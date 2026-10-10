@@ -14,11 +14,103 @@
 #include "core/hle/kernel/event.h"
 #include "core/hle/kernel/server_session.h"
 #include "core/hle/service/fs/file.h"
+#ifdef __PSVITA__
+#include <algorithm>
+#include <atomic>
+#include <future>
+#include <mutex>
+#include <vector>
+#include "common/thread_worker.h"
+#endif
 
 SERIALIZE_EXPORT_IMPL(Service::FS::File)
 SERIALIZE_EXPORT_IMPL(Service::FS::FileSessionSlot)
 
 namespace Service::FS {
+
+#ifdef __PSVITA__
+namespace {
+/**
+ * LAS LECTURAS GRANDES DE LA ROMFS EN UN HILO PROPIO (0.3.3.1). Los juegos leen
+ * de la ROM varios trozos de mas de 8 KB por segundo (los que no caben en la
+ * cache del lector) a 1-5 ms cada uno de tarjeta, en el hilo de emulacion:
+ * "::Read" 6-20 ms por segundo en crash.txt de 0.3.2.6. RunAsync no sirve aqui
+ * (std::async crea un hilo por llamada y en la Vita se agotan, ver main.cpp);
+ * este es uno solo, para siempre. El hilo del juego duerme mientras tanto y los
+ * demas siguen.
+ *
+ * El despertar no lo pide el trabajador, como la rama asincrona de
+ * RunOnThreadWorker: un evento pedido desde otro hilo va como minimo dos
+ * rodajas por delante (~8,5 ms emulados), y una carga de muchas lecturas
+ * seguidas iria mas lenta que leyendo aqui mismo. El trabajador apunta la
+ * lectura como hecha y el hilo de emulacion, en la vuelta siguiente de RunLoop
+ * (DeliverRomFsReads), despierta al del juego con el retraso exacto.
+ */
+Common::ThreadWorker& RomFsReadWorker() {
+    // En el nucleo 2, por encima del compilador de shaders: casi todo el tiempo
+    // esta esperando a la tarjeta, pero con la prioridad por defecto competiria
+    // de igual a igual con el hilo de emulacion.
+    static Common::ThreadWorker worker{1, "FS_lectura", {}, true, 2};
+    return worker;
+}
+
+struct ReadDone {
+    std::weak_ptr<Kernel::Thread> thread;
+    s64 sleep_for;
+};
+std::mutex g_reads_mutex;
+std::vector<ReadDone> g_reads_done;
+std::atomic<bool> g_reads_pending{false};
+
+template <typename ResultFunctor>
+class ReadWakeUp final : public Kernel::HLERequestContext::WakeupCallback {
+public:
+    ReadWakeUp(Kernel::KernelSystem& kernel_, ResultFunctor functor_, std::future<void> done_)
+        : kernel{kernel_}, functor{std::move(functor_)}, done{std::move(done_)} {}
+
+    // Si el hilo se destruye antes de despertar (fin de la partida), el
+    // trabajador no puede seguir usando la peticion: se le espera.
+    ~ReadWakeUp() override {
+        if (done.valid()) {
+            done.wait();
+        }
+    }
+
+    void WakeUp(std::shared_ptr<Kernel::Thread>, Kernel::HLERequestContext& ctx,
+                Kernel::ThreadWakeupReason) override {
+        functor(ctx);
+        kernel.ReportAsyncState(false);
+    }
+
+    bool SupportsSerialization() override {
+        return false;
+    }
+
+private:
+    Kernel::KernelSystem& kernel;
+    ResultFunctor functor;
+    std::future<void> done;
+};
+} // Anonymous namespace
+
+void DeliverRomFsReads() {
+    if (!g_reads_pending.load(std::memory_order_acquire)) {
+        return;
+    }
+    std::vector<ReadDone> done;
+    {
+        const std::lock_guard lock{g_reads_mutex};
+        done.swap(g_reads_done);
+        g_reads_pending.store(false, std::memory_order_relaxed);
+    }
+    for (const ReadDone& read : done) {
+        // De una partida que ya se ha cerrado, el hilo ya no existe.
+        if (const auto thread = read.thread.lock()) {
+            thread->WakeAfterDelay(std::max<s64>(read.sleep_for, 0));
+        }
+    }
+}
+#endif
 
 template <class Archive>
 void File::serialize(Archive& ar, const unsigned int) {
@@ -126,48 +218,66 @@ void File::Read(Kernel::HLERequestContext& ctx) {
     }
 
     // LOG_DEBUG(Service_FS, "cache={}, offset={}, length={}", cache_ready, offset, length);
-    ctx.RunAsync(
-        [this, async_data](Kernel::HLERequestContext& ctx) {
-            async_data->data = std::make_unique_for_overwrite<u8[]>(async_data->length);
-            const auto read =
-                backend->Read(async_data->offset, async_data->length, async_data->data.get());
-            if (read.Failed()) {
-                async_data->ret = read.Code();
-                async_data->read_size = 0;
-            } else {
-                async_data->ret = ResultSuccess;
-                async_data->read_size = *read;
-            }
+    const auto read_section = [this, async_data](Kernel::HLERequestContext& ctx) {
+        async_data->data = std::make_unique_for_overwrite<u8[]>(async_data->length);
+        const auto read =
+            backend->Read(async_data->offset, async_data->length, async_data->data.get());
+        if (read.Failed()) {
+            async_data->ret = read.Code();
+            async_data->read_size = 0;
+        } else {
+            async_data->ret = ResultSuccess;
+            async_data->read_size = *read;
+        }
 
-            const auto read_delay = static_cast<s64>(backend->GetReadDelayNs(async_data->length));
-            if (!async_data->cache_ready) {
-                const auto time_took = std::chrono::duration_cast<std::chrono::nanoseconds>(
-                                           std::chrono::steady_clock::now() - async_data->pre_timer)
-                                           .count();
-                /*
-                if (time_took > read_delay) {
-                    LOG_DEBUG(Service_FS, "Took longer! length={}, time_took={}, read_delay={}",
-                              async_data->length, time_took, read_delay);
-                }
-                */
-                return static_cast<s64>((read_delay > time_took) ? (read_delay - time_took) : 0);
-            } else {
-                return static_cast<s64>(read_delay);
+        const auto read_delay = static_cast<s64>(backend->GetReadDelayNs(async_data->length));
+        if (!async_data->cache_ready) {
+            const auto time_took = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                       std::chrono::steady_clock::now() - async_data->pre_timer)
+                                       .count();
+            /*
+            if (time_took > read_delay) {
+                LOG_DEBUG(Service_FS, "Took longer! length={}, time_took={}, read_delay={}",
+                          async_data->length, time_took, read_delay);
             }
-        },
-        [async_data](Kernel::HLERequestContext& ctx) {
-            IPC::RequestBuilder rb(ctx, 0x0802, 2, 2);
-            if (async_data->ret.IsError()) {
-                rb.Push(async_data->ret);
-                rb.Push<u32>(0);
-            } else {
-                async_data->buffer->Write(async_data->data.get(), 0, async_data->read_size);
-                rb.Push(ResultSuccess);
-                rb.Push<u32>(static_cast<u32>(async_data->read_size));
-            }
-            rb.PushMappedBuffer(*async_data->buffer);
-        },
-        really_async);
+            */
+            return static_cast<s64>((read_delay > time_took) ? (read_delay - time_took) : 0);
+        } else {
+            return static_cast<s64>(read_delay);
+        }
+    };
+    const auto result_section = [async_data](Kernel::HLERequestContext& ctx) {
+        IPC::RequestBuilder rb(ctx, 0x0802, 2, 2);
+        if (async_data->ret.IsError()) {
+            rb.Push(async_data->ret);
+            rb.Push<u32>(0);
+        } else {
+            async_data->buffer->Write(async_data->data.get(), 0, async_data->read_size);
+            rb.Push(ResultSuccess);
+            rb.Push<u32>(static_cast<u32>(async_data->read_size));
+        }
+        rb.PushMappedBuffer(*async_data->buffer);
+    };
+#ifdef __PSVITA__
+    if (really_async) {
+        kernel.ReportAsyncState(true);
+        auto* const context = &ctx;
+        std::weak_ptr<Kernel::Thread> client = ctx.ClientThread();
+        auto task = std::make_shared<std::packaged_task<void()>>([context, read_section, client] {
+            const s64 sleep_for = read_section(*context);
+            const std::lock_guard lock{g_reads_mutex};
+            g_reads_done.push_back({client, sleep_for});
+            g_reads_pending.store(true, std::memory_order_release);
+        });
+        std::future<void> done = task->get_future();
+        RomFsReadWorker().QueueWork([task] { (*task)(); });
+        ctx.SleepClientThread("FS_lectura", std::chrono::nanoseconds(-1),
+                              std::make_shared<ReadWakeUp<decltype(result_section)>>(
+                                  kernel, result_section, std::move(done)));
+        return;
+    }
+#endif
+    ctx.RunAsync(read_section, result_section, really_async);
 }
 
 void File::Write(Kernel::HLERequestContext& ctx) {

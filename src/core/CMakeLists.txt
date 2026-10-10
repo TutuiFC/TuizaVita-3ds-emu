@@ -636,3 +636,28 @@ set_source_files_properties(
     hle/kernel/kernel.cpp
     PROPERTIES COMPILE_OPTIONS "-O2"
 )
+# Lo que corre en cada llamada al sistema o a un servicio (0.3.3.1): el bucle
+# de RunLoop (1.500-3.500 vueltas por segundo), el IPC (cada SendSyncRequest:
+# 120-520 por segundo) y los objetos del kernel que se esperan y se senalan
+# (ArbitrateAddress, eventos, mutex: cientos por segundo). Estaban a -Os, sin
+# meter en linea casi nada.
+set_source_files_properties(
+    core.cpp
+    hle/kernel/hle_ipc.cpp
+    hle/kernel/server_session.cpp
+    hle/kernel/client_session.cpp
+    hle/kernel/handle_table.cpp
+    hle/kernel/wait_object.cpp
+    hle/kernel/address_arbiter.cpp
+    hle/kernel/event.cpp
+    hle/kernel/mutex.cpp
+    hle/kernel/semaphore.cpp
+    hle/kernel/timer.cpp
+    hle/service/service.cpp
+    hle/service/gsp/gsp_gpu.cpp
+    hle/service/hid/hid.cpp
+    hle/service/fs/file.cpp
+    hle/service/dsp/dsp_dsp.cpp
+    hle/service/cam/y2r_u.cpp
+    PROPERTIES COMPILE_OPTIONS "-O2"
+)

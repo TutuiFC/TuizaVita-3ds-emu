@@ -13,6 +13,10 @@
 #include "core/hle/kernel/server_session.h"
 #include "core/hle/kernel/session.h"
 #include "core/hle/kernel/thread.h"
+#ifdef __PSVITA__
+#include "core/arm/arm_interface.h"
+#include "core/core_timing.h"
+#endif
 
 SERIALIZE_EXPORT_IMPL(Kernel::ServerSession)
 
@@ -77,6 +81,32 @@ void ServerSession::Acquire(Thread* thread) {
     pending_requesting_threads.pop_back();
 }
 
+#ifdef __PSVITA__
+namespace {
+/**
+ * LA ESPERA DEL IPC SIN DORMIR (0.3.3.1). Una peticion a un servicio HLE duerme
+ * al hilo 39 us emulados (ver HandleSyncRequest): dos cambios de contexto, un
+ * evento y dos replanificaciones por llamada, y los juegos hacen 120-520 por
+ * segundo (SendSyncRequest en crash.txt). Si no hay ningun otro hilo listo en
+ * este nucleo y la rodaja no se acaba antes (ningun evento en esos 39 us), lo
+ * que pasaria es exactamente esto: el nucleo ocioso hasta que el hilo despierta
+ * con la respuesta. Asi que se gasta ese tiempo en el contador y el hilo sigue.
+ */
+bool ConsumeIpcDelay(KernelSystem& kernel, u64 delay_ns) {
+    if (kernel.current_cpu == nullptr || kernel.GetCurrentThreadManager().HaveReadyThreads()) {
+        return false;
+    }
+    Core::Timing::Timer& timer = kernel.current_cpu->GetTimer();
+    const s64 cycles = nsToCycles(delay_ns);
+    if (timer.GetDowncount() <= cycles) {
+        return false;
+    }
+    timer.AddTicks(static_cast<u64>(cycles));
+    return true;
+}
+} // Anonymous namespace
+#endif
+
 Result ServerSession::HandleSyncRequest(std::shared_ptr<Thread> thread) {
     // The ServerSession received a sync request, this means that there's new data available
     // from its ClientSession, so wake up any threads that may be waiting on a svcReplyAndReceive or
@@ -109,6 +139,12 @@ Result ServerSession::HandleSyncRequest(std::shared_ptr<Thread> thread) {
     }
 
     if (thread->status == ThreadStatus::Running) {
+#ifdef __PSVITA__
+        if (hle_handler != nullptr && ConsumeIpcDelay(kernel, 39000)) {
+            WakeupAllWaitingThreads();
+            return ResultSuccess;
+        }
+#endif
         // Put the thread to sleep until the server replies, it will be awoken in
         // svcReplyAndReceive for LLE servers.
         thread->status = ThreadStatus::WaitIPC;

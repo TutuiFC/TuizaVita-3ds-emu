@@ -671,7 +671,9 @@ Result SVC::SendSyncRequest(Handle handle) {
 
     LOG_TRACE(Kernel_SVC, "called handle=0x{:08X}({})", handle, session->GetName());
 
+#ifndef __PSVITA__
     system.PrepareReschedule();
+#endif
 
     auto thread = SharedFrom(kernel.GetCurrentThreadManager().GetCurrentThread());
 
@@ -689,6 +691,13 @@ Result SVC::SendSyncRequest(Handle handle) {
     if (is_hle) {
         system.perf_stats->EndIPCProcessing();
     }
+#ifdef __PSVITA__
+    // Si sigue corriendo es que la espera del IPC ya se ha gastado aqui (ver
+    // ConsumeIpcDelay en server_session.cpp) y no ha despertado nadie mas.
+    if (thread->status != ThreadStatus::Running) {
+        system.PrepareReschedule();
+    }
+#endif
 
     return res;
 }

@@ -313,6 +313,21 @@ set_source_files_properties(
     PROPERTIES COMPILE_OPTIONS "-O3;-flto"
 )
 
+# Lo que corre por lote o por shader nuevo y seguia a -Os (0.3.3.1): la cola
+# del hilo de la GPU, FSConfig (se construye en cada lote que cambia de
+# material: "preguntas" 11-26 us por lote), los traductores de shaders (4-36 ms
+# por programa nuevo, "traducir" en crash.txt) y el reservador del compilador
+# de Cg (cientos de miles de llamadas por shader).
+set_source_files_properties(
+    gpu.cpp
+    shader/generator/pica_fs_config.cpp
+    shader/generator/shader_gen.cpp
+    shader/generator/cg_vs_shader_gen.cpp
+    shader/generator/cg_fs_shader_gen.cpp
+    renderer_gxm/gxm_cg.cpp
+    PROPERTIES COMPILE_OPTIONS "-O2"
+)
+
 # Por que -flto ademas de -O3.
 #
 # -O3 optimiza cada fichero por separado, y el problema del rasterizador no esta

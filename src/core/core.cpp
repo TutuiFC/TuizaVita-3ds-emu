@@ -64,6 +64,13 @@
 #include "video_core/gpu.h"
 #include "video_core/renderer_base.h"
 
+#ifdef __PSVITA__
+namespace Service::FS {
+/// Despierta a los hilos cuyas lecturas de la RomFS han acabado (file.cpp).
+void DeliverRomFsReads();
+} // namespace Service::FS
+#endif
+
 namespace Core {
 
 #ifdef __PSVITA__
@@ -281,6 +288,7 @@ System::ResultStatus System::RunLoop(bool tight_loop) {
 
 #ifdef __PSVITA__
     LoopLap lap{(++g_loop_tick & 3u) == 0};
+    ::Service::FS::DeliverRomFsReads();
 #endif
     /**
      * GPU en otro nucleo (0.2.0.0): las interrupciones que ha levantado el hilo
