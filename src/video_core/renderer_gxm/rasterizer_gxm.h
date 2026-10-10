@@ -506,6 +506,8 @@ private:
     };
     std::vector<LazyFill> lazy_fills;
     void ApplyLazyFills(PAddr addr, u32 size);
+    /// Quita de lo pendiente lo que [addr, addr + size) va a pisar entero (0.3.3.3).
+    void TrimLazyFills(PAddr addr, u32 size);
     /// El relleno por software que esta invalidando su tramo (bpp 0 si
     /// ninguno): sus texturas van por TextureCache::InvalidateFill (0.3.2.6).
     u32 invalidating_fill_texel = 0;

@@ -2224,7 +2224,28 @@ private:
         // El tope mira la de siempre: con el de la otra, un programa que antes
         // se especializaba podria pasar a compilarse entero (ver
         // AccelerateDrawBatch) y dejar sin usar los especializados de la cache.
-        if (first->size() > kMaxCompileSource) {
+        /**
+         * ESPECIALIZADO Y AUN GRANDE: LA DE LECTURAS COMPARTIDAS, SI CABE
+         * (0.3.3.3). Zelda: Ocarina of Time 3D tiene shaders de vertices de 24 KB
+         * que ni con los booleanos del lote bajan del tope, y por la CPU son
+         * 37-68 ms por fotograma ("vtx" en crash.txt). Con lecturas compartidas
+         * los de piel quedan bastante mas cortos: si esa cabe, se compila sola
+         * (las demas variantes no caben) y como grande. El generico sigue
+         * fuera por su tamano, para que se especialice como siempre.
+         */
+        const bool too_big = first->size() > kMaxCompileSource;
+        const bool specialized =
+            (g_cg_const_bools.load(std::memory_order_relaxed) & kCgBoolsKnown) != 0;
+        // La de lecturas compartidas, despues del tope (0.3.1.5): un programa
+        // que no se va a compilar no necesita su segunda traduccion.
+        std::optional<std::string> shared;
+        if (!too_big || specialized) {
+            shared = generate(kCgFloatAddress | kCgRelCache);
+            if (shared.has_value() && *shared == *first) {
+                shared.reset();
+            }
+        }
+        if (too_big && (!shared.has_value() || shared->size() > kMaxCompileSource)) {
             static u32 big_notes = 0;
             if (big_notes < 4) {
                 big_notes++;
@@ -2233,12 +2254,6 @@ private:
             }
             program.reason = "vs demasiado grande";
             return;
-        }
-        // La de lecturas compartidas, despues del tope (0.3.1.5): un programa
-        // que no se va a compilar no necesita su segunda traduccion.
-        std::optional<std::string> shared = generate(kCgFloatAddress | kCgRelCache);
-        if (shared.has_value() && *shared == *first) {
-            shared.reset();
         }
         if (shared.has_value()) {
             for (const bool from_card : {false, true}) {
@@ -2253,20 +2268,30 @@ private:
             }
         }
         auto job = std::make_shared<CgJob>();
+        if (too_big) {
+            static u32 shared_notes = 0;
+            if (shared_notes < 4) {
+                shared_notes++;
+                NoteFmt("gxm vs", "{} bytes de Cg, {} con lecturas compartidas: se compila esa",
+                        first->size(), shared->size());
+            }
+        }
         if (shared.has_value()) {
             job->sources.push_back(std::move(*shared));
             job->variants.push_back(kCgFloatAddress | kCgRelCache);
             job->names.push_back(kSharedName);
         }
-        job->sources.push_back(std::move(*first));
-        job->variants.push_back(kCgFloatAddress);
-        job->names.push_back(kName);
-        for (const u32 variant : {kCgFloatAddress | kCgFlat, kCgFlat, 0u}) {
-            // En linea puede fallar solo por tamano, y la siguiente sin linea vale.
-            if (auto source = generate(variant); source.has_value()) {
-                job->sources.push_back(std::move(*source));
-                job->variants.push_back(variant);
-                job->names.push_back(kName);
+        if (!too_big) {
+            job->sources.push_back(std::move(*first));
+            job->variants.push_back(kCgFloatAddress);
+            job->names.push_back(kName);
+            for (const u32 variant : {kCgFloatAddress | kCgFlat, kCgFlat, 0u}) {
+                // En linea puede fallar solo por tamano, y la siguiente sin linea vale.
+                if (auto source = generate(variant); source.has_value()) {
+                    job->sources.push_back(std::move(*source));
+                    job->variants.push_back(variant);
+                    job->names.push_back(kName);
+                }
             }
         }
         // Al hilo de compilacion (0.1.9.6); GetProgram recoge el resultado.
@@ -3063,6 +3088,7 @@ void RasterizerGXM::WriteBack(Surface& surface, u32 site) {
         return;
     }
     gpu_writebacks.fetch_add(1, std::memory_order_relaxed);
+    TrimLazyFills(surface.guest_address, surface.guest_stride * surface.height);
     u8* linear = static_cast<u8*>(surface.color_buffer.Data());
     u32 linear_stride = surface.color_stride * surface.rt_bpp;
     if (surface.scale != 2) {
@@ -3087,6 +3113,7 @@ void RasterizerGXM::Reload(Surface& surface) {
     // quedo en la GPU deja de valer: esa memoria pasa a ser de la superficie.
     MaterializeCopies(surface.guest_address, surface.guest_stride * surface.height);
     DropTiledCopies(surface.guest_address, surface.guest_stride * surface.height);
+    ApplyLazyFills(surface.guest_address, surface.guest_stride * surface.height);
     // Lee y escribe color_buffer: misma razon que WriteBack.
     WaitGpu(GpuWait::Reload);
     surface.needs_reload = false;
@@ -3513,6 +3540,7 @@ void RasterizerGXM::MaterializeCopy(ScreenCopy& copy) {
     } else {
         WaitGpu(GpuWait::Copy);
     }
+    ApplyLazyFills(copy.dst, copy.dst_size);
     u8* const dst = memory.GetPhysicalPointer(copy.dst);
     const u8* const src = static_cast<const u8*>(copy.color_buffer.Data());
     const u32 src_stride = copy.stride * copy.bpp;
@@ -4306,23 +4334,25 @@ bool RasterizerGXM::FillGuestMemory(const Pica::MemoryFillConfig& config) {
     const u32 bytes = end - start;
     /**
      * Solo profundidad (0.2.2.7): el tramo entero dentro del buffer de
-     * profundidad de una superficie y sin tocar ningun color. Pokemon Sol
-     * borra asi 512 KB unas catorce veces por fotograma ("rellenos por
-     * software" de 0.2.2.6: ~7 MB por fotograma escritos sin que nadie los
-     * lea). Los pendientes que este cubre entero ya no hacen falta; los que
-     * pisa a medias, antes al invitado.
+     * profundidad de una superficie. Pokemon Sol borra asi 512 KB unas catorce
+     * veces por fotograma ("rellenos por software" de 0.2.2.6: ~7 MB por
+     * fotograma escritos sin que nadie los lea). Los pendientes que este cubre
+     * entero ya no hacen falta; los que pisa a medias, antes al invitado.
+     * AUNQUE PISE EL COLOR DE OTRA (0.3.3.3). Smash borra asi la profundidad de
+     * su 3D de 512x400 (800 KB por fotograma), que comparte memoria con su
+     * pantalla de abajo de 256x320, y por eso iba entero por la CPU. El color
+     * que pisa se invalida igual (InvalidateRegion) y se recarga con lo
+     * pendiente ya escrito (Reload); lo que lo escribe entero despues (un
+     * volcado, un relleno en la GPU, que es lo que hace Smash) lo recorta.
      */
     bool depth_only = false;
     for (const auto& surface : surfaces) {
-        if (surface->Overlaps(start, bytes)) {
-            depth_only = false;
-            break;
-        }
         const PAddr depth_end =
             surface->guest_depth_address + surface->guest_depth_stride * surface->height;
         if (surface->guest_depth_address != 0 && start >= surface->guest_depth_address &&
             end <= depth_end) {
             depth_only = true;
+            break;
         }
     }
     std::erase_if(lazy_fills, [start, end](const LazyFill& fill) {
@@ -4338,7 +4368,7 @@ bool RasterizerGXM::FillGuestMemory(const Pica::MemoryFillConfig& config) {
     constexpr u32 kEagerBytes = 192;
     if (depth_only && bytes > kEagerBytes) {
         FillPattern(guest, kEagerBytes, texel, bpp);
-        if (lazy_fills.size() >= 8) {
+        while (lazy_fills.size() >= 8) {
             const LazyFill oldest = lazy_fills.front();
             lazy_fills.erase(lazy_fills.begin());
             FillPattern(memory.GetPhysicalPointer(oldest.start), oldest.bytes, oldest.texel,
@@ -4364,6 +4394,40 @@ void RasterizerGXM::ApplyLazyFills(PAddr addr, u32 size) {
         FillPattern(memory.GetPhysicalPointer(fill.start), fill.bytes, fill.texel, fill.bpp);
         return true;
     });
+}
+
+/**
+ * Un volcado o un relleno en la GPU escriben [addr, addr + size) entero en el
+ * invitado, y un relleno pendiente debajo, aplicado despues, se lo comeria. Lo
+ * que queda fuera sigue pendiente. Si el trozo de detras no empieza en fase
+ * con el patron (24 bits), ese relleno se escribe ya, entero.
+ */
+void RasterizerGXM::TrimLazyFills(PAddr addr, u32 size) {
+    if (lazy_fills.empty() || size == 0) {
+        return;
+    }
+    const PAddr end = addr + size;
+    const std::size_t count = lazy_fills.size();
+    std::size_t kept = 0;
+    for (std::size_t i = 0; i < count; i++) {
+        const LazyFill fill = lazy_fills[i];
+        const PAddr fill_end = fill.start + fill.bytes;
+        if (addr >= fill_end || fill.start >= end) {
+            lazy_fills[kept++] = fill;
+            continue;
+        }
+        if (fill_end > end && (end - fill.start) % fill.bpp != 0) {
+            FillPattern(memory.GetPhysicalPointer(fill.start), fill.bytes, fill.texel, fill.bpp);
+            continue;
+        }
+        if (fill.start < addr) {
+            lazy_fills[kept++] = {fill.start, addr - fill.start, fill.texel, fill.bpp};
+        }
+        if (fill_end > end) {
+            lazy_fills.push_back({end, fill_end - end, fill.texel, fill.bpp});
+        }
+    }
+    lazy_fills.erase(lazy_fills.begin() + kept, lazy_fills.begin() + count);
 }
 
 bool RasterizerGXM::AccelerateFillOnGpu(const Pica::MemoryFillConfig& config) {
@@ -4472,6 +4536,7 @@ bool RasterizerGXM::AccelerateFillOnGpu(const Pica::MemoryFillConfig& config) {
      */
     u8* const guest = memory.GetPhysicalPointer(start);
     const u32 bytes = end - start;
+    TrimLazyFills(start, bytes);
     FillPattern(guest, bytes, texel, target->bpp);
     if (whole) {
         // Todo el color es el relleno: lo de antes ya no cuenta.
