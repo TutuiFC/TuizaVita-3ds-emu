@@ -29,6 +29,18 @@ StereoBuffer16 DecodeADPCM(const u8* data, const std::size_t sample_count,
                            const std::array<s16, 16>& adpcm_coeff, ADPCMState& state);
 
 /**
+ * Like DecodeADPCM, but appends the decoded samples to the end of an existing buffer.
+ * @param data Pointer to ADPCM data to decode, at the start of a frame
+ * @param sample_count Number of samples to decode (an odd count decodes one more, like DecodeADPCM)
+ * @param adpcm_coeff ADPCM coefficients
+ * @param state ADPCM state, this is updated with new state
+ * @param buffer Buffer the decoded samples are appended to
+ */
+void AppendADPCM(const u8* data, const std::size_t sample_count,
+                 const std::array<s16, 16>& adpcm_coeff, ADPCMState& state,
+                 StereoBuffer16& buffer);
+
+/**
  * @param num_channels Number of channels
  * @param data Pointer to buffer that contains PCM8 data to decode
  * @param sample_count Length of buffer in terms of number of samples

@@ -13,8 +13,12 @@
 
 namespace AudioCore::Codec {
 
-StereoBuffer16 DecodeADPCM(const u8* const data, const std::size_t sample_count,
-                           const std::array<s16, 16>& adpcm_coeff, ADPCMState& state) {
+namespace {
+/// DecodeADPCM sobre un destino ya reservado para sample_count muestras
+/// redondeado a par (0.3.3.2: lo comparte con AppendADPCM).
+template <typename OutputIt>
+void DecodeADPCMTo(const u8* const data, const std::size_t sample_count,
+                   const std::array<s16, 16>& adpcm_coeff, ADPCMState& state, OutputIt out) {
     // GC-ADPCM with scale factor and variable coefficients.
     // Frames are 8 bytes long containing 14 samples each.
     // Samples are 4 bits (one nibble) long.
@@ -25,14 +29,9 @@ StereoBuffer16 DecodeADPCM(const u8* const data, const std::size_t sample_count,
         0, 1, 2, 3, 4, 5, 6, 7, -8, -7, -6, -5, -4, -3, -2, -1,
     };
 
-    const std::size_t ret_size =
-        sample_count % 2 == 0 ? sample_count : sample_count + 1; // Ensure multiple of two.
-    StereoBuffer16 ret(ret_size);
     // Escritura en orden con el iterador (0.3.2.1): el operator[] de la deque
     // hace cuentas de nodo en cada muestra. Cada trama escribe justo despues
     // de la anterior (outputi = framei * 14 y 14 muestras por trama).
-    auto out = ret.begin();
-
     int yn1 = state.yn1, yn2 = state.yn2;
 
     const std::size_t NUM_FRAMES =
@@ -81,8 +80,24 @@ StereoBuffer16 DecodeADPCM(const u8* const data, const std::size_t sample_count,
 
     state.yn1 = static_cast<s16>(yn1);
     state.yn2 = static_cast<s16>(yn2);
+}
+} // Anonymous namespace
 
+StereoBuffer16 DecodeADPCM(const u8* const data, const std::size_t sample_count,
+                           const std::array<s16, 16>& adpcm_coeff, ADPCMState& state) {
+    const std::size_t ret_size =
+        sample_count % 2 == 0 ? sample_count : sample_count + 1; // Ensure multiple of two.
+    StereoBuffer16 ret(ret_size);
+    DecodeADPCMTo(data, sample_count, adpcm_coeff, state, ret.begin());
     return ret;
+}
+
+void AppendADPCM(const u8* const data, const std::size_t sample_count,
+                 const std::array<s16, 16>& adpcm_coeff, ADPCMState& state,
+                 StereoBuffer16& buffer) {
+    const std::size_t base = buffer.size();
+    buffer.resize(base + (sample_count % 2 == 0 ? sample_count : sample_count + 1));
+    DecodeADPCMTo(data, sample_count, adpcm_coeff, state, std::next(buffer.begin(), base));
 }
 
 StereoBuffer16 DecodePCM8(const unsigned num_channels, const u8* const data,

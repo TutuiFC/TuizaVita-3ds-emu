@@ -16,8 +16,9 @@ namespace AudioCore::HLE::Stats {
  *   ticks          ticks de audio (uno cada 160 muestras)
  *   active         fuentes encendidas, sumadas en cada tick
  *   decode_us      decodificar buffers enteros (al empezar a sonar, al dar la
- *                  vuelta un bucle, al alargarse uno a medio sonar)
- *   decoded        muestras decodificadas por eso
+ *                  vuelta un bucle, al alargarse uno a medio sonar); el ADPCM
+ *                  va por tramos desde 0.3.3.2 y solo cuentan los grandes
+ *   decoded        muestras decodificadas, todas
  * La mezcla es el resto de Common::FrameStats::dsp_us, quitando el AAC.
  */
 inline std::atomic<unsigned long long> ticks{0};

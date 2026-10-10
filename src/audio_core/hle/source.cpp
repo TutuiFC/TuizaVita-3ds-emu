@@ -6,6 +6,9 @@
 #include <array>
 #include <atomic>
 #include <fmt/format.h>
+#if defined(__ARM_NEON)
+#include <arm_neon.h>
+#endif
 #include "audio_core/codec.h"
 #include "audio_core/hle/common.h"
 #include "audio_core/hle/dsp_stats.h"
@@ -28,6 +31,13 @@ struct DecodeTimer {
     }
     unsigned long long begin = Common::VitaMicros();
 };
+
+/// Muestras de entrada que puede consumir el resto de un fotograma, con margen.
+/// Con un ritmo absurdo (NaN, enorme), mas que cualquier buffer.
+u64 InputAhead(float rate, std::size_t remaining) {
+    const float wanted = rate * static_cast<float>(remaining) + 16.0f;
+    return wanted < 65536.0f ? static_cast<u64>(wanted) : u64{1} << 40;
+}
 } // Anonymous namespace
 
 namespace AudioCore::HLE {
@@ -71,6 +81,39 @@ void Source::MixInto(QuadFrame32& dest, std::size_t intermediate_mix_id) {
      * cambia nada, asi que saltarse esos canales da exactamente lo mismo.
      */
     if (!ramp_active) {
+#if defined(__ARM_NEON)
+        /**
+         * CON NEON, DE CUATRO EN CUATRO MUESTRAS (0.3.3.2). Esto eran 160
+         * productos en float, truncados y sumados de uno en uno en VFP, por
+         * fuente y mezcla: con 20-24 fuentes sonando, "otro nucleo" llega a
+         * 16-22 ms por fotograma en Kirby y New Super Mario Bros. 2 de 0.3.3.1.
+         * Son las mismas cuentas por canal (producto en float con redondeo al
+         * par, truncado hacia cero con saturacion, suma en 32 bits), y un canal
+         * con ganancia 0 suma 0, asi que mezclar los cuatro da lo mismo que
+         * saltarse los callados. Comprobado en el PC con ganancias al azar,
+         * 0, -0 y diminutas.
+         */
+        if (gains[0] == 0.0f && gains[1] == 0.0f && gains[2] == 0.0f && gains[3] == 0.0f) {
+            return;
+        }
+        static_assert(sizeof(current_frame) == samples_per_frame * 2 * sizeof(s16));
+        static_assert(sizeof(QuadFrame32) == samples_per_frame * 4 * sizeof(s32));
+        const s16* in = reinterpret_cast<const s16*>(current_frame.data());
+        s32* out = reinterpret_cast<s32*>(dest.data());
+        for (std::size_t samplei = 0; samplei < samples_per_frame;
+             samplei += 4, in += 8, out += 16) {
+            const int16x4x2_t stereo = vld2_s16(in);
+            const float32x4_t left = vcvtq_f32_s32(vmovl_s16(stereo.val[0]));
+            const float32x4_t right = vcvtq_f32_s32(vmovl_s16(stereo.val[1]));
+            int32x4x4_t quad = vld4q_s32(out);
+            quad.val[0] = vaddq_s32(quad.val[0], vcvtq_s32_f32(vmulq_n_f32(left, gains[0])));
+            quad.val[1] = vaddq_s32(quad.val[1], vcvtq_s32_f32(vmulq_n_f32(right, gains[1])));
+            quad.val[2] = vaddq_s32(quad.val[2], vcvtq_s32_f32(vmulq_n_f32(left, gains[2])));
+            quad.val[3] = vaddq_s32(quad.val[3], vcvtq_s32_f32(vmulq_n_f32(right, gains[3])));
+            vst4q_s32(out, quad);
+        }
+        return;
+#else
         const float g0 = gains[0];
         const float g1 = gains[1];
         const float g2 = gains[2];
@@ -88,6 +131,7 @@ void Source::MixInto(QuadFrame32& dest, std::size_t intermediate_mix_id) {
             }
         }
         return;
+#endif
     }
 
     for (std::size_t samplei = 0; samplei < samples_per_frame; samplei++) {
@@ -306,6 +350,7 @@ void Source::ParseConfig(SourceConfiguration::Configuration& config,
                         num_channels, memory + std::size_t{skip} * num_channels * sizeof(s16),
                         length - skip);
                 }
+                state.adpcm_pending = 0;
                 if (restart) {
                     state.current_sample_number = 0;
                 }
@@ -481,6 +526,7 @@ void Source::GenerateFrame() {
         }
     }
 
+    DecodeADPCMAhead(InputAhead(state.rate_multiplier, current_frame.size()));
     if (state.current_buffer.empty()) {
         // TODO(SachinV): Should dequeue happen at the end of the frame generation?
         if (DequeueBuffer()) {
@@ -495,6 +541,8 @@ void Source::GenerateFrame() {
 
     std::size_t frame_position = 0;
     while (frame_position < current_frame.size()) {
+        DecodeADPCMAhead(
+            InputAhead(state.rate_multiplier, current_frame.size() - frame_position));
         if (state.current_buffer.empty()) {
             const std::size_t queued = state.input_queue.size();
             if (!DequeueBuffer()) {
@@ -561,6 +609,7 @@ bool Source::DequeueBuffer() {
 
     Buffer buf = state.input_queue.top();
     state.input_queue.pop();
+    state.adpcm_pending = 0;
 
     if (buf.adpcm_dirty) {
         state.adpcm_state.yn1 = buf.adpcm_yn[0];
@@ -572,18 +621,22 @@ bool Source::DequeueBuffer() {
     const u8* const memory = memory_system->GetPhysicalPointer(buf.physical_address & 0xFFFFFFFC);
     if (memory) {
         const unsigned num_channels = buf.mono_or_stereo == MonoOrStereo::Stereo ? 2 : 1;
-        const DecodeTimer timer{buf.length};
         switch (buf.format) {
-        case Format::PCM8:
+        case Format::PCM8: {
+            const DecodeTimer timer{buf.length};
             state.current_buffer = Codec::DecodePCM8(num_channels, memory, buf.length);
             break;
-        case Format::PCM16:
+        }
+        case Format::PCM16: {
+            const DecodeTimer timer{buf.length};
             state.current_buffer = Codec::DecodePCM16(num_channels, memory, buf.length);
             break;
+        }
         case Format::ADPCM:
             DEBUG_ASSERT(num_channels == 1);
-            state.current_buffer =
-                Codec::DecodeADPCM(memory, buf.length, state.adpcm_coeffs, state.adpcm_state);
+            // Por tramos: el primero abajo, con el buffer ya descrito en state.
+            state.adpcm_pending = buf.length;
+            state.adpcm_buffer_coeffs = state.adpcm_coeffs;
             break;
         default:
             UNIMPLEMENTED();
@@ -613,6 +666,9 @@ bool Source::DequeueBuffer() {
         state.input_queue.push(buf);
     }
 
+    DecodeADPCMAhead(state.current_sample_number +
+                     InputAhead(state.rate_multiplier, current_frame.size()));
+
     // Because our interpolation consumes samples instead of using an index,
     // let's just consume the samples up to the current sample number.
     // Con play_position mas alla del final, iterar pasado end() era indefinido.
@@ -628,6 +684,55 @@ bool Source::DequeueBuffer() {
               source_id, buf.buffer_id, buf.from_queue, state.current_buffer.size(), buf.has_played,
               buf.play_position);
     return true;
+}
+
+/**
+ * EL ADPCM POR TRAMOS (0.3.3.2). DequeueBuffer decodificaba el buffer entero al
+ * sacarlo de la cola: un efecto o un bucle de varios segundos son decenas de
+ * miles de muestras de golpe, y una deque de cientos de KB con malloc, en el
+ * fotograma en que empieza a sonar ("decodificar" hasta 8,8 ms por fotograma
+ * en New Super Mario Bros. 2 de 0.3.3.1), casi todo para muestras que sonaran
+ * segundos despues o nunca. Ahora se decodifican tramas enteras de 14 muestras
+ * hasta tener lo que puede consumir el resto del fotograma, con el estado
+ * yn1/yn2 de siempre y los coeficientes de cuando salio de la cola: las mismas
+ * muestras en el mismo orden. Si el interpolador se queda corto, GenerateFrame
+ * pide mas y sigue donde lo dejo, como en un cambio de buffer.
+ * Los tramos de cada fotograma (unas 180 muestras, pocos us) no se cronometran:
+ * dos VitaMicros por fuente y fotograma costarian casi lo mismo, y su tiempo ya
+ * va en "otro nucleo". Los grandes (ritmos absurdos, play_position), si.
+ */
+void Source::DecodeADPCMAhead(u64 target) {
+    if (state.adpcm_pending == 0 || state.current_buffer.size() >= target) {
+        return;
+    }
+    const u8* const memory =
+        memory_system->GetPhysicalPointer(state.current_buffer_physical_address & 0xFFFFFFFC);
+    if (!memory) {
+        state.adpcm_pending = 0;
+        return;
+    }
+    constexpr std::size_t kFrameSamples = 14;
+    constexpr std::size_t kFrameBytes = 8;
+    constexpr std::size_t kTimedSamples = 2048;
+    std::size_t count = state.adpcm_pending;
+    const u64 missing = target - state.current_buffer.size();
+    if (missing < count) {
+        const std::size_t frames = (static_cast<std::size_t>(missing) + kFrameSamples - 1) /
+                                   kFrameSamples;
+        count = std::min(count, frames * kFrameSamples);
+    }
+    const std::size_t decoded = state.current_buffer_length - state.adpcm_pending;
+    const u8* const data = memory + decoded / kFrameSamples * kFrameBytes;
+    if (count >= kTimedSamples) {
+        const DecodeTimer timer{count};
+        Codec::AppendADPCM(data, count, state.adpcm_buffer_coeffs, state.adpcm_state,
+                           state.current_buffer);
+    } else {
+        Stats::decoded.fetch_add(count, std::memory_order_relaxed);
+        Codec::AppendADPCM(data, count, state.adpcm_buffer_coeffs, state.adpcm_state,
+                           state.current_buffer);
+    }
+    state.adpcm_pending -= static_cast<u32>(count);
 }
 
 SourceStatus::Status Source::GetCurrentStatus() {

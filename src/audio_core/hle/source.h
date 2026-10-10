@@ -167,6 +167,11 @@ private:
 
         std::array<s16, 16> adpcm_coeffs = {};
         Codec::ADPCMState adpcm_state = {};
+        // ADPCM por tramos (0.3.3.2, ver DecodeADPCMAhead): muestras del buffer
+        // actual que quedan por decodificar y los coeficientes que habia al
+        // sacarlo de la cola.
+        u32 adpcm_pending = 0;
+        std::array<s16, 16> adpcm_buffer_coeffs = {};
 
         // Resampling state
 
@@ -217,6 +222,9 @@ private:
     /// INTERNAL: Dequeues a buffer and does preprocessing on it (decoding, resampling). Puts it
     /// into current_buffer.
     bool DequeueBuffer();
+    /// INTERNAL: Decodifica ADPCM pendiente del buffer actual hasta tener `target` muestras en
+    /// current_buffer (o hasta acabarlo).
+    void DecodeADPCMAhead(u64 target);
     /// INTERNAL: Generates a SourceStatus::Status based on our internal state.
     SourceStatus::Status GetCurrentStatus();
 
