@@ -17,8 +17,9 @@
 #ifdef __PSVITA__
 #include <algorithm>
 #include <atomic>
-#include <future>
+#include <chrono>
 #include <mutex>
+#include <thread>
 #include <vector>
 #include "common/thread_worker.h"
 #endif
@@ -62,17 +63,25 @@ std::mutex g_reads_mutex;
 std::vector<ReadDone> g_reads_done;
 std::atomic<bool> g_reads_pending{false};
 
+/**
+ * Sin std::packaged_task ni std::future (0.3.3.4): al publicar su resultado
+ * usan std::call_once, que en la libstdc++ de la Vita lanza system_error con un
+ * codigo basura. En 0.3.3.1 eso mataba el hilo FS_lectura en la primera
+ * lectura grande y el juego se quedaba esperandola al arrancar (Yo-kai Watch,
+ * Pokemon Sol, Zafiro Alfa). Basta un indicador.
+ */
 template <typename ResultFunctor>
 class ReadWakeUp final : public Kernel::HLERequestContext::WakeupCallback {
 public:
-    ReadWakeUp(Kernel::KernelSystem& kernel_, ResultFunctor functor_, std::future<void> done_)
+    ReadWakeUp(Kernel::KernelSystem& kernel_, ResultFunctor functor_,
+               std::shared_ptr<std::atomic<bool>> done_)
         : kernel{kernel_}, functor{std::move(functor_)}, done{std::move(done_)} {}
 
     // Si el hilo se destruye antes de despertar (fin de la partida), el
     // trabajador no puede seguir usando la peticion: se le espera.
     ~ReadWakeUp() override {
-        if (done.valid()) {
-            done.wait();
+        while (!done->load(std::memory_order_acquire)) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
         }
     }
 
@@ -89,7 +98,7 @@ public:
 private:
     Kernel::KernelSystem& kernel;
     ResultFunctor functor;
-    std::future<void> done;
+    std::shared_ptr<std::atomic<bool>> done;
 };
 } // Anonymous namespace
 
@@ -263,17 +272,19 @@ void File::Read(Kernel::HLERequestContext& ctx) {
         kernel.ReportAsyncState(true);
         auto* const context = &ctx;
         std::weak_ptr<Kernel::Thread> client = ctx.ClientThread();
-        auto task = std::make_shared<std::packaged_task<void()>>([context, read_section, client] {
+        auto done = std::make_shared<std::atomic<bool>>(false);
+        RomFsReadWorker().QueueWork([context, read_section, client, done] {
             const s64 sleep_for = read_section(*context);
-            const std::lock_guard lock{g_reads_mutex};
-            g_reads_done.push_back({client, sleep_for});
-            g_reads_pending.store(true, std::memory_order_release);
+            {
+                const std::lock_guard lock{g_reads_mutex};
+                g_reads_done.push_back({client, sleep_for});
+                g_reads_pending.store(true, std::memory_order_release);
+            }
+            done->store(true, std::memory_order_release);
         });
-        std::future<void> done = task->get_future();
-        RomFsReadWorker().QueueWork([task] { (*task)(); });
         ctx.SleepClientThread("FS_lectura", std::chrono::nanoseconds(-1),
                               std::make_shared<ReadWakeUp<decltype(result_section)>>(
-                                  kernel, result_section, std::move(done)));
+                                  kernel, result_section, done));
         return;
     }
 #endif
