@@ -79,6 +79,16 @@ public:
         stats_font = font;
     }
 
+    /// Donde esta la pantalla superior en la pantalla de la Vita con la
+    /// disposicion actual (g_screen_layout). La usa la captura del menu de inicio.
+    static void TopScreenRect(int& x, int& y, int& w, int& h) {
+        const ScreenRects rects = RectsFor(g_screen_layout.load(std::memory_order_relaxed));
+        x = rects.top_x;
+        y = rects.top_y;
+        w = rects.top_w;
+        h = rects.top_h;
+    }
+
 private:
     void BuildLayout();
     /// Rectangulos de las dos pantallas para una disposicion (ver

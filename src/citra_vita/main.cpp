@@ -1674,6 +1674,18 @@ void RunGame(vita2d_pgf* font, const std::string& path) {
     watchdog_stop.store(true, std::memory_order_relaxed);
     watchdog.join();
 
+    // La pantalla superior del juego para la ficha del menu de inicio (0.3.4.0),
+    // con el ultimo fotograma todavia en pantalla. Solo al salir con START+SELECT:
+    // tras un error lo que se ve es el mensaje, no el juego.
+    if (window->ShouldExit() && window->FramesPresented() > 0) {
+        int top_x = 0;
+        int top_y = 0;
+        int top_w = 0;
+        int top_h = 0;
+        VitaFrontend::EmuWindow_Vita::TopScreenRect(top_x, top_y, top_w, top_h);
+        VitaFrontend::CaptureGameScreen(path, top_x, top_y, top_w, top_h);
+    }
+
     // Resumen de la cache de traduccion al cerrar la partida (salga como salga:
     // el usuario cerro, o algo de lo de arriba lo corto). Sirve para decidir si
     // agrandar TRANS_CACHE_MB compensa: "capacidad" es la unica cifra que tiene
@@ -1900,6 +1912,7 @@ void Run(vita2d_pgf* font) {
             // La textura de iconos vuelve a la CDRAM: la necesita el juego.
             menu.ReleaseTextures();
             RunGame(font, menu.SelectedPath());
+            menu.ForgetScreenshot(menu.SelectedPath());
             // Al volver del juego hay que reiniciar el estado de botones para
             // que la combinacion de salida no se lea aqui como una pulsacion.
             previous_buttons = ~0u;

@@ -63,8 +63,11 @@ public:
     void DrawScene(float settings_hold, float language_hold);
     void Draw(float settings_hold, float language_hold);
 
-    /// Devuelve la textura de iconos a la CDRAM antes de arrancar un juego.
+    /// Devuelve las texturas (iconos y captura) a la CDRAM antes de arrancar un juego.
     void ReleaseTextures();
+
+    /// Al volver de un juego: su captura es nueva y hay que volver a leerla.
+    void ForgetScreenshot(const std::string& path);
 
 private:
     struct Entry {
@@ -77,6 +80,8 @@ private:
         bool info_loaded = false;
         bool uploaded = false;
         u32 tint = 0;
+        /// Captura de la pantalla superior: 0 sin mirar, 1 no hay, 2 hay.
+        int shot_state = 0;
     };
 
     void LoadInfo(Entry& entry);
@@ -90,6 +95,9 @@ private:
     void DrawBackground();
     void DrawTopBar();
     void DrawPanel();
+    /// La "pantalla superior" de la ficha: la captura del juego, o su icono en grande.
+    void DrawMiniScreen(float x, float y, float w, float h);
+    bool LoadScreenshot(int index);
     void DrawGrid();
     void DrawTile(int index, float x, float y, float size, bool is_selected);
     void DrawSlider();
@@ -100,6 +108,13 @@ private:
     int selected = 0;
     vita2d_texture* atlas = nullptr;
     bool atlas_failed = false;
+
+    /// Una sola textura para la captura del seleccionado (se cambia al moverse).
+    vita2d_texture* shot = nullptr;
+    int shot_for = -1;
+    /// Fundido de entrada de la captura, de 0 a 1.
+    float shot_fade = 0.0f;
+    int shown_selection = -1;
 
     /// Desplazamiento horizontal de la cuadricula, en pixeles, y adonde va.
     float camera = 0.0f;
@@ -121,6 +136,16 @@ private:
     int touch_last_y = 0;
     float touch_start_camera = 0.0f;
 };
+
+/**
+ * Guarda la pantalla superior del juego tal y como se ve ahora en la Vita
+ * (0.3.4.0). Se llama al salir con START+SELECT, con el ultimo fotograma
+ * todavia en pantalla. Se lee la imagen que esta mostrando la consola, asi que
+ * vale igual con GXM que con software y en cualquier disposicion: x, y, w, h
+ * dicen donde esta la superior. Va a ux0:/data/azahar/capturas/<fichero>.scr,
+ * en RGB565 a 400x240.
+ */
+void CaptureGameScreen(const std::string& path, int x, int y, int w, int h);
 
 /**
  * Selector del idioma de los menus, dibujado encima del menu de inicio.

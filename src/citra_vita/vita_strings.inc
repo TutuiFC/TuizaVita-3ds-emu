@@ -34,6 +34,14 @@ TR(kHomeNoInfo,
    "Keine Titeldaten (verschlüsselte ROM oder Homebrew ohne Symbol)",
    "Nessun dato del titolo (ROM cifrata o homebrew senza icona)",
    "Sem dados do título (ROM criptografada ou homebrew sem ícone)")
+TR(kHomeNoShot,
+   "The screen will show up here after you play",
+   "La pantalla saldrá aquí cuando juegues",
+   "La pantalla sortirà aquí quan juguis",
+   "L'écran s'affichera ici après avoir joué",
+   "Der Bildschirm erscheint hier nach dem Spielen",
+   "Lo schermo apparirà qui dopo aver giocato",
+   "A tela aparecerá aqui depois que você jogar")
 TR(kHomePlay, "Play", "Jugar", "Jugar", "Jouer", "Spielen", "Gioca", "Jogar")
 TR(kHomeExit, "Exit", "Salir", "Sortir", "Quitter", "Beenden", "Esci", "Sair")
 TR(kHomeSettingsHold,

@@ -8,6 +8,9 @@
 #include <cstdio>
 #include <cstring>
 #include <psp2/ctrl.h>
+#include <psp2/display.h>
+#include <psp2/io/fcntl.h>
+#include <psp2/io/stat.h>
 #include <psp2/kernel/processmgr.h>
 #include <psp2/power.h>
 #include <psp2/rtc.h>
@@ -49,9 +52,9 @@ constexpr int kScreenH = 544;
 constexpr int kTopBarH = 34;
 
 /// La ficha del juego, como la pantalla superior de la 3DS.
-constexpr float kPanelX = 150.0f;
+constexpr float kPanelX = 30.0f;
 constexpr float kPanelY = 48.0f;
-constexpr float kPanelW = 660.0f;
+constexpr float kPanelW = 900.0f;
 constexpr float kPanelH = 176.0f;
 
 /// La cuadricula: dos filas, rellena por columnas como la de la consola.
@@ -71,6 +74,12 @@ constexpr int kCell = 50;
 constexpr int kCellsPerRow = kAtlasSize / kCell;
 constexpr int kAtlasSlots = kCellsPerRow * kCellsPerRow;
 constexpr int kIconSize = 48;
+
+/// Capturas de la pantalla superior (0.3.4.0): 400x240 en RGB565.
+constexpr int kShotW = 400;
+constexpr int kShotH = 240;
+constexpr u32 kShotMagic = 0x43535A41; // "AZSC"
+constexpr char kShotDir[] = "ux0:/data/azahar/capturas";
 
 constexpr u64 kRepeatDelayUs = 380'000;
 constexpr u64 kRepeatEveryUs = 90'000;
@@ -190,7 +199,67 @@ std::string Ellipsize(vita2d_pgf* font, float scale, const std::string& text, in
     return "...";
 }
 
+/// ux0:/data/azahar/capturas/<nombre del fichero>.scr
+std::string ShotPath(const std::string& rom_path) {
+    const std::size_t slash = rom_path.find_last_of('/');
+    const std::string name = slash == std::string::npos ? rom_path : rom_path.substr(slash + 1);
+    return std::string(kShotDir) + "/" + name + ".scr";
+}
+
+struct ShotHeader {
+    u32 magic;
+    u16 width;
+    u16 height;
+};
+
 } // Anonymous namespace
+
+void CaptureGameScreen(const std::string& path, int x, int y, int w, int h) {
+    SceDisplayFrameBuf frame{};
+    frame.size = sizeof(frame);
+    if (sceDisplayGetFrameBuf(&frame, SCE_DISPLAY_SETBUF_NEXTFRAME) < 0 || frame.base == nullptr ||
+        frame.pixelformat != SCE_DISPLAY_PIXELFORMAT_A8B8G8R8 || w <= 0 || h <= 0 || x < 0 ||
+        y < 0 || x + w > static_cast<int>(frame.width) || y + h > static_cast<int>(frame.height)) {
+        return;
+    }
+    const auto* pixels = static_cast<const u32*>(frame.base);
+    std::vector<u16> image(static_cast<std::size_t>(kShotW * kShotH));
+    // Al reducir (pantalla grande) se promedian 2x2 para que no salga dentado.
+    const int step = w >= 2 * kShotW - 40 ? 1 : 0;
+    for (int row = 0; row < kShotH; row++) {
+        const int sy = y + row * h / kShotH;
+        const u32* line = pixels + static_cast<std::size_t>(sy) * frame.pitch;
+        const u32* next = step != 0 && sy + 1 < y + h ? line + frame.pitch : line;
+        for (int column = 0; column < kShotW; column++) {
+            const int sx = x + column * w / kShotW;
+            const u32 taps[4] = {line[sx], line[sx + step], next[sx], next[sx + step]};
+            u32 r = 0;
+            u32 g = 0;
+            u32 b = 0;
+            for (const u32 c : taps) {
+                r += c & 0xFF;
+                g += (c >> 8) & 0xFF;
+                b += (c >> 16) & 0xFF;
+            }
+            r /= 4;
+            g /= 4;
+            b /= 4;
+            image[static_cast<std::size_t>(row * kShotW + column)] =
+                static_cast<u16>(((r >> 3) << 11) | ((g >> 2) << 5) | (b >> 3));
+        }
+    }
+
+    sceIoMkdir(kShotDir, 0777);
+    const SceUID fd =
+        sceIoOpen(ShotPath(path).c_str(), SCE_O_WRONLY | SCE_O_CREAT | SCE_O_TRUNC, 0777);
+    if (fd < 0) {
+        return;
+    }
+    const ShotHeader header{kShotMagic, kShotW, kShotH};
+    sceIoWrite(fd, &header, sizeof(header));
+    sceIoWrite(fd, image.data(), static_cast<SceSize>(image.size() * sizeof(u16)));
+    sceIoClose(fd);
+}
 
 HomeMenu::HomeMenu(vita2d_pgf* font_) : font(font_) {
     sceTouchSetSamplingState(SCE_TOUCH_PORT_FRONT, SCE_TOUCH_SAMPLING_STATE_START);
@@ -342,15 +411,73 @@ void HomeMenu::UploadIcon(int index) {
 }
 
 void HomeMenu::ReleaseTextures() {
-    if (atlas != nullptr) {
+    if (atlas != nullptr || shot != nullptr) {
         vita2d_wait_rendering_done();
+    }
+    if (atlas != nullptr) {
         vita2d_free_texture(atlas);
         atlas = nullptr;
     }
+    if (shot != nullptr) {
+        vita2d_free_texture(shot);
+        shot = nullptr;
+    }
+    shot_for = -1;
     atlas_failed = false;
     for (Entry& entry : entries) {
         entry.uploaded = false;
     }
+}
+
+void HomeMenu::ForgetScreenshot(const std::string& path) {
+    for (Entry& entry : entries) {
+        if (entry.path == path) {
+            entry.shot_state = 0;
+        }
+    }
+    shot_for = -1;
+    shown_selection = -1;
+}
+
+bool HomeMenu::LoadScreenshot(int index) {
+    Entry& entry = entries[index];
+    if (entry.shot_state == 1) {
+        return false;
+    }
+    if (shot_for == index && shot != nullptr) {
+        return true;
+    }
+    const SceUID fd = sceIoOpen(ShotPath(entry.path).c_str(), SCE_O_RDONLY, 0);
+    if (fd < 0) {
+        entry.shot_state = 1;
+        return false;
+    }
+    ShotHeader header{};
+    bool ok = sceIoRead(fd, &header, sizeof(header)) == static_cast<int>(sizeof(header)) &&
+              header.magic == kShotMagic && header.width == kShotW && header.height == kShotH;
+    if (ok && shot == nullptr) {
+        shot = vita2d_create_empty_texture_format(kShotW, kShotH,
+                                                  SCE_GXM_TEXTURE_FORMAT_U5U6U5_RGB);
+        if (shot != nullptr) {
+            vita2d_texture_set_filters(shot, SCE_GXM_TEXTURE_FILTER_LINEAR,
+                                       SCE_GXM_TEXTURE_FILTER_LINEAR);
+        }
+    }
+    ok = ok && shot != nullptr;
+    if (ok) {
+        // La textura la puede estar leyendo el fotograma anterior.
+        vita2d_wait_rendering_done();
+        auto* base = static_cast<u8*>(vita2d_texture_get_datap(shot));
+        const unsigned int stride = vita2d_texture_get_stride(shot);
+        for (int row = 0; row < kShotH && ok; row++) {
+            ok = sceIoRead(fd, base + row * stride, kShotW * sizeof(u16)) ==
+                 static_cast<int>(kShotW * sizeof(u16));
+        }
+    }
+    sceIoClose(fd);
+    entry.shot_state = ok ? 2 : 1;
+    shot_for = ok ? index : -1;
+    return ok;
 }
 
 int HomeMenu::Columns() const {
@@ -574,6 +701,48 @@ void HomeMenu::DrawTopBar() {
     }
 }
 
+void HomeMenu::DrawMiniScreen(float x, float y, float w, float h) {
+    // El marco negro de la pantalla superior de la consola.
+    FillRoundRect(x - 6.0f, y - 6.0f, w + 12.0f, h + 12.0f, 10.0f, Rgb(0x23272D));
+    vita2d_draw_rectangle(x, y, w, h, Rgb(0x0E1013));
+    if (entries.empty()) {
+        return;
+    }
+    if (shown_selection != selected) {
+        shown_selection = selected;
+        shot_fade = 0.0f;
+    }
+    shot_fade = std::min(1.0f, shot_fade + 0.12f);
+    const unsigned int alpha = static_cast<unsigned int>(shot_fade * 255.0f);
+
+    if (LoadScreenshot(selected)) {
+        vita2d_draw_texture_tint_part_scale(shot, x, y, 0.0f, 0.0f, kShotW, kShotH,
+                                            w / static_cast<float>(kShotW),
+                                            h / static_cast<float>(kShotH),
+                                            Rgb(0xFFFFFF, alpha));
+        // Reflejo suave arriba, como el cristal de la pantalla.
+        vita2d_draw_rectangle(x, y, w, h * 0.18f, Rgb(0xFFFFFF, 0x12));
+        return;
+    }
+
+    // Aun sin captura (no se ha jugado): degradado del color del juego con el
+    // icono en grande y una pista de que la imagen sale al jugar.
+    const Entry& entry = entries[selected];
+    const unsigned int top = Mix(entry.tint, 0xFFFFFF, 0.35f);
+    const unsigned int bottom = Mix(entry.tint, 0x101418, 0.55f);
+    constexpr int kBands = 12;
+    for (int i = 0; i < kBands; i++) {
+        const float t = static_cast<float>(i) / static_cast<float>(kBands - 1);
+        vita2d_draw_rectangle(x, y + h * static_cast<float>(i) / kBands, w, h / kBands + 1.0f,
+                              Rgb(Mix(top, bottom, t), alpha));
+    }
+    const float big = h * 0.6f;
+    DrawTile(selected, x + (w - big) / 2.0f, y + (h - big) / 2.0f - 8.0f, big, false);
+    I18n::DrawTextFit(font, static_cast<int>(x) + 10, static_cast<int>(y + h) - 8,
+                      Rgb(0xFFFFFF, 0xD0), 0.6f, I18n::Tr(I18n::kHomeNoShot),
+                      static_cast<int>(w) - 20);
+}
+
 void HomeMenu::DrawPanel() {
     FillRoundRect(kPanelX, kPanelY + 4.0f, kPanelW, kPanelH, 16.0f, Rgb(0xBDC3CA));
     FillRoundRect(kPanelX - 1.0f, kPanelY - 1.0f, kPanelW + 2.0f, kPanelH + 2.0f, 16.0f,
@@ -582,38 +751,46 @@ void HomeMenu::DrawPanel() {
     // Franja de color arriba, como el marco del titulo en la pantalla superior.
     vita2d_draw_rectangle(kPanelX + 15.0f, kPanelY, kPanelW - 30.0f, 4.0f, Rgb(kCyan));
 
+    // La pantalla superior en pequeno, en la proporcion de la de la 3DS (5:3).
+    constexpr float kMiniH = 148.0f;
+    constexpr float kMiniW = kMiniH * 5.0f / 3.0f;
+    const float mini_x = kPanelX + 20.0f;
+    const float mini_y = kPanelY + (kPanelH - kMiniH) / 2.0f + 2.0f;
+    DrawMiniScreen(mini_x, mini_y, kMiniW, kMiniH);
+
+    const float info_x = mini_x + kMiniW + 30.0f;
+    const int line_w = static_cast<int>(kPanelX + kPanelW - info_x) - 24;
     if (entries.empty()) {
-        I18n::DrawTextFit(font, static_cast<int>(kPanelX) + 30, static_cast<int>(kPanelY) + 80,
-                          Rgb(kInk), 1.1f, I18n::Tr(I18n::kHomeNoGames),
-                          static_cast<int>(kPanelW) - 60);
-        I18n::DrawTextFit(font, static_cast<int>(kPanelX) + 30, static_cast<int>(kPanelY) + 116,
-                          Rgb(kInkDim), 0.85f, I18n::Tr(I18n::kHomeNoGamesHint),
-                          static_cast<int>(kPanelW) - 60);
+        I18n::DrawTextFit(font, static_cast<int>(info_x), static_cast<int>(kPanelY) + 80,
+                          Rgb(kInk), 1.1f, I18n::Tr(I18n::kHomeNoGames), line_w);
+        I18n::DrawTextFit(font, static_cast<int>(info_x), static_cast<int>(kPanelY) + 116,
+                          Rgb(kInkDim), 0.8f, I18n::Tr(I18n::kHomeNoGamesHint), line_w);
         return;
     }
 
     const Entry& entry = entries[selected];
-    constexpr float kBig = 104.0f;
-    const float icon_x = kPanelX + 30.0f;
-    const float icon_y = kPanelY + (kPanelH - kBig) / 2.0f;
-    DrawTile(selected, icon_x, icon_y, kBig, false);
+    constexpr float kIcon = 84.0f;
+    const float icon_y = kPanelY + 24.0f;
+    DrawTile(selected, info_x, icon_y, kIcon, false);
 
-    const int text_x = static_cast<int>(icon_x + kBig + 28.0f);
+    const int text_x = static_cast<int>(info_x + kIcon + 22.0f);
     const int text_w = static_cast<int>(kPanelX + kPanelW) - text_x - 24;
-    const std::string title = Ellipsize(font, 1.25f, entry.title, text_w);
-    vita2d_pgf_draw_text(font, text_x, static_cast<int>(kPanelY) + 78, Rgb(kInk), 1.25f,
+    const std::string title = Ellipsize(font, 1.2f, entry.title, text_w);
+    vita2d_pgf_draw_text(font, text_x, static_cast<int>(icon_y) + 34, Rgb(kInk), 1.2f,
                          title.c_str());
     if (!entry.publisher.empty()) {
-        const std::string publisher = Ellipsize(font, 0.9f, entry.publisher, text_w);
-        vita2d_pgf_draw_text(font, text_x, static_cast<int>(kPanelY) + 110, Rgb(kInkDim), 0.9f,
+        const std::string publisher = Ellipsize(font, 0.88f, entry.publisher, text_w);
+        vita2d_pgf_draw_text(font, text_x, static_cast<int>(icon_y) + 66, Rgb(kInkDim), 0.88f,
                              publisher.c_str());
     } else if (entry.info_loaded && entry.icon.empty()) {
-        I18n::DrawTextFit(font, text_x, static_cast<int>(kPanelY) + 110, Rgb(kInkDim), 0.75f,
+        I18n::DrawTextFit(font, text_x, static_cast<int>(icon_y) + 66, Rgb(kInkDim), 0.72f,
                           I18n::Tr(I18n::kHomeNoInfo), text_w);
     }
-    const std::string file = Ellipsize(font, 0.72f, entry.name, text_w);
-    vita2d_pgf_draw_text(font, text_x, static_cast<int>(kPanelY) + 146, Rgb(0xA3AAB2), 0.72f,
-                         file.c_str());
+    vita2d_draw_rectangle(info_x, kPanelY + 124.0f, static_cast<float>(line_w), 1.0f,
+                          Rgb(0xE1E5E9));
+    const std::string file = Ellipsize(font, 0.72f, entry.name, line_w);
+    vita2d_pgf_draw_text(font, static_cast<int>(info_x), static_cast<int>(kPanelY) + 150,
+                         Rgb(0xA3AAB2), 0.72f, file.c_str());
 }
 
 void HomeMenu::DrawTile(int index, float x, float y, float size, bool is_selected) {
