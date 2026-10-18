@@ -50,6 +50,7 @@ std::atomic<u32> thumb{1};
 std::atomic<u32> profile{0};
 std::atomic<u32> link_table{1};
 std::atomic<u32> veneers{1};
+std::atomic<u32> reuse_base{1};
 
 namespace {
 
@@ -1130,6 +1131,7 @@ struct CostStats {
     u64 vm_closes = 0, vm_close_us = 0;
     u64 vm_syncs = 0, vm_sync_us = 0;
     u64 vm_lock_us = 0;
+    u64 reused_bases = 0; ///< bases que no se cargan otra vez (0.3.3.8, ver RnHost)
 };
 CostStats g_cost;
 
@@ -2235,15 +2237,22 @@ public:
     /// Una instruccion. 'pc' es su direccion en el juego.
     void Instruction(u32 inst, u32 pc, const Decoded& decoded) {
         const u32 cond = inst >> 28;
+        // El base que dejo en kRn la instruccion anterior vale solo para esta
+        // (ver RnHost).
+        incoming_rn_ = carried_rn_;
+        carried_rn_ = -1;
+        current_cond_ = cond;
         if (decoded.terminator) {
             // BLX inmediato no tiene condicion: su campo vale 0xF.
             Terminator(inst, pc, decoded,
                        decoded.kind == Kind::BranchLinkExchangeImm ? kAlways : cond);
+            carried_rn_ = -1; // los enlaces usan kRn
             return;
         }
         // Sin cuerpo no hay nada que saltar (y PLD lleva el campo de
         // condicion a 0xF, que no es una condicion).
         if (decoded.kind == Kind::Nop) {
+            carried_rn_ = incoming_rn_; // no emite nada: kRn sigue igual
             return;
         }
         // CLREX tambien lleva 0xF ahi: siempre se ejecuta.
@@ -2450,6 +2459,9 @@ public:
             if (internal_branches_[i].second == pc) {
                 e.PatchBranch(internal_branches_[i].first, e.Position());
                 internal_branches_.erase(internal_branches_.begin() + static_cast<long>(i));
+                // Por el salto se llega sin pasar por la anterior: kRn no
+                // tiene por que tener lo que ella dejo.
+                carried_rn_ = -1;
             } else {
                 i++;
             }
@@ -2514,6 +2526,15 @@ private:
     u32 block_count_ = 0;
     bool has_literal_ = false;
     u32 literal_ = 0;
+    /**
+     * EL BASE YA CARGADO (0.3.3.8, ver RnHost). carried_rn_: el registro del
+     * juego (sin hueco en la cache) cuyo valor deja en kRn la instruccion que
+     * se acaba de compilar; incoming_rn_: el que dejo la anterior, que es el
+     * que vale para la actual. current_cond_: la condicion de la actual.
+     */
+    s8 carried_rn_ = -1;
+    s8 incoming_rn_ = -1;
+    u32 current_cond_ = kAlways;
     /// El terminador que se compila ahora es un salto lateral (0.2.3.1, ver
     /// DecodeArmBlock): lo que se devuelve si se toma, y si salta dentro, a que
     /// PC y cuantas instrucciones se salta.
@@ -2740,7 +2761,7 @@ private:
          * es UNA instruccion del anfitrion. Los que no estan cacheados van por
          * los temporales de siempre (y el PC, que nunca se cachea, tambien).
          */
-        const u32 rn_host = uses_rn ? OperandHost(kRn, rn, pc) : 0u;
+        const u32 rn_host = uses_rn ? RnHost(rn, pc, false) : 0u;
         const s8 rd_cached = writes_rd ? CacheHost(rd) : static_cast<s8>(-1);
         const u32 rd_host = rd_cached >= 0 ? static_cast<u32>(rd_cached) : kRd;
         /**
@@ -2768,6 +2789,42 @@ private:
         }
         if (writes_rd && rd_cached < 0) {
             StoreGuest(kRd, rd);
+        }
+        if (uses_rn && !(writes_rd && rd == rn)) {
+            CarryRn(rn);
+        }
+    }
+
+    /**
+     * EL BASE YA CARGADO (0.3.3.8). Un registro del juego sin hueco en la
+     * cache se carga de cpu->Reg cada vez que se usa: en un bloque de Zafiro
+     * Alfa (jit_volcado.bin de 0.3.3.4), catorce "strb r8, [sp, #k]" seguidos
+     * eran catorce LDR del mismo sp. Si la instruccion anterior -- sin
+     * condicion, sin un salto interno que caiga entre las dos y sin escribir
+     * ese registro -- ya lo dejo en kRn, se usa sin cargarlo. Solo kRn y solo
+     * de una instruccion a la siguiente: las que lo dejan (CarryRn: datos,
+     * LDR/STR y compania, VLDR/VSTR, sin escritura del base) no vuelven a
+     * tocar kRn ni tienen caminos frios que vuelvan. La variante de
+     * comprobacion hace lo mismo, asi que un fallo aqui saldria como
+     * DIFERENCIA. 'in_temp': tiene que acabar en kRn aunque este cacheado.
+     */
+    u32 RnHost(u32 rn, u32 pc, bool in_temp) {
+        if (rn < 15 && CacheHost(rn) < 0 && incoming_rn_ == static_cast<s8>(rn) &&
+            reuse_base.load(std::memory_order_relaxed) != 0) {
+            g_cost.reused_bases++;
+            return kRn;
+        }
+        if (in_temp) {
+            LoadGuest(kRn, rn, pc);
+            return kRn;
+        }
+        return OperandHost(kRn, rn, pc);
+    }
+
+    /// kRn tiene ahora el valor de 'rn' para la instruccion siguiente.
+    void CarryRn(u32 rn) {
+        if (rn < 15 && CacheHost(rn) < 0 && current_cond_ == kAlways) {
+            carried_rn_ = static_cast<s8>(rn);
         }
     }
 
@@ -2974,12 +3031,7 @@ private:
             const u32 offset = inst & 0xFFFu;
             e.Mov32(kRs, up ? PcRead(pc) + offset : PcRead(pc) - offset);
         } else {
-            u32 base = kRn;
-            if (writeback) {
-                LoadGuest(kRn, rn, pc);
-            } else {
-                base = OperandHost(kRn, rn, pc);
-            }
+            const u32 base = RnHost(rn, pc, writeback);
             u32 computed = base;
             if (reg_offset) {
                 // ADD/SUB kRs, base, rm, <desplazamiento>: los bits 5-11 son los
@@ -3014,6 +3066,9 @@ private:
             const u32 value = OperandHost(kRd, rd, pc);
             MemoryAccess(address, true, kind, value);
         }
+        if (!writeback && !(load && (rd == rn || rd == 15))) {
+            CarryRn(rn);
+        }
     }
 
     /// LDRH/STRH/LDRSB/LDRSH, como LoadStore (0.2.1.0): el inmediato de 8 bits
@@ -3034,12 +3089,7 @@ private:
         if (rn == 15 && imm_offset && !writeback) {
             e.Mov32(kRs, up ? PcRead(pc) + imm : PcRead(pc) - imm);
         } else {
-            u32 base = kRn;
-            if (writeback) {
-                LoadGuest(kRn, rn, pc);
-            } else {
-                base = OperandHost(kRn, rn, pc);
-            }
+            const u32 base = RnHost(rn, pc, writeback);
             u32 computed = base;
             if (!imm_offset) {
                 const u32 rm_host = OperandHost(kRm, Bits(inst, 0, 3), pc);
@@ -3061,6 +3111,9 @@ private:
             const u32 value = OperandHost(kRd, rd, pc);
             MemoryAccess(address, true, kHalf, value);
         }
+        if (!writeback && !(load && rd == rn)) {
+            CarryRn(rn);
+        }
     }
 
     /**
@@ -3077,7 +3130,7 @@ private:
         const u32 rn = Bits(inst, 16, 19);
         const u32 rd = Bits(inst, 12, 15);
 
-        LoadGuest(kRn, rn, pc);
+        RnHost(rn, pc, true);
         if (imm_offset) {
             e.Mov32(kRm, (Bits(inst, 8, 11) << 4) | Bits(inst, 0, 3));
         } else {
@@ -3318,11 +3371,14 @@ private:
         if (rn == 15) {
             e.Mov32(kRs, add ? PcRead(pc) + imm32 : PcRead(pc) - imm32);
         } else if (!base_as_is) {
-            AddImmediate(kRs, OperandHost(kRn, rn, pc), imm32, add);
+            AddImmediate(kRs, RnHost(rn, pc, false), imm32, add);
         }
+        // En todos los caminos kRn acaba con el base (si no tiene hueco):
+        // abajo solo se tocan kRs, kRd, kT0 y kT1.
+        CarryRn(rn);
         // kRs = direccion base+/-imm. Para double, la segunda palabra es +4.
         if (vfp_regs_) {
-            const u32 address = base_as_is ? OperandHost(kRn, rn, pc) : kRs;
+            const u32 address = base_as_is ? RnHost(rn, pc, false) : kRs;
             // Del registro a la memoria del juego y al reves, sin pasar por
             // ExtReg. El double, palabra a palabra como el interprete (cada
             // una con su pagina).
@@ -3427,6 +3483,8 @@ public:
      * Instruction ya puso la de una sola).
      */
     void VfpCdpRun(const u32* insts, u32 count, bool keep_flags, bool conditions) {
+        // Sin los VFP fijos usa kRn (el FPSCR del emulador): ver RnHost.
+        carried_rn_ = -1;
         if (vfp_regs_) {
             /**
              * Con los VFP fijos, sin mirar LEN y STRIDE en cada racha
@@ -3704,7 +3762,7 @@ private:
         if (keep_flags) {
             e.Mrs(kFlags);
         }
-        const u32 base = OperandHost(kRn, rn, pc);
+        const u32 base = RnHost(rn, pc, false);
         const u32 start = first != 0 ? kRs : base;
         AddSmall(start, base, first);
         std::vector<u32> slow;
@@ -3812,12 +3870,7 @@ private:
         }
         // El base ORIGINAL. Con escritura del base, en kRn: su hueco recibe el
         // nuevo antes de los accesos, y STM guarda el original.
-        u32 base = kRn;
-        if (writeback) {
-            LoadGuest(kRn, rn, pc);
-        } else {
-            base = OperandHost(kRn, rn, pc);
-        }
+        const u32 base = RnHost(rn, pc, writeback);
         const u32 start = first != 0 ? kRs : base;
         AddSmall(start, base, first);
         std::vector<u32> slow;
@@ -6077,7 +6130,7 @@ void MaybeReportCost() {
                     "{:.0f}/s | invalidar {:.1f}/s {:.0f} bloques/s {:.1f} ms/s | interprete: "
                     "traducir {:.0f} bloques/s {:.0f} instr/s {:.1f} ms/s, vaciar {:.1f}/s {:.1f} "
                     "ms/s | dominio: abrir {:.0f}/s {:.1f} us, cerrar {:.1f} us, sincronizar "
-                    "{:.0f}/s {:.1f} us, cerrojo {:.2f} ms/s",
+                    "{:.0f}/s {:.1f} us, cerrojo {:.2f} ms/s | bases reusadas al compilar {:.0f}/s",
                     seconds, per_s(c.compiles), ms_per_s(compile_us), each(compile_us, c.compiles),
                     each(c.analyze_us, c.compiles), each(c.emit_us, c.compiles),
                     each(c.compile_vm_us, c.compiles), per_s(c.revived), per_s(c.revive_failed),
@@ -6087,7 +6140,8 @@ void MaybeReportCost() {
                     per_s(c.translated), ms_per_s(c.translate_us), per_s(c.interp_resets),
                     ms_per_s(c.interp_reset_us), per_s(c.vm_opens), each(c.vm_open_us, c.vm_opens),
                     each(c.vm_close_us, c.vm_closes), per_s(c.vm_syncs),
-                    each(c.vm_sync_us, c.vm_syncs), ms_per_s(c.vm_lock_us))
+                    each(c.vm_sync_us, c.vm_syncs), ms_per_s(c.vm_lock_us),
+                    per_s(c.reused_bases))
             .c_str());
 }
 

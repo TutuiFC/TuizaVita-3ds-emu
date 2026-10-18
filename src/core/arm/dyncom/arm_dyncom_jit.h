@@ -176,6 +176,14 @@ extern std::atomic<u32> link_table;
 extern std::atomic<u32> veneers;
 
 /**
+ * Un registro del juego sin hueco en la cache que la instruccion anterior ya
+ * dejo en el temporal del base no se vuelve a cargar (0.3.3.8, ver RnHost).
+ * 0 = se carga siempre, como hasta 0.3.3.7. Clave "jit_reusar_base=" de
+ * ajustes.txt; al cambiarlo se vacia la cache de bloques.
+ */
+extern std::atomic<u32> reuse_base;
+
+/**
  * Llamar en el DESPACHO del interprete, con el PC ya alineado. Si hay codigo
  * para este bloque y cabe en el presupuesto, lo ejecuta y devuelve cuantas
  * instrucciones del juego ha ejecutado; con 0, el interprete sigue como
