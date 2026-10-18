@@ -945,10 +945,18 @@ static int InterpreterTranslateBlock(ARMul_State* cpu, std::size_t& bb_start, u3
 
     u32 phys_addr = addr;
     u32 pc_start = cpu->Reg[15];
+#ifdef __PSVITA__
+    // Lo que cuesta traducir (0.3.3.5): "jit coste" en crash.txt.
+    const unsigned long long begin = Common::VitaMicros();
+    u32 translated = 0;
+#endif
 
     while (ret == TransExtData::NON_BRANCH) {
         u32 inst_size = InterpreterTranslateInstruction(cpu, phys_addr, inst_base);
         phys_addr += inst_size;
+#ifdef __PSVITA__
+        translated++;
+#endif
 
         if ((phys_addr & 0xfff) == 0) {
             inst_base->br = TransExtData::END_OF_PAGE;
@@ -957,6 +965,9 @@ static int InterpreterTranslateBlock(ARMul_State* cpu, std::size_t& bb_start, u3
     };
 
     cpu->instruction_cache[pc_start] = bb_start;
+#ifdef __PSVITA__
+    Core::ArmJit::CountTranslation(Common::VitaMicros() - begin, translated);
+#endif
 
     return KEEP_GOING;
 }

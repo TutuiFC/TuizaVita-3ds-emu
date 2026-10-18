@@ -15,6 +15,8 @@
 #include <cstddef>
 #include <cstring>
 #include <functional>
+#include <mutex>
+#include <optional>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -899,6 +901,9 @@ enum class BlockState : u8 {
     Compiled,
     Rejected,
     Blacklisted,
+    /// Compilado, pero un tramo invalidado lo toca (0.3.3.5, ver Revive): su
+    /// codigo sigue ahi y vale si las instrucciones del juego no cambiaron.
+    Stale,
 };
 
 /**
@@ -990,6 +995,8 @@ struct Block {
     /// Saltos condicionales que siguen dentro del bloque (0.2.3.1, ver
     /// DecodeArmBlock): la comprobacion deja correr al interprete por ellos.
     u32 side_exits = 0;
+    /// Esta en g_patch_queue, con enlaces por parchear (0.3.3.5).
+    bool patch_queued = false;
 };
 
 /// Palabras de un enlace directo que cambia el parche, desde la primera (ver
@@ -1082,7 +1089,101 @@ u32 g_code_blocks = 0;
 bool g_ready = false;
 bool g_init_tried = false;
 
+/**
+ * EL COSTE DE COMPILAR, POR PARTES (0.3.3.5). En crash.txt de 0.3.3.4
+ * (Zafiro Alfa) "compilar" eran 7-13 ms por fotograma con unos mil bloques
+ * nuevos por segundo: ~200 us por bloque de diez instrucciones, unos 9.000
+ * ciclos por instruccion del juego, cuando generar el codigo son unos cientos.
+ * Y "resto" subia lo mismo a la vez. Aqui se reparte: decodificar y analizar,
+ * emitir, las llamadas al kernel del dominio VM (abrir, cerrar, sincronizar y
+ * la espera del cerrojo), publicar, invalidar y lo que el interprete gasta en
+ * traducir y en vaciar sus traducciones. Lo suma el hilo de emulacion; lo
+ * lee el overlay cada 10 s con TakeCostSummary.
+ */
+struct CostStats {
+    u64 compiles = 0;
+    u64 analyze_us = 0;
+    u64 emit_us = 0;       ///< EmitBlockCode menos su parte de dominio VM
+    u64 compile_vm_us = 0; ///< la parte de dominio VM de EmitBlockCode
+    u64 revived = 0;       ///< bloques invalidados que vuelven sin recompilar
+    u64 revive_failed = 0; ///< los que habian cambiado
+    u64 revive_us = 0;
+    u64 publishes = 0;
+    u64 patched_sites = 0;
+    u64 publish_us = 0;    ///< parchear los enlaces de lo publicado
+    u64 withdraws = 0;
+    u64 invalidations = 0;
+    u64 invalidated = 0;   ///< bloques que tocaba un tramo
+    u64 invalidate_us = 0;
+    u64 translations = 0;  ///< bloques que traduce el interprete
+    u64 translated = 0;    ///< sus instrucciones
+    u64 translate_us = 0;
+    u64 interp_resets = 0;
+    u64 interp_reset_us = 0;
+    u64 vm_opens = 0, vm_open_us = 0;
+    u64 vm_closes = 0, vm_close_us = 0;
+    u64 vm_syncs = 0, vm_sync_us = 0;
+    u64 vm_lock_us = 0;
+};
+CostStats g_cost;
+
+/// Todo lo que se va en el dominio VM (para separarlo dentro de compilar).
+u64 VmTotalUs() {
+    return g_cost.vm_open_us + g_cost.vm_close_us + g_cost.vm_sync_us + g_cost.vm_lock_us;
+}
+
+/**
+ * ESCRIBIR EN LA MEMORIA DE CODIGO: el cerrojo del dominio (ver
+ * Common::vita_vm_domain_mutex), abrirlo y, al salir del ambito, cerrarlo;
+ * cada paso cronometrado (0.3.3.5).
+ */
+class VmWrite {
+public:
+    VmWrite() {
+        const u64 t0 = Common::VitaMicros();
+        lock = std::unique_lock{Common::vita_vm_domain_mutex};
+        const u64 t1 = Common::VitaMicros();
+        rc = sceKernelOpenVMDomain();
+        const u64 t2 = Common::VitaMicros();
+        g_cost.vm_lock_us += t1 - t0;
+        g_cost.vm_opens++;
+        g_cost.vm_open_us += t2 - t1;
+    }
+    ~VmWrite() {
+        if (rc < 0) {
+            return;
+        }
+        const u64 t0 = Common::VitaMicros();
+        sceKernelCloseVMDomain();
+        g_cost.vm_closes++;
+        g_cost.vm_close_us += Common::VitaMicros() - t0;
+    }
+    VmWrite(const VmWrite&) = delete;
+    VmWrite& operator=(const VmWrite&) = delete;
+
+    [[nodiscard]] bool Ok() const {
+        return rc >= 0;
+    }
+    [[nodiscard]] int Result() const {
+        return rc;
+    }
+
+private:
+    std::unique_lock<std::mutex> lock;
+    int rc = -1;
+};
+
+/// sceKernelSyncVMDomain de lo recien escrito, cronometrado.
+void VmSync(SceUID block, void* address, u32 bytes) {
+    const u64 t0 = Common::VitaMicros();
+    sceKernelSyncVMDomain(block, address, bytes);
+    g_cost.vm_syncs++;
+    g_cost.vm_sync_us += Common::VitaMicros() - t0;
+}
+
 std::unordered_map<u32, Block> g_blocks;
+/// Bloques publicados con enlaces por parchear (ver FlushPatchQueue).
+std::vector<Block*> g_patch_queue;
 
 /// Atajo delante del mapa, como block_cache del interprete.
 constexpr u32 kFastSlots = 8192;
@@ -1183,6 +1284,8 @@ void FlushLocalStats() {
     g_local = LocalStats{};
 }
 
+void MeasureVmDomain();
+
 bool Init(ARMul_State* cpu) {
     g_init_tried = true;
     const auto base = reinterpret_cast<const u8*>(cpu);
@@ -1267,8 +1370,8 @@ bool Init(ARMul_State* cpu) {
         g_check_used_words = 0;
     }
     {
-        const std::lock_guard vm_lock{Common::vita_vm_domain_mutex};
-        if (sceKernelOpenVMDomain() < 0) {
+        const VmWrite vm;
+        if (!vm.Ok()) {
             Common::VitaNote("jit arm", "no se puede abrir el dominio VM: JIT apagado");
             return false;
         }
@@ -1369,8 +1472,7 @@ bool Init(ARMul_State* cpu) {
             e.StrImm(kRd, kCpu, RegOffset(15));
             e.BranchToAddress(kAlways, g_shared_exit[mode]);
         }
-        sceKernelSyncVMDomain(g_code_block, shared, kSharedWords * 4);
-        sceKernelCloseVMDomain();
+        VmSync(g_code_block, shared, kSharedWords * 4);
         if (e.Overflowed()) {
             Common::VitaNote("jit arm", "entrada y salida comunes sin sitio: JIT apagado");
             return false;
@@ -1379,7 +1481,56 @@ bool Init(ARMul_State* cpu) {
     g_ready = true;
     Common::VitaNote("jit arm",
                      fmt::format("listo ({} MB de codigo)", g_code_bytes >> 20).c_str());
+    MeasureVmDomain();
     return true;
+}
+
+/**
+ * LO QUE CUESTA CADA LLAMADA DEL DOMINIO VM, AL ARRANCAR (0.3.3.5). Cada
+ * bloque nuevo abre y cierra el dominio y sincroniza dos o tres tramos, y
+ * publicarlo otra vez abrir, cerrar y una sincronizacion por enlace. Si esas
+ * llamadas al kernel son caras, ahi esta el "compilar" de 200 us por bloque.
+ * Dieciseis de cada, para no depender de la partida.
+ */
+void MeasureVmDomain() {
+    constexpr u32 kRounds = 16;
+    const u64 c0 = Common::VitaMicros();
+    for (u32 i = 0; i < kRounds; i++) {
+        Common::VitaMicros();
+    }
+    const u64 c1 = Common::VitaMicros();
+    const std::lock_guard vm_lock{Common::vita_vm_domain_mutex};
+    const u64 t0 = Common::VitaMicros();
+    for (u32 i = 0; i < kRounds; i++) {
+        if (sceKernelOpenVMDomain() < 0) {
+            Common::VitaNote("jit dominio", "no se pudo abrir para medirlo");
+            return;
+        }
+        sceKernelCloseVMDomain();
+    }
+    const u64 t1 = Common::VitaMicros();
+    if (sceKernelOpenVMDomain() < 0) {
+        return;
+    }
+    u32* const shared = g_code + g_cold_start_words;
+    const u64 s0 = Common::VitaMicros();
+    for (u32 i = 0; i < kRounds; i++) {
+        sceKernelSyncVMDomain(g_code_block, shared, 32);
+    }
+    const u64 s1 = Common::VitaMicros();
+    for (u32 i = 0; i < kRounds; i++) {
+        sceKernelSyncVMDomain(g_code_block, shared, 4096);
+    }
+    const u64 s2 = Common::VitaMicros();
+    sceKernelCloseVMDomain();
+    const auto each = [](u64 begin, u64 end) {
+        return static_cast<double>(end - begin) / static_cast<double>(kRounds);
+    };
+    Common::VitaNote("jit dominio",
+                     fmt::format("abrir y cerrar {:.1f} us, sincronizar 32 B {:.1f} us y 4 KB "
+                                 "{:.1f} us, leer el reloj {:.2f} us",
+                                 each(t0, t1), each(s0, s1), each(s1, s2), each(c0, c1))
+                         .c_str());
 }
 
 // ---------------------------------------------------------------------------
@@ -4135,6 +4286,7 @@ u64 BlockHash(const Block& block) {
 void ResetAll() {
     FoldProfile();
     g_invalid_ranges.clear();
+    g_patch_queue.clear();
     g_blocks.clear();
     g_fast.fill(FastSlot{});
     g_code_used_words = 0;
@@ -4880,7 +5032,7 @@ BlockFn EmitCheckVariant(Block& block) {
         u32* const start = g_code + g_check_start_words + g_check_used_words;
         EmittedVariant out;
         if (EmitVariant(block, true, start, ring_words - g_check_used_words, nullptr, 0, out)) {
-            sceKernelSyncVMDomain(g_code_block, start, out.hot_words * 4);
+            VmSync(g_code_block, start, out.hot_words * 4);
             g_check_used_words += out.hot_words;
             return reinterpret_cast<BlockFn>(out.entry);
         }
@@ -4927,68 +5079,104 @@ void UnpatchSite(Block::LinkSite& site) {
 }
 
 void SyncSite(const Block::LinkSite& site) {
-    sceKernelSyncVMDomain(g_code_block, site.word0, (kLinkSiteBx + 1) * 4);
+    VmSync(g_code_block, site.word0, (kLinkSiteBx + 1) * 4);
 }
 
-/// Publica la entrada del bloque y parchea los enlaces que esperan por el.
+/**
+ * PARCHEAR EN TANDAS (0.3.3.5). Publicar un bloque abria el dominio VM,
+ * parcheaba sus enlaces de entrada (una sincronizacion por enlace) y lo
+ * cerraba, uno por uno y en medio de la rodaja: con mil bloques nuevos por
+ * segundo, mil aperturas y cierres mas. Ahora PublishEntry pone la entrada
+ * (desde ese momento los enlaces ya entran, por la prueba de g_link_check) y
+ * apunta el bloque aqui; FlushPatchQueue los parchea todos con una sola
+ * apertura al acabar la rodaja. Mientras, un enlace sin parchear solo es un
+ * poco mas lento. Los punteros valen: los Block solo se borran en ResetAll,
+ * que vacia la cola (g_patch_queue, junto a g_blocks).
+ */
+/// Publica la entrada del bloque; sus enlaces se parchean en FlushPatchQueue.
 void PublishEntry(Block& block) {
     if (block.link.entry != 0) {
         return;
     }
     block.link.entry = block.chain_entry;
+    g_cost.publishes++;
     if (block.incoming.empty() || block.chain_entry == 0 ||
-        direct_link_patch.load(std::memory_order_relaxed) == 0) {
+        direct_link_patch.load(std::memory_order_relaxed) == 0 || block.patch_queued) {
         return;
     }
-    const std::lock_guard vm_lock{Common::vita_vm_domain_mutex};
-    if (sceKernelOpenVMDomain() < 0) {
-        return;
-    }
-    for (Block::LinkSite& site : block.incoming) {
-        if (!site.patched) {
-            PatchSite(site, block);
-            SyncSite(site);
-        }
-    }
-    sceKernelCloseVMDomain();
+    block.patch_queued = true;
+    g_patch_queue.push_back(&block);
 }
 
-/// Despublica la entrada: los enlaces parcheados vuelven a mirar entry.
-void WithdrawEntry(Block& block) {
-    block.link.entry = 0;
-    bool any = false;
+void FlushPatchQueue() {
+    if (g_patch_queue.empty()) {
+        return;
+    }
+    const ScopedMicros timer{g_cost.publish_us};
+    const VmWrite vm;
+    for (Block* block : g_patch_queue) {
+        block->patch_queued = false;
+        // Retirado entretanto (invalidado, o una DIFERENCIA): nada que parchear.
+        if (!vm.Ok() || block->link.entry == 0) {
+            continue;
+        }
+        for (Block::LinkSite& site : block->incoming) {
+            if (!site.patched) {
+                PatchSite(site, *block);
+                SyncSite(site);
+                g_cost.patched_sites++;
+            }
+        }
+    }
+    g_patch_queue.clear();
+}
+
+bool HasPatchedIncoming(const Block& block) {
     for (const Block::LinkSite& site : block.incoming) {
-        any = any || site.patched;
+        if (site.patched) {
+            return true;
+        }
     }
-    if (!any) {
-        return;
-    }
-    const std::lock_guard vm_lock{Common::vita_vm_domain_mutex};
-    if (sceKernelOpenVMDomain() < 0) {
-        // Sin poder escribir el codigo, los enlaces seguirian saltando al
-        // bloque viejo: se tira todo en el siguiente TryRun.
-        g_flush_requested = true;
-        return;
-    }
+    return false;
+}
+
+/// Los enlaces parcheados hacia 'block' vuelven a mirar entry. Con el
+/// dominio ya abierto.
+void UnpatchIncoming(Block& block) {
     for (Block::LinkSite& site : block.incoming) {
         if (site.patched) {
             UnpatchSite(site);
             SyncSite(site);
         }
     }
-    sceKernelCloseVMDomain();
+}
+
+/// Despublica la entrada: los enlaces parcheados vuelven a mirar entry.
+void WithdrawEntry(Block& block) {
+    block.link.entry = 0;
+    g_cost.withdraws++;
+    if (!HasPatchedIncoming(block)) {
+        return;
+    }
+    const VmWrite vm;
+    if (!vm.Ok()) {
+        // Sin poder escribir el codigo, los enlaces seguirian saltando al
+        // bloque viejo: se tira todo en el siguiente TryRun.
+        g_flush_requested = true;
+        return;
+    }
+    UnpatchIncoming(block);
 }
 
 bool EmitBlockCode(Block& block, bool normal, bool check) {
-    const std::lock_guard vm_lock{Common::vita_vm_domain_mutex};
-    const int open_rc = sceKernelOpenVMDomain();
-    if (open_rc < 0) {
+    const VmWrite vm;
+    if (!vm.Ok()) {
         static bool noted = false;
         if (!noted) {
             noted = true;
             Common::VitaNote("jit arm",
                              fmt::format("no se puede abrir el dominio VM ({:#x})",
-                                         static_cast<u32>(open_rc))
+                                         static_cast<u32>(vm.Result()))
                                  .c_str());
         }
         return false;
@@ -5003,7 +5191,6 @@ bool EmitBlockCode(Block& block, bool normal, bool check) {
         if (!EmitVariant(block, false, start, g_cold_start_words - g_code_used_words, cold,
                          g_check_start_words - g_cold_start_words - g_cold_used_words, out,
                          &sites)) {
-            sceKernelCloseVMDomain();
             g_flush_requested = true;
             /**
              * Cada vaciado son cientos de ms recompilando lo que se usaba
@@ -5039,8 +5226,8 @@ bool EmitBlockCode(Block& block, bool normal, bool check) {
         }
         // Sin esto la cache de instrucciones puede tener lo que hubiera antes
         // en esa memoria y se ejecuta basura.
-        sceKernelSyncVMDomain(g_code_block, start, out.hot_words * 4);
-        sceKernelSyncVMDomain(g_code_block, cold, out.cold_words * 4);
+        VmSync(g_code_block, start, out.hot_words * 4);
+        VmSync(g_code_block, cold, out.cold_words * 4);
         DumpBlock(block, start, out.hot_words, cold, out.cold_words);
         g_code_used_words += out.hot_words;
         g_cold_used_words += out.cold_words;
@@ -5050,11 +5237,9 @@ bool EmitBlockCode(Block& block, bool normal, bool check) {
         // comprobacion se pide otra vez en StartCheck.
         check_code = EmitCheckVariant(block);
         if (check_code == nullptr && !normal) {
-            sceKernelCloseVMDomain();
             return false;
         }
     }
-    sceKernelCloseVMDomain();
     if (code != nullptr) {
         block.code = code;
         g_code_blocks++;
@@ -5158,6 +5343,66 @@ namespace {
  */
 bool DueForCheck(const Block& block);
 
+/// Vuelve a "nuevo" un bloque cuyo codigo ya no vale (ver ApplyInvalidations).
+/// El Block se queda: los enlaces y g_fast lo apuntan.
+void Forget(Block& block) {
+    block.state = BlockState::New;
+    block.visits = 0;
+    block.code = nullptr;
+    block.check_code = nullptr;
+    block.chain_entry = 0;
+    block.link.runs = 0;
+    block.reject = kRejectNone;
+    block.words.clear();
+    block.sizes.clear();
+    block.targets.clear();
+}
+
+/**
+ * BLOQUES INVALIDADOS QUE NO HAN CAMBIADO (0.3.3.5). Al cargar o descargar un
+ * modulo .cro, LDR:RO invalida su tramo entero, y Pokemon vuelve a cargar los
+ * mismos modulos al entrar en un edificio, al abrir el menu o al empezar un
+ * combate: crash.txt de 0.3.3.4, "ya comprobados" 3.119 en 10 s en Zafiro
+ * Alfa, miles de bloques recompilados con las MISMAS instrucciones en la
+ * misma direccion, a ~200 us cada uno. Ahora el bloque invalidado guarda su
+ * codigo (BlockState::Stale) y, la proxima vez que se despacha, se vuelven a
+ * leer sus instrucciones: si son las mismas -- palabra por palabra, y en Thumb
+ * tambien los tamanos y los destinos de los saltos --, el codigo generado
+ * seria identico y vale el de antes. Lo que la traduccion lee del juego son
+ * solo esas instrucciones (las constantes de la memoria se cargan al
+ * ejecutar), y los ajustes del JIT no cambian sin un Reset, que tira todo.
+ */
+bool Revive(ARMul_State* cpu, Block& block) {
+    const u64 begin = Common::VitaMicros();
+    // Un solo hilo emula: el bloque de prueba se reutiliza sin reservar memoria.
+    static Block probe;
+    probe.pc = block.pc;
+    probe.thumb = block.thumb;
+    probe.words.clear();
+    probe.sizes.clear();
+    probe.targets.clear();
+    const bool same = (cpu->Cpsr & (1u << 9)) == 0 &&
+                      (block.thumb ? DecodeThumbBlock(cpu, probe) : DecodeArmBlock(cpu, probe)) &&
+                      probe.guest_count == block.guest_count && probe.words == block.words &&
+                      probe.sizes == block.sizes && probe.targets == block.targets;
+    if (same) {
+        block.state = BlockState::Compiled;
+        // Como al compilar: lo ya comprobado con estas instrucciones no se
+        // vuelve a comprobar.
+        if (const auto it = g_verified.find(block.pc);
+            it != g_verified.end() && it->second == BlockHash(block)) {
+            block.link.runs = kFullChecks;
+        }
+        g_cost.revived++;
+    } else {
+        g_cost.revive_failed++;
+    }
+    const u64 spent = Common::VitaMicros() - begin;
+    g_cost.revive_us += spent;
+    g_compile_us += spent;
+    return same;
+}
+
 Block* Acquire(ARMul_State* cpu, u32 pc) {
     g_local.dispatches++;
     FastSlot& slot = g_fast[FastIndex(pc)];
@@ -5185,6 +5430,14 @@ Block* Acquire(ARMul_State* cpu, u32 pc) {
     case BlockState::Blacklisted:
         g_local.rejects[kRejectOther]++;
         return nullptr;
+    case BlockState::Stale:
+        if (Revive(cpu, *block)) {
+            return block;
+        }
+        // Ha cambiado: se recompila ya, sin la visita de espera (se ejecutaba).
+        Forget(*block);
+        block->visits = kCompileAfterVisits - 1;
+        break;
     case BlockState::New:
         break;
     }
@@ -5200,6 +5453,7 @@ Block* Acquire(ARMul_State* cpu, u32 pc) {
      * cuanto antes sale mas barato en total aunque el paron sea de una vez.
      */
     const ScopedMicros timer{g_compile_us};
+    const u64 analyze_begin = Common::VitaMicros();
     if (!Analyze(cpu, *block)) {
         block->state = BlockState::Rejected;
         g_local.rejects[block->reject]++;
@@ -5215,8 +5469,19 @@ Block* Acquire(ARMul_State* cpu, u32 pc) {
         block->link.runs = kFullChecks;
         Common::FrameStats::jit_reverified.fetch_add(1, std::memory_order_relaxed);
     }
+    const u64 emit_begin = Common::VitaMicros();
+    const u64 vm_before = VmTotalUs();
+    g_cost.analyze_us += emit_begin - analyze_begin;
     // Las dos variantes de una vez si le toca comprobacion (la primera vez, siempre).
-    if (!EmitBlockCode(*block, true, DueForCheck(*block))) {
+    const bool emitted = EmitBlockCode(*block, true, DueForCheck(*block));
+    {
+        const u64 emit_us = Common::VitaMicros() - emit_begin;
+        const u64 vm_us = VmTotalUs() - vm_before;
+        g_cost.compile_vm_us += vm_us;
+        g_cost.emit_us += emit_us > vm_us ? emit_us - vm_us : 0;
+        g_cost.compiles++;
+    }
+    if (!emitted) {
         // Sin sitio: se vacia en la siguiente llamada y se vuelve a intentar.
         block->visits = 0;
         return nullptr;
@@ -5524,12 +5789,84 @@ void FinishPendingCheck(ARMul_State* cpu) {
     g_verified[block.pc] = BlockHash(block);
 }
 
+namespace {
+
+/**
+ * "jit coste" en crash.txt cada 10 s (0.3.3.5, ver CostStats). Lo escribe el
+ * propio hilo de emulacion, que es el que suma: asi nadie lee los contadores
+ * mientras cambian. Por segundo, y por bloque o por llamada donde sirve.
+ */
+void MaybeReportCost() {
+    constexpr u64 kReportUs = 10'000'000;
+    constexpr u32 kMaxReports = 90;
+    static u64 last_us = 0;
+    static u32 reports = 0;
+    const u64 now = Common::VitaMicros();
+    if (last_us == 0) {
+        last_us = now;
+        g_cost = CostStats{};
+        return;
+    }
+    if (now - last_us < kReportUs) {
+        return;
+    }
+    const double seconds = static_cast<double>(now - last_us) / 1e6;
+    last_us = now;
+    const CostStats c = g_cost;
+    g_cost = CostStats{};
+    if (reports >= kMaxReports) {
+        return;
+    }
+    reports++;
+    const auto per_s = [seconds](u64 count) { return static_cast<double>(count) / seconds; };
+    const auto ms_per_s = [seconds](u64 us) { return static_cast<double>(us) / 1000.0 / seconds; };
+    const auto each = [](u64 us, u64 count) {
+        return count != 0 ? static_cast<double>(us) / static_cast<double>(count) : 0.0;
+    };
+    const u64 compile_us = c.analyze_us + c.emit_us + c.compile_vm_us;
+    Common::VitaNote(
+        "jit coste",
+        fmt::format("en {:.1f} s | compilar {:.0f}/s {:.1f} ms/s ({:.0f} us: analizar {:.0f} "
+                    "emitir {:.0f} dominio {:.0f}) | revivir {:.0f}/s ({:.0f} cambiados) {:.1f} "
+                    "ms/s | publicar {:.0f}/s, parchear {:.0f} enlaces/s {:.1f} ms/s | retirar "
+                    "{:.0f}/s | invalidar {:.1f}/s {:.0f} bloques/s {:.1f} ms/s | interprete: "
+                    "traducir {:.0f} bloques/s {:.0f} instr/s {:.1f} ms/s, vaciar {:.1f}/s {:.1f} "
+                    "ms/s | dominio: abrir {:.0f}/s {:.1f} us, cerrar {:.1f} us, sincronizar "
+                    "{:.0f}/s {:.1f} us, cerrojo {:.2f} ms/s",
+                    seconds, per_s(c.compiles), ms_per_s(compile_us), each(compile_us, c.compiles),
+                    each(c.analyze_us, c.compiles), each(c.emit_us, c.compiles),
+                    each(c.compile_vm_us, c.compiles), per_s(c.revived), per_s(c.revive_failed),
+                    ms_per_s(c.revive_us), per_s(c.publishes), per_s(c.patched_sites),
+                    ms_per_s(c.publish_us), per_s(c.withdraws), per_s(c.invalidations),
+                    per_s(c.invalidated), ms_per_s(c.invalidate_us), per_s(c.translations),
+                    per_s(c.translated), ms_per_s(c.translate_us), per_s(c.interp_resets),
+                    ms_per_s(c.interp_reset_us), per_s(c.vm_opens), each(c.vm_open_us, c.vm_opens),
+                    each(c.vm_close_us, c.vm_closes), per_s(c.vm_syncs),
+                    each(c.vm_sync_us, c.vm_syncs), ms_per_s(c.vm_lock_us))
+            .c_str());
+}
+
+} // Anonymous namespace
+
+void CountTranslation(u64 microseconds, u32 instructions) {
+    g_cost.translations++;
+    g_cost.translated += instructions;
+    g_cost.translate_us += microseconds;
+}
+
+void CountInterpreterReset(u64 microseconds) {
+    g_cost.interp_resets++;
+    g_cost.interp_reset_us += microseconds;
+}
+
 void AbandonPendingCheck(u32 slice_instructions) {
     // Sin comparar (la rodaja se acabo en medio): se comprueba otra vez.
     if (g_pending.active && g_pending.block != nullptr) {
         g_pending.block->link.runs = 0;
     }
     g_pending.active = false;
+    // Los enlaces hacia lo publicado en esta rodaja, de una vez (0.3.3.5).
+    FlushPatchQueue();
     g_local.instructions += slice_instructions;
     // 0.1.6.3: publicar cada 32 rodajas, no en cada una: son unas veinte
     // operaciones atomicas, y el overlay solo lo lee una vez por segundo.
@@ -5537,6 +5874,7 @@ void AbandonPendingCheck(u32 slice_instructions) {
     if (++slices_since_flush >= 32) {
         slices_since_flush = 0;
         FlushLocalStats();
+        MaybeReportCost();
     }
 }
 
@@ -5947,6 +6285,11 @@ void ApplyInvalidations() {
         }
     }
     g_invalid_ranges.clear();
+    const ScopedMicros timer{g_cost.invalidate_us};
+    g_cost.invalidations++;
+    static std::vector<Block*> hits;
+    hits.clear();
+    bool any_patched = false;
     for (auto& [key, block] : g_blocks) {
         // Un bloque no pasa del final de su pagina. Sin palabras (rechazado),
         // se cuenta hasta ahi: rehacer de mas no rompe nada. La clave de un
@@ -5964,21 +6307,43 @@ void ApplyInvalidations() {
         if (!hit) {
             continue;
         }
-        if (g_pending.active && g_pending.block == &block) {
+        hits.push_back(&block);
+        any_patched = any_patched || HasPatchedIncoming(block);
+    }
+    g_cost.invalidated += hits.size();
+    /**
+     * Los enlaces parcheados hacia todos ellos, con UNA apertura del dominio
+     * (0.3.3.5): antes cada bloque abria y cerraba el suyo, y un modulo
+     * descargado son miles de bloques.
+     */
+    std::optional<VmWrite> vm;
+    if (any_patched) {
+        vm.emplace();
+        if (!vm->Ok()) {
+            // Sin poder escribir el codigo, los enlaces seguirian saltando al
+            // bloque viejo: se tira todo en el siguiente TryRun.
+            g_flush_requested = true;
+        }
+    }
+    for (Block* block : hits) {
+        if (g_pending.active && g_pending.block == block) {
             g_pending.active = false;
         }
-        // El Block se queda (los enlaces y g_fast lo apuntan); vuelve a nuevo.
-        block.state = BlockState::New;
-        block.visits = 0;
-        block.code = nullptr;
-        block.check_code = nullptr;
-        WithdrawEntry(block);
-        block.chain_entry = 0;
-        block.link.runs = 0;
-        block.reject = kRejectNone;
-        block.words.clear();
-        block.sizes.clear();
-        block.targets.clear();
+        block->link.entry = 0;
+        g_cost.withdraws++;
+        if (vm.has_value() && vm->Ok()) {
+            UnpatchIncoming(*block);
+        }
+        // Lo compilado guarda su codigo por si vuelve igual (ver Revive); lo
+        // demas vuelve a nuevo. El Block se queda: los enlaces y g_fast lo
+        // apuntan.
+        if (block->state == BlockState::Compiled || block->state == BlockState::Stale) {
+            block->state = BlockState::Stale;
+            block->visits = 0;
+            block->link.runs = 0;
+        } else {
+            Forget(*block);
+        }
     }
 }
 

@@ -9,6 +9,7 @@
 #include "core/arm/skyeye_common/armsupp.h"
 #include "core/arm/skyeye_common/vfp/vfp.h"
 #ifdef __PSVITA__
+#include "common/vita_diag.h"
 #include "core/arm/dyncom/arm_dyncom_jit.h"
 #endif
 
@@ -73,6 +74,16 @@ void ResetTransCache() {
 }
 
 static void ResetInterpreterTranslations() {
+#ifdef __PSVITA__
+    // Lo que cuesta vaciar los indices (0.3.3.5): "jit coste" en crash.txt.
+    const unsigned long long begin = Common::VitaMicros();
+    struct Measure {
+        unsigned long long begin;
+        ~Measure() {
+            Core::ArmJit::CountInterpreterReset(Common::VitaMicros() - begin);
+        }
+    } measure{begin};
+#endif
     for (ARMul_State* cpu : trans_cache_users) {
         cpu->instruction_cache.clear();
         // OBLIGATORIO junto al de arriba: block_cache es un atajo delante del

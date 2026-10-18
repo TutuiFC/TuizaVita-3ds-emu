@@ -237,6 +237,11 @@ void AddSvcTime(u64 microseconds);
 /// pone su cuenta a cero ahi).
 void CountInstructions(u32 instructions);
 
+/// Lo que el interprete gasta en traducir un bloque y en vaciar todas sus
+/// traducciones (0.3.3.5): va a la nota "jit coste" de crash.txt.
+void CountTranslation(u64 microseconds, u32 instructions);
+void CountInterpreterReset(u64 microseconds);
+
 /**
  * CONTADORES DEL PROCESADOR (0.2.3.6), ver PmuSliceBegin en el .cpp. Las
  * rodajas del ARM los encienden y apagan, y las llamadas al sistema los

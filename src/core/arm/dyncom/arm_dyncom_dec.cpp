@@ -440,7 +440,51 @@ const InstructionSetEncodingItem arm_exclusion_code[] = {
 };
 // clang-format on
 
+static ARMDecodeStatus DecodeARMInstructionByTable(u32 instr, int* idx);
+
+#ifdef __PSVITA__
+/**
+ * LO YA DECODIFICADO, RECORDADO (0.3.3.5). DecodeARMInstructionByTable
+ * recorre la tabla de arriba entera hasta dar con la instruccion: LDR, STR y
+ * las de datos estan al final, unas 170 entradas con dos o tres pruebas cada
+ * una, y el interprete la llama por cada instruccion que traduce (miles por
+ * segundo cuando se vacian sus traducciones, en cada carga de un modulo .cro).
+ * El resultado solo depende de la palabra, y las palabras se repiten mucho
+ * ("bx lr", "push {r4, lr}"...): 4096 huecos con la palabra y su indice.
+ * Solo la llama el hilo de emulacion (interprete y JIT), sin cerrojos.
+ */
 ARMDecodeStatus DecodeARMInstruction(u32 instr, int* idx) {
+    struct Memo {
+        u32 instr;
+        s16 idx;
+        u16 state; ///< 0 vacio, 1 SUCCESS, 2 FAILURE
+    };
+    static Memo memo[4096] = {};
+    Memo& slot = memo[(instr * 2654435761u) >> 20];
+    if (slot.state != 0 && slot.instr == instr) {
+        if (slot.state == 1) {
+            *idx = slot.idx;
+            return ARMDecodeStatus::SUCCESS;
+        }
+        return ARMDecodeStatus::FAILURE;
+    }
+    int found = -1;
+    const ARMDecodeStatus status = DecodeARMInstructionByTable(instr, &found);
+    slot.instr = instr;
+    slot.idx = static_cast<s16>(found);
+    slot.state = status == ARMDecodeStatus::SUCCESS ? 1 : 2;
+    if (status == ARMDecodeStatus::SUCCESS) {
+        *idx = found;
+    }
+    return status;
+}
+#else
+ARMDecodeStatus DecodeARMInstruction(u32 instr, int* idx) {
+    return DecodeARMInstructionByTable(instr, idx);
+}
+#endif
+
+static ARMDecodeStatus DecodeARMInstructionByTable(u32 instr, int* idx) {
     int n = 0;
     int base = 0;
     int instr_slots = sizeof(arm_instruction) / sizeof(InstructionSetEncodingItem);
