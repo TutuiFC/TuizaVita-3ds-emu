@@ -434,6 +434,9 @@ struct UserSettings {
     /// 0.3.3.8: el base ya cargado por la instruccion anterior
     /// (Core::ArmJit::reuse_base). Solo ajustes.txt.
     bool jit_reuse_base = true;
+    /// 0.3.4.2: lotes con W-buffer en la GPU (Gxm::RasterizerGXM::wbuffer_on_gpu).
+    /// Solo ajustes.txt.
+    bool wbuffer_gpu = true;
     /// 0.3.3.9: idioma de los menus (VitaFrontend::I18n::Language). Ingles por
     /// defecto; se elige manteniendo SELECT en el menu de inicio.
     int menu_language = I18n::kEnglish;
@@ -552,6 +555,8 @@ void ApplyUserSettings() {
         static_cast<u32>(g_user.present_writeback_every), std::memory_order_relaxed);
     Gxm::RasterizerGXM::texture_copy_gpu.store(g_user.texture_copy_gpu ? 1u : 0u,
                                                std::memory_order_relaxed);
+    Gxm::RasterizerGXM::wbuffer_on_gpu.store(g_user.wbuffer_gpu ? 1u : 0u,
+                                             std::memory_order_relaxed);
 }
 
 /// Lee ajustes.txt. Si no existe o una linea no se entiende, se queda el valor
@@ -629,6 +634,7 @@ void LoadUserSettings() {
     read_bool("jit_tabla_enlaces=", g_user.jit_link_table);
     read_bool("jit_saltos_cro=", g_user.jit_veneers);
     read_bool("jit_reusar_base=", g_user.jit_reuse_base);
+    read_bool("wbuffer_gpu=", g_user.wbuffer_gpu);
     if (read_int("idioma_menu=", value)) {
         g_user.menu_language = std::clamp(value, 0, I18n::kLanguageCount - 1);
     }
@@ -645,7 +651,8 @@ int FormatUserSettings(char* buffer, std::size_t size) {
         "resolucion_gpu2=%d\nshaders_asinc=%d\njit_thumb=%d\njit_parche=%d\n"
         "jit_superbloques=%d\njit_regs_fijos=%d\njit_vfp_fijos=%d\nvertices_ram=%d\n"
         "dsp_hilo=%d\njit_perfil=%d\nvolcado_cada=%d\ncopia_textura_gpu=%d\n"
-        "jit_tabla_enlaces=%d\njit_saltos_cro=%d\njit_reusar_base=%d\nidioma_menu=%d\n",
+        "jit_tabla_enlaces=%d\njit_saltos_cro=%d\njit_reusar_base=%d\nidioma_menu=%d\n"
+        "wbuffer_gpu=%d\n",
         g_user.volume_percent, g_user.language, g_user.half_resolution ? 1 : 0,
         g_user.jit_reg_cache ? 1 : 0, g_user.jit_vfp_data ? 1 : 0, g_user.gxm_no_finish ? 1 : 0,
         g_user.gxm_present_direct ? 1 : 0, g_user.jit_direct_link ? 1 : 0,
@@ -658,7 +665,8 @@ int FormatUserSettings(char* buffer, std::size_t size) {
         g_user.jit_vfp_regs ? 1 : 0, g_user.vertex_ring_host ? 1 : 0,
         g_user.dsp_thread ? 1 : 0, g_user.jit_profile ? 1 : 0, g_user.present_writeback_every,
         g_user.texture_copy_gpu ? 1 : 0, g_user.jit_link_table ? 1 : 0,
-        g_user.jit_veneers ? 1 : 0, g_user.jit_reuse_base ? 1 : 0, g_user.menu_language);
+        g_user.jit_veneers ? 1 : 0, g_user.jit_reuse_base ? 1 : 0, g_user.menu_language,
+        g_user.wbuffer_gpu ? 1 : 0);
 }
 
 /// Los ajustes con los que se juega, a crash.txt en una linea (0.1.8.7): sin

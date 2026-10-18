@@ -27,6 +27,7 @@ namespace Pica::Shader::Generator::GXM {
 std::atomic<bool> g_allow_vs_escapes{true};
 std::atomic<u32> g_cg_variant{0};
 std::atomic<u32> g_cg_const_bools{0};
+std::atomic<bool> g_cg_wbuffer{false};
 
 namespace {
 
@@ -1683,6 +1684,11 @@ std::optional<std::string> GenerateVertexShader(const Pica::ShaderSetup& setup,
     out += "uniform float vs_b[16];\n";
     // Atributos por defecto, indexados por REGISTRO de entrada (ver VSInputs).
     out += "uniform float4 vs_default[16];\n\n";
+    const bool w_buffer = g_cg_wbuffer.load(std::memory_order_relaxed);
+    if (w_buffer) {
+        // Escala y desplazamiento de profundidad de la PICA (ver g_cg_wbuffer).
+        out += "uniform float2 vs_wbuf;\n\n";
+    }
 
     /**
      * Las globales del programa. 'static' porque en Cg una global sin cualificar
@@ -1830,6 +1836,13 @@ std::optional<std::string> GenerateVertexShader(const Pica::ShaderSetup& setup,
                        semantic(VSOutputAttributes::POSITION_Y),
                        semantic(VSOutputAttributes::POSITION_Z),
                        semantic(VSOutputAttributes::POSITION_W));
+    if (w_buffer) {
+        // W-buffer: z * escala + w * desplazamiento, recortado como en el
+        // software, y por w para que GXM, que divide, deje justo ese valor con
+        // el viewport de profundidad neutro (ver SetupDrawState).
+        out += "    gl_Position.z = clamp(gl_Position.z * vs_wbuf.x + gl_Position.w * vs_wbuf.y, "
+               "0.0, 1.0) * gl_Position.w;\n";
+    }
 
     // El color se recorta a uno en valor absoluto, igual que en el de GLSL: el
     // hardware deja que el shader saque valores fuera de rango y los dobla.

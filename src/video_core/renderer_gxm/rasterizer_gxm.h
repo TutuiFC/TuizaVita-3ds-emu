@@ -190,6 +190,19 @@ public:
     /// 0.3.1.9. Clave "copia_textura_gpu=" de ajustes.txt.
     static std::atomic<u32> texture_copy_gpu;
     /**
+     * Lotes con W-buffer en la GPU (0.3.4.2). Antes iban enteros al
+     * rasterizador de software: Kirby's Extra Epic Yarn lo usa en casi todo y
+     * se quedaba en 0,5 FPS con la GPU de la Vita sin dibujar un triangulo.
+     * GXM no tiene W-buffer, asi que la profundidad del W-buffer
+     * (z * escala + w * desplazamiento, ver sw_rasterizer.cpp) se calcula por
+     * vertice al empaquetar y se le entrega a GXM ya hecha, con el viewport de
+     * profundidad neutro. Es exacta en los vertices; dentro del triangulo se
+     * interpola lineal en pantalla en vez de con perspectiva, que solo se nota
+     * en superficies muy inclinadas que se cruzan. Clave "wbuffer_gpu=" de
+     * ajustes.txt; a 0, como antes.
+     */
+    static std::atomic<u32> wbuffer_on_gpu;
+    /**
      * Resolucion de dibujado en la GPU EN MITADES (ajuste "Resolucion GPU"):
      * 1 = 0.5x (0.2.0.4), 2 = 1x, 4 = 2x (0.2.0.3). Las superficies tienen
      * width * escala / 2 pixeles por eje; la memoria del invitado sigue a 1x

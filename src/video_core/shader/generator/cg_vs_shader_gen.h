@@ -58,6 +58,16 @@ extern std::atomic<u32> g_cg_variant;
 constexpr u32 kCgBoolsKnown = 1u << 16;
 extern std::atomic<u32> g_cg_const_bools;
 
+/**
+ * W-buffer en el propio shader de vertices (0.3.4.2). Con esto puesto,
+ * GenerateVertexShader declara "uniform float2 vs_wbuf" (escala y
+ * desplazamiento de profundidad de la PICA) y deja en la z de la posicion la
+ * profundidad del W-buffer multiplicada por w, igual que hace el empaquetado de
+ * DrawBatchOnGpu para la ruta de la CPU. Lo pone AccelerateDrawBatch alrededor
+ * de GetProgram, como g_cg_const_bools; el programa lleva su propia clave.
+ */
+extern std::atomic<bool> g_cg_wbuffer;
+
 /// Mascara de los uniforms booleanos que lee algun JMPU/IFU/CALLU del codigo
 /// de vertices: solo esos entran en la clave del programa especializado.
 [[nodiscard]] u32 UsedBoolUniforms(const Pica::ShaderSetup& setup);

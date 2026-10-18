@@ -67,6 +67,7 @@ std::atomic<u32> RasterizerGXM::async_vs{1};
 std::atomic<u32> RasterizerGXM::transfer_on_gpu{1};
 std::atomic<u32> RasterizerGXM::present_writeback_every{4};
 std::atomic<u32> RasterizerGXM::texture_copy_gpu{0};
+std::atomic<u32> RasterizerGXM::wbuffer_on_gpu{1};
 std::atomic<u32> RasterizerGXM::resolution_scale{2};
 std::atomic<u32> RasterizerGXM::gpu_transfers{0};
 std::atomic<u32> RasterizerGXM::transfer_materialized{0};
@@ -1932,6 +1933,8 @@ struct RasterizerGXM::HwShaderCache {
         const SceGxmProgramParameter* uniform_i = nullptr;
         const SceGxmProgramParameter* uniform_b = nullptr;
         const SceGxmProgramParameter* uniform_default = nullptr;
+        /// "vs_wbuf": solo en los programas hechos para W-buffer (0.3.4.2).
+        const SceGxmProgramParameter* uniform_wbuf = nullptr;
         /// "vs_in<registro>", o null si el programa no lee ese registro de un
         /// flujo (lo elimina el compilador o sale de otro sitio).
         std::array<const SceGxmProgramParameter*, 16> inputs{};
@@ -2328,6 +2331,7 @@ private:
         program.uniform_i = sceGxmProgramFindParameterByName(program.gxp, "vs_i");
         program.uniform_b = sceGxmProgramFindParameterByName(program.gxp, "vs_b");
         program.uniform_default = sceGxmProgramFindParameterByName(program.gxp, "vs_default");
+        program.uniform_wbuf = sceGxmProgramFindParameterByName(program.gxp, "vs_wbuf");
         for (u32 reg = 0; reg < 16; reg++) {
             const std::string name = fmt::format("vs_in{}", reg);
             program.inputs[reg] = sceGxmProgramFindParameterByName(program.gxp, name.c_str());
@@ -2613,6 +2617,8 @@ struct RasterizerGXM::BatchMemo {
         /// se hizo: el de vertices escribe las de esa variante.
         bool lit = false;
         bool proj = false;
+        /// Programa hecho para W-buffer (0.3.4.2, ver g_cg_wbuffer).
+        bool wbuffer = false;
     };
     const PipelineCache::Entry* pipeline = nullptr;
     /// Motivo del ultimo fallo de pipeline con estos registros, y en que
@@ -5367,8 +5373,11 @@ void RasterizerGXM::AddTriangle(const Pica::OutputVertex& v0, const Pica::Output
              * una nota ("el generador se echo atras") puesta justo para cazar
              * que se desincronizaran.
              */
+            // Desde 0.3.4.2 el W-buffer solo frena si se ha apagado su ajuste
+            // (ver wbuffer_on_gpu): la profundidad se calcula al empaquetar.
             const bool wbuffering = pica.regs.internal.rasterizer.depthmap_enable ==
-                                    RasterizerRegs::DepthBuffering::WBuffering;
+                                        RasterizerRegs::DepthBuffering::WBuffering &&
+                                    wbuffer_on_gpu.load(std::memory_order_relaxed) == 0;
             const char* reason = nullptr;
             batch_on_gpu =
                 !wbuffering && pipelines->Get(pica.regs.internal, &reason) != nullptr;
@@ -5559,6 +5568,21 @@ bool RasterizerGXM::DrawBatchOnGpu() {
     auto* vertices = reinterpret_cast<float*>(vertex_slice);
 
     /**
+     * W-BUFFER (0.3.4.2). La PICA guarda como profundidad
+     * z * escala + w * desplazamiento en vez de z / w * escala + desplazamiento
+     * (sw_rasterizer.cpp, "W-Buffer"). Ese valor se calcula aqui por vertice,
+     * recortado a [0, 1] como hace el software, y se entrega como z = valor * w:
+     * GXM divide por w y, con el viewport de profundidad neutro que pone
+     * SetupDrawState para estos lotes, escribe justo el valor. Ver
+     * wbuffer_on_gpu en la cabecera.
+     */
+    const auto& depth_regs = pica.regs.internal.rasterizer;
+    const bool w_buffer =
+        depth_regs.depthmap_enable == RasterizerRegs::DepthBuffering::WBuffering;
+    const float w_scale = Pica::f24::FromRaw(depth_regs.viewport_depth_range).ToFloat32();
+    const float w_offset = Pica::f24::FromRaw(depth_regs.viewport_depth_near_plane).ToFloat32();
+
+    /**
      * EMPAQUETADO EN UNA SOLA PASADA (0.1.0.45).
      *
      * El buffer de vertices esta en CDRAM, que la CPU escribe sin cache y
@@ -5580,6 +5604,10 @@ bool RasterizerGXM::DrawBatchOnGpu() {
             out[1] = v.pos.y.ToFloat32();
             out[2] = v.pos.z.ToFloat32();
             out[3] = v.pos.w.ToFloat32();
+            if (w_buffer) {
+                const float depth = std::clamp(out[2] * w_scale + out[3] * w_offset, 0.0f, 1.0f);
+                out[2] = depth * out[3];
+            }
             out[4] = v.color.x.ToFloat32();
             out[5] = v.color.y.ToFloat32();
             out[6] = v.color.z.ToFloat32();
@@ -5719,8 +5747,15 @@ bool RasterizerGXM::SetupDrawState(Surface* surface, const Entry* pipeline,
     const float halfsize_y = Pica::f24::FromRaw(rasterizer.viewport_size_y).ToFloat32();
     const float corner_x = static_cast<float>(rasterizer.viewport_corner.x);
     const float corner_y = static_cast<float>(rasterizer.viewport_corner.y);
-    const float depth_scale = Pica::f24::FromRaw(rasterizer.viewport_depth_range).ToFloat32();
-    const float depth_offset = Pica::f24::FromRaw(rasterizer.viewport_depth_near_plane).ToFloat32();
+    // Con W-buffer, la profundidad ya viene hecha en la z de cada vertice: la
+    // calcula el empaquetado de DrawBatchOnGpu o, por AccelerateDrawBatch, el
+    // programa de vertices (g_cg_wbuffer). Viewport de profundidad neutro.
+    const bool w_buffer =
+        rasterizer.depthmap_enable == RasterizerRegs::DepthBuffering::WBuffering;
+    const float depth_scale =
+        w_buffer ? 1.0f : Pica::f24::FromRaw(rasterizer.viewport_depth_range).ToFloat32();
+    const float depth_offset =
+        w_buffer ? 0.0f : Pica::f24::FromRaw(rasterizer.viewport_depth_near_plane).ToFloat32();
     /**
      * EL SIGNO DE LA ESCALA EN Y, QUE ES LO QUE TENIA LA IMAGEN BOCA ABAJO.
      *
@@ -6537,7 +6572,12 @@ bool RasterizerGXM::AccelerateDrawBatch(bool is_indexed) {
     default:
         return HwVsReject("topologia");
     }
-    if (regs.rasterizer.depthmap_enable == RasterizerRegs::DepthBuffering::WBuffering) {
+    // W-buffer en la GPU desde 0.3.4.2 (ver wbuffer_on_gpu y g_cg_wbuffer): el
+    // programa de vertices lleva la cuenta de la profundidad. Con el ajuste
+    // apagado, como antes.
+    const bool w_buffer =
+        regs.rasterizer.depthmap_enable == RasterizerRegs::DepthBuffering::WBuffering;
+    if (w_buffer && wbuffer_on_gpu.load(std::memory_order_relaxed) == 0) {
         return HwVsReject("wbuffer");
     }
     // Lo que no haya cambiado desde el lote anterior se reutiliza (BatchMemo).
@@ -6609,7 +6649,8 @@ bool RasterizerGXM::AccelerateDrawBatch(bool is_indexed) {
         // habia forma de saber por que no se aceleraba nada.
         return HwVsReject(FsRejectName(fs_reason != nullptr ? fs_reason : "pipeline nulo"));
     }
-    if (memo.vs_valid && (memo.layout.lit != pipeline->lit || memo.layout.proj != pipeline->proj)) {
+    if (memo.vs_valid && (memo.layout.lit != pipeline->lit || memo.layout.proj != pipeline->proj ||
+                          memo.layout.wbuffer != w_buffer)) {
         memo.vs_valid = false;
     }
     phase(0);
@@ -6727,6 +6768,12 @@ bool RasterizerGXM::AccelerateDrawBatch(bool is_indexed) {
         // GenerateVertexShader): entra en la clave.
         program_key = Common::HashCombine(program_key, (pipeline->lit ? 2u : 0u) |
                                                            (pipeline->proj ? 1u : 0u));
+        // Solo los de W-buffer cambian de clave: la de los demas sigue siendo
+        // la misma, y con ella su entrada del indice de la cache de la tarjeta.
+        if (w_buffer) {
+            program_key = Common::HashCombine(program_key, 0x57B0F000ull);
+        }
+        Pica::Shader::Generator::GXM::g_cg_wbuffer.store(w_buffer, std::memory_order_relaxed);
         if (hw_shaders->unlinkable.count(program_key) != 0) {
             return HwVsReject("vs enlazar atributos");
         }
@@ -6806,6 +6853,9 @@ bool RasterizerGXM::AccelerateDrawBatch(bool is_indexed) {
                 reason = special_reason;
             }
         }
+        // Las traducciones de este lote ya estan hechas (Build genera el
+        // texto en este hilo, tambien las que compila en segundo plano).
+        Pica::Shader::Generator::GXM::g_cg_wbuffer.store(false, std::memory_order_relaxed);
         if (program == nullptr) {
             // Compilandose (el generico o su especializado): el lote se salta.
             if (reason != nullptr && std::strcmp(reason, "vs compilando") == 0 &&
@@ -6967,6 +7017,7 @@ bool RasterizerGXM::AccelerateDrawBatch(bool is_indexed) {
         }
         layout.lit = pipeline->lit;
         layout.proj = pipeline->proj;
+        layout.wbuffer = w_buffer;
         memo.vs_valid = true;
     } else {
         phase(1);
@@ -7158,6 +7209,13 @@ bool RasterizerGXM::AccelerateDrawBatch(bool is_indexed) {
                 defaults[reg * 4 + 3] = value.w.ToFloat32();
             }
             sceGxmSetUniformDataF(vertex_uniforms, program->uniform_default, 0, 16 * 4, defaults);
+        }
+        if (program->uniform_wbuf != nullptr) {
+            const auto& depth = regs.rasterizer;
+            const float wbuf[2] = {
+                Pica::f24::FromRaw(depth.viewport_depth_range).ToFloat32(),
+                Pica::f24::FromRaw(depth.viewport_depth_near_plane).ToFloat32()};
+            sceGxmSetUniformDataF(vertex_uniforms, program->uniform_wbuf, 0, 2, wbuf);
         }
     }
 
