@@ -2,10 +2,15 @@
 
 add_executable(azahar
     main.cpp
+    vita_home_menu.cpp
+    vita_home_menu.h
+    vita_i18n.cpp
+    vita_i18n.h
     vita_input.cpp
     vita_input.h
     vita_jit_probe.cpp
     vita_jit_probe.h
+    vita_strings.inc
     vita_version.h
     vita_window.cpp
     vita_window.h
@@ -42,6 +47,8 @@ target_link_libraries(azahar PRIVATE
     SceCommonDialog_stub
     SceAppMgr_stub
     ScePower_stub
+    # El reloj de la barra de arriba del menu de inicio (0.3.3.9).
+    SceRtc_stub
     ScePgf_stub
     SceNet_stub
     SceNetCtl_stub
