@@ -36,7 +36,7 @@ set(CMAKE_C_STANDARD 11)
 # ---------------------------------------------------------------------------
 set(VITA_APP_NAME "Azahar")
 set(VITA_TITLEID  "AZHR00001")
-set(VITA_VERSION  "03.01")
+set(VITA_VERSION  "00.20")
 
 # ---------------------------------------------------------------------------
 # Recorte de funcionalidad para Vita
