@@ -82,6 +82,10 @@ private:
         u32 tint = 0;
         /// Captura de la pantalla superior: 0 sin mirar, 1 no hay, 2 hay.
         int shot_state = 0;
+        /// Codigo de 4 letras (ECLA) para la caratula, y si esta: 0/1/2 como arriba.
+        std::string product_id;
+        int cover_state = 0;
+        u32 cover_retry = 0;
     };
 
     void LoadInfo(Entry& entry);
@@ -98,6 +102,7 @@ private:
     /// La "pantalla superior" de la ficha: la captura del juego, o su icono en grande.
     void DrawMiniScreen(float x, float y, float w, float h);
     bool LoadScreenshot(int index);
+    bool LoadCover(int index);
     void DrawGrid();
     void DrawTile(int index, float x, float y, float size, bool is_selected);
     void DrawSlider();
@@ -115,6 +120,10 @@ private:
     /// Fundido de entrada de la captura, de 0 a 1.
     float shot_fade = 0.0f;
     int shown_selection = -1;
+
+    /// La caratula del seleccionado (0.3.4.1), igual: una sola textura.
+    vita2d_texture* cover = nullptr;
+    int cover_for = -1;
 
     /// Desplazamiento horizontal de la cuadricula, en pixeles, y adonde va.
     float camera = 0.0f;

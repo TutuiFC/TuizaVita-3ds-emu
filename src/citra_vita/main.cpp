@@ -33,6 +33,7 @@
 
 #include <cryptopp/integer.h>
 
+#include "citra_vita/vita_covers.h"
 #include "citra_vita/vita_home_menu.h"
 #include "citra_vita/vita_i18n.h"
 #include "citra_vita/vita_input.h"
@@ -1844,7 +1845,14 @@ void Run(vita2d_pgf* font) {
 
     DrawStep(font, "7/7 buscando juegos", I18n::kStep7);
     VitaFrontend::HomeMenu menu(font);
-    menu.SetGames(ScanRoms());
+    const std::vector<RomEntry> roms = ScanRoms();
+    menu.SetGames(roms);
+    // Las caratulas que falten, en otro hilo (0.3.4.1). Ver vita_covers.h.
+    std::vector<std::string> rom_paths;
+    for (const RomEntry& rom : roms) {
+        rom_paths.push_back(rom.path);
+    }
+    VitaFrontend::Covers::Start(rom_paths);
     bool running = true;
 
     // Estado anterior de los botones: sin esto un solo toque de la cruceta
@@ -1894,9 +1902,13 @@ void Run(vita2d_pgf* font) {
         if (language_hold >= 1.0f) {
             const int chosen = VitaFrontend::RunLanguagePicker(menu, font);
             if (chosen >= 0 && chosen != g_user.menu_language) {
+                // La caratula de cada region se pide con el idioma del menu:
+                // el hilo no puede leerlo mientras cambia.
+                VitaFrontend::Covers::Stop();
                 g_user.menu_language = chosen;
                 I18n::SetLanguage(chosen);
                 SaveUserSettings();
+                VitaFrontend::Covers::Start(rom_paths);
                 // Los titulos de los iconos tambien van en el idioma elegido.
                 menu.RefreshTitles();
             }
@@ -1909,10 +1921,13 @@ void Run(vita2d_pgf* font) {
             running = false;
         }
         if (menu.Update(pad.buttons, pressed) && menu.Count() > 0) {
-            // La textura de iconos vuelve a la CDRAM: la necesita el juego.
+            // La textura de iconos vuelve a la CDRAM y la red se apaga: el juego
+            // necesita la memoria y la CPU.
+            VitaFrontend::Covers::Stop();
             menu.ReleaseTextures();
             RunGame(font, menu.SelectedPath());
             menu.ForgetScreenshot(menu.SelectedPath());
+            VitaFrontend::Covers::Start(rom_paths);
             // Al volver del juego hay que reiniciar el estado de botones para
             // que la combinacion de salida no se lea aqui como una pulsacion.
             previous_buttons = ~0u;
@@ -1924,6 +1939,7 @@ void Run(vita2d_pgf* font) {
 
         menu.Draw(settings_hold, language_hold);
     }
+    VitaFrontend::Covers::Stop();
 
     VitaFrontend::Input::Shutdown();
     Common::Log::Stop();

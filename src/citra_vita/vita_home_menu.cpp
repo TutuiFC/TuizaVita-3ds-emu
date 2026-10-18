@@ -15,10 +15,12 @@
 #include <psp2/power.h>
 #include <psp2/rtc.h>
 #include <psp2/touch.h>
+#include "citra_vita/vita_covers.h"
 #include "citra_vita/vita_home_menu.h"
 #include "citra_vita/vita_i18n.h"
 #include "citra_vita/vita_version.h"
 #include "common/string_util.h"
+#include "core/frontend/image_interface.h"
 #include "core/loader/loader.h"
 #include "core/loader/smdh.h"
 
@@ -293,6 +295,9 @@ const std::string& HomeMenu::SelectedPath() const {
 
 void HomeMenu::LoadInfo(Entry& entry) {
     entry.info_loaded = true;
+    if (entry.product_id.empty()) {
+        entry.product_id = Covers::ReadProductId(entry.path);
+    }
     std::vector<u8> data;
     try {
         auto loader = Loader::GetLoader(entry.path);
@@ -411,9 +416,14 @@ void HomeMenu::UploadIcon(int index) {
 }
 
 void HomeMenu::ReleaseTextures() {
-    if (atlas != nullptr || shot != nullptr) {
+    if (atlas != nullptr || shot != nullptr || cover != nullptr) {
         vita2d_wait_rendering_done();
     }
+    if (cover != nullptr) {
+        vita2d_free_texture(cover);
+        cover = nullptr;
+    }
+    cover_for = -1;
     if (atlas != nullptr) {
         vita2d_free_texture(atlas);
         atlas = nullptr;
@@ -478,6 +488,72 @@ bool HomeMenu::LoadScreenshot(int index) {
     entry.shot_state = ok ? 2 : 1;
     shot_for = ok ? index : -1;
     return ok;
+}
+
+bool HomeMenu::LoadCover(int index) {
+    Entry& entry = entries[index];
+    if (cover_for == index && cover != nullptr) {
+        return true;
+    }
+    if (!entry.info_loaded || entry.product_id.empty()) {
+        return false;
+    }
+    // Si aun no esta, se vuelve a mirar cada segundo y medio: la puede estar
+    // bajando el hilo de las caratulas ahora mismo.
+    if (entry.cover_state == 1 && frame < entry.cover_retry) {
+        return false;
+    }
+    const std::string path = Covers::CoverPath(entry.product_id);
+    SceIoStat stat{};
+    if (sceIoGetstat(path.c_str(), &stat) < 0) {
+        entry.cover_state = 1;
+        entry.cover_retry = frame + 90;
+        return false;
+    }
+    if (cover != nullptr) {
+        vita2d_wait_rendering_done();
+        vita2d_free_texture(cover);
+        cover = nullptr;
+        cover_for = -1;
+    }
+    // Con el lodepng que ya lleva el nucleo: vita2d_load_PNG_file arrastra
+    // libpng entera (~160 KB) y el codigo dejaba de caber delante de
+    // .init_array (ver CMakeLists.txt de la raiz).
+    std::vector<u8> file;
+    const SceUID fd = sceIoOpen(path.c_str(), SCE_O_RDONLY, 0);
+    if (fd >= 0) {
+        file.resize(static_cast<std::size_t>(std::max<SceOff>(stat.st_size, 0)));
+        if (file.empty() ||
+            sceIoRead(fd, file.data(), static_cast<SceSize>(file.size())) !=
+                static_cast<int>(file.size())) {
+            file.clear();
+        }
+        sceIoClose(fd);
+    }
+    std::vector<u8> rgba;
+    u32 width = 0;
+    u32 height = 0;
+    if (!file.empty() && Frontend::ImageInterface().DecodePNG(rgba, width, height, file) &&
+        width > 0 && height > 0 && width <= 1024 && height <= 1024 &&
+        rgba.size() >= static_cast<std::size_t>(width) * height * 4) {
+        cover = vita2d_create_empty_texture(width, height);
+    }
+    if (cover == nullptr) {
+        entry.cover_state = 1;
+        entry.cover_retry = frame + 600;
+        return false;
+    }
+    // RGBA en memoria = el ABGR de vita2d en palabras de 32 bits.
+    auto* base = static_cast<u8*>(vita2d_texture_get_datap(cover));
+    const unsigned int stride = vita2d_texture_get_stride(cover);
+    for (u32 row = 0; row < height; row++) {
+        std::memcpy(base + row * stride, rgba.data() + static_cast<std::size_t>(row) * width * 4,
+                    width * 4);
+    }
+    vita2d_texture_set_filters(cover, SCE_GXM_TEXTURE_FILTER_LINEAR, SCE_GXM_TEXTURE_FILTER_LINEAR);
+    entry.cover_state = 2;
+    cover_for = index;
+    return true;
 }
 
 int HomeMenu::Columns() const {
@@ -663,6 +739,9 @@ void HomeMenu::DrawTopBar() {
         vita2d_pgf_draw_text(font, (kScreenW - w) / 2, 23, Rgb(0xC9D0D7), 0.8f, count);
     }
 
+    // Caratulas bajando, a la izquierda del reloj (ver Covers::Start).
+    const Covers::Progress covers = Covers::GetProgress();
+
     // Bateria (si la hay: la PS TV no tiene) y reloj, a la derecha.
     float right = static_cast<float>(kScreenW) - 16.0f;
     const int battery = scePowerGetBatteryLifePercent();
@@ -698,6 +777,14 @@ void HomeMenu::DrawTopBar() {
         const int dw = vita2d_pgf_text_width(font, 0.72f, date);
         vita2d_pgf_draw_text(font, static_cast<int>(right) - w - 10 - dw, 23, Rgb(0x9AA3AD),
                              0.72f, date);
+        right -= static_cast<float>(w + 10 + dw + 24);
+    }
+    if (covers.active && covers.total > 0) {
+        char text[64];
+        std::snprintf(text, sizeof(text), I18n::Tr(I18n::kCoversProgress), covers.done,
+                      covers.total);
+        const int w = vita2d_pgf_text_width(font, 0.72f, text);
+        vita2d_pgf_draw_text(font, static_cast<int>(right) - w, 23, Rgb(kCyanLight), 0.72f, text);
     }
 }
 
@@ -771,9 +858,19 @@ void HomeMenu::DrawPanel() {
     const Entry& entry = entries[selected];
     constexpr float kIcon = 84.0f;
     const float icon_y = kPanelY + 24.0f;
-    DrawTile(selected, info_x, icon_y, kIcon, false);
+    int text_x = static_cast<int>(info_x + kIcon + 22.0f);
+    float rule_x = info_x;
+    if (LoadCover(selected)) {
+        // Con caratula: a la altura de la mini pantalla, y el texto a su lado.
+        const float scale = kMiniH / static_cast<float>(vita2d_texture_get_height(cover));
+        const float cover_w = static_cast<float>(vita2d_texture_get_width(cover)) * scale;
+        vita2d_draw_texture_scale(cover, info_x - 8.0f, mini_y, scale, scale);
+        text_x = static_cast<int>(info_x - 8.0f + cover_w + 22.0f);
+        rule_x = static_cast<float>(text_x);
+    } else {
+        DrawTile(selected, info_x, icon_y, kIcon, false);
+    }
 
-    const int text_x = static_cast<int>(info_x + kIcon + 22.0f);
     const int text_w = static_cast<int>(kPanelX + kPanelW) - text_x - 24;
     const std::string title = Ellipsize(font, 1.2f, entry.title, text_w);
     vita2d_pgf_draw_text(font, text_x, static_cast<int>(icon_y) + 34, Rgb(kInk), 1.2f,
@@ -786,10 +883,11 @@ void HomeMenu::DrawPanel() {
         I18n::DrawTextFit(font, text_x, static_cast<int>(icon_y) + 66, Rgb(kInkDim), 0.72f,
                           I18n::Tr(I18n::kHomeNoInfo), text_w);
     }
-    vita2d_draw_rectangle(info_x, kPanelY + 124.0f, static_cast<float>(line_w), 1.0f,
+    const int rule_w = static_cast<int>(kPanelX + kPanelW - rule_x) - 24;
+    vita2d_draw_rectangle(rule_x, kPanelY + 124.0f, static_cast<float>(rule_w), 1.0f,
                           Rgb(0xE1E5E9));
-    const std::string file = Ellipsize(font, 0.72f, entry.name, line_w);
-    vita2d_pgf_draw_text(font, static_cast<int>(info_x), static_cast<int>(kPanelY) + 150,
+    const std::string file = Ellipsize(font, 0.72f, entry.name, rule_w);
+    vita2d_pgf_draw_text(font, static_cast<int>(rule_x), static_cast<int>(kPanelY) + 150,
                          Rgb(0xA3AAB2), 0.72f, file.c_str());
 }
 

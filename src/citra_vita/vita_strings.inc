@@ -42,6 +42,8 @@ TR(kHomeNoShot,
    "Der Bildschirm erscheint hier nach dem Spielen",
    "Lo schermo apparirà qui dopo aver giocato",
    "A tela aparecerá aqui depois que você jogar")
+TR(kCoversProgress, "Covers %d/%d", "Carátulas %d/%d", "Caràtules %d/%d", "Jaquettes %d/%d",
+   "Cover %d/%d", "Copertine %d/%d", "Capas %d/%d")
 TR(kHomePlay, "Play", "Jugar", "Jugar", "Jouer", "Spielen", "Gioca", "Jogar")
 TR(kHomeExit, "Exit", "Salir", "Sortir", "Quitter", "Beenden", "Esci", "Sair")
 TR(kHomeSettingsHold,

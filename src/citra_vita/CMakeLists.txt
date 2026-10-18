@@ -2,6 +2,8 @@
 
 add_executable(azahar
     main.cpp
+    vita_covers.cpp
+    vita_covers.h
     vita_home_menu.cpp
     vita_home_menu.h
     vita_i18n.cpp
@@ -49,6 +51,8 @@ target_link_libraries(azahar PRIVATE
     ScePower_stub
     # El reloj de la barra de arriba del menu de inicio (0.3.3.9).
     SceRtc_stub
+    # Las caratulas de GameTDB del menu de inicio (0.3.4.1).
+    SceHttp_stub
     ScePgf_stub
     SceNet_stub
     SceNetCtl_stub
