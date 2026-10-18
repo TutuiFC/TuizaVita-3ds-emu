@@ -159,6 +159,14 @@ extern std::atomic<u32> thumb;
 extern std::atomic<u32> profile;
 
 /**
+ * Saltos indirectos por la tabla de enlaces (0.3.3.6, ver TABLA DE ENLACES en
+ * el .cpp). 0 = por g_fast y el Block, como hasta 0.3.3.5. Clave
+ * "jit_tabla_enlaces=" de ajustes.txt; al cambiarlo se vacia la cache de
+ * bloques.
+ */
+extern std::atomic<u32> link_table;
+
+/**
  * Llamar en el DESPACHO del interprete, con el PC ya alineado. Si hay codigo
  * para este bloque y cabe en el presupuesto, lo ejecuta y devuelve cuantas
  * instrucciones del juego ha ejecutado; con 0, el interprete sigue como

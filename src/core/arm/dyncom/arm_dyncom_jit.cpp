@@ -48,6 +48,7 @@ std::atomic<u32> vfp_regs{1};
 std::atomic<u32> vfp_native{1};
 std::atomic<u32> thumb{1};
 std::atomic<u32> profile{0};
+std::atomic<u32> link_table{1};
 
 namespace {
 
@@ -1210,6 +1211,66 @@ inline u32 FastIndex(u32 key) {
 u32 g_link_in_block = 0;
 
 /**
+ * TABLA DE ENLACES (0.3.3.6). Los saltos indirectos -- "bx lr", "blx r12",
+ * "pop {..., pc}", "ldr pc, [...]" -- son el 45 % de las entradas a los bloques
+ * mas calientes de Zafiro Alfa (jit_calientes.txt), y cada uno buscaba su
+ * destino en g_fast, seguia el puntero al Block (un nodo del unordered_map,
+ * suelto por el heap y casi nunca en la cache de datos) y de ahi leia su
+ * LinkInfo: tres cargas dependientes y 21 instrucciones. Aqui cada hueco
+ * guarda ya lo que el enlace necesita -- clave, entrada y cuenta -- en 16
+ * bytes: una carga para comparar la clave y dos del mismo hueco despues.
+ *
+ * Solo hay bloques PUBLICADOS (con link.entry): se pone en PublishEntry y se
+ * quita en cuanto la entrada vuelve a cero (WithdrawEntry, ApplyInvalidations)
+ * o se tiran todos (ResetAll). Si dos claves caen en el mismo hueco gana la
+ * ultima que pasa por TryRun (RefreshLinkSlot). Un hueco vacio lleva una clave
+ * que NO lo indexa, asi que no coincide con ninguna que se busque en el.
+ */
+struct LinkSlot {
+    u32 key;
+    u32 entry;
+    u32 count;
+    u32 unused;
+};
+static_assert(sizeof(LinkSlot) == 16 && offsetof(LinkSlot, key) == 0 &&
+                  offsetof(LinkSlot, entry) == 4 && offsetof(LinkSlot, count) == 8,
+              "el enlace indirecto lee la tabla con estos desplazamientos");
+alignas(64) std::array<LinkSlot, kFastSlots> g_link_table{};
+
+LinkSlot EmptyLinkSlot(u32 index) {
+    return LinkSlot{((index + 1) & (kFastSlots - 1)) << 1, 0, 0, 0};
+}
+
+void ResetLinkTable() {
+    for (u32 i = 0; i < kFastSlots; i++) {
+        g_link_table[i] = EmptyLinkSlot(i);
+    }
+}
+
+/// El bloque, publicado, en su hueco de la tabla de enlaces.
+void SetLinkSlot(const Block& block) {
+    if (block.link.entry == 0) {
+        return;
+    }
+    g_link_table[FastIndex(block.pc)] = LinkSlot{block.pc, block.link.entry, block.link.count, 0};
+}
+
+/// Lo mismo si otro bloque le quito el hueco (ver TryRun).
+void RefreshLinkSlot(const Block& block) {
+    if (g_link_table[FastIndex(block.pc)].key != block.pc) {
+        SetLinkSlot(block);
+    }
+}
+
+/// Fuera de la tabla: su entrada acaba de volver a cero.
+void ClearLinkSlot(const Block& block) {
+    const u32 index = FastIndex(block.pc);
+    if (g_link_table[index].key == block.pc) {
+        g_link_table[index] = EmptyLinkSlot(index);
+    }
+}
+
+/**
  * Contadores. Los suma el hilo de emulacion en variables normales (una
  * operacion atomica por bloque costaria mas que lo medido) y los publica al
  * final de cada rodaja en los atomicos, que es lo que lee el overlay con
@@ -1478,6 +1539,7 @@ bool Init(ARMul_State* cpu) {
             return false;
         }
     }
+    ResetLinkTable();
     g_ready = true;
     Common::VitaNote("jit arm",
                      fmt::format("listo ({} MB de codigo)", g_code_bytes >> 20).c_str());
@@ -2920,7 +2982,7 @@ private:
             e.Ubfx(kRd, kRs, 0, 1);
             e.StrImm(kRd, kCpu, g_offsets.t);
             e.Emit(0xE3C00001u | (kRs << 16) | (kRs << 12)); // BIC kRs, kRs, #1
-            StoreGuest(kRs, 15);
+            StorePcForIndirect();
         } else if (load) {
             LoadInto(address, kind, rd);
         } else {
@@ -3755,7 +3817,7 @@ private:
                     e.Ubfx(kRd, kRs, 0, 1);
                     e.StrImm(kRd, kCpu, g_offsets.t);
                     e.Emit(0xE3C00001u | (kRs << 16) | (kRs << 12)); // BIC kRs, kRs, #1
-                    e.StrImm(kRs, kCpu, RegOffset(15));
+                    StorePcForIndirect();
                     continue;
                 }
                 const s8 cached = CacheHost(i);
@@ -3835,11 +3897,93 @@ private:
      * EmitIndirectLink).
      */
     void ExitIndirect(bool in_regs = false) {
+        if (TableLinking()) {
+            EmitTableLink(in_regs);
+            return;
+        }
         if (Linking()) {
             EmitIndirectLink(in_regs);
             return;
         }
         to_epilogue.push_back(e.BranchPlaceholder(kAlways));
+    }
+
+    /// Los saltos indirectos van por la tabla de enlaces (ver TABLA DE ENLACES).
+    bool TableLinking() const {
+        return Linking() && link_table.load(std::memory_order_relaxed) != 0;
+    }
+
+    /**
+     * Reg[15] = kRs antes de ExitIndirect(true). Con la tabla de enlaces solo
+     * lo escribe el camino que falla (0.3.3.6): el bloque al que se enlaza no
+     * lee Reg[15], igual que en los enlaces directos desde 0.2.1.0.
+     */
+    void StorePcForIndirect() {
+        if (!TableLinking()) {
+            StoreGuest(kRs, 15);
+        }
+    }
+
+    /**
+     * SALTO INDIRECTO POR LA TABLA DE ENLACES (0.3.3.6). Con kRs = PC (bit 0
+     * a cero) y kRd = TFlag si 'in_regs'; si no, de Reg[15] y TFlag, como en
+     * EmitIndirectLink, con la misma prueba del bit 0. Lo caliente:
+     *
+     *   MRS kT0; ORR kRs, kRs, kRd (clave); UBFX kRd, kRs, #1, #13;
+     *   MOVW/MOVT kT1, tabla; ADD kT1, kT1, kRd, LSL #4;
+     *   LDR kRd, [kT1] (clave del hueco); CMP kRd, kRs; BNE fallo;
+     *   LDRD kRn, kRm (presupuesto y enlaces); LDR kRd, [kT1, #4] (entrada);
+     *   LDR kT1, [kT1, #8] (cuenta); SUBS kRn, kRn, kT1; BLO fallo;
+     *   ADD kRm, kRm, #1; STRD kRn, kRm; MSR kT0; BX kRd
+     *
+     * 17 instrucciones (eran 21 y una carga del PC recien guardado), y solo
+     * dos cargas dependientes: la clave y lo demas del mismo hueco. El fallo
+     * repone los flags, escribe Reg[15] (con 'in_regs' nadie lo ha hecho) y
+     * sale sin volver a volcar la cache, como siempre.
+     */
+    void EmitTableLink(bool in_regs) {
+        std::vector<u32> fails;
+        FlushCachedRegs();
+        e.Mrs(kT0);
+        if (!in_regs) {
+            // "mov pc, ..." y compania: el PC ya esta en Reg[15].
+            e.LdrImm(kRs, kCpu, RegOffset(15));
+            e.LdrImm(kRd, kCpu, g_offsets.t);
+            e.Emit(0xE3100001u | (kRs << 16)); // TST kRs, #1
+            fails.push_back(e.BranchPlaceholder(kCondNe));
+        }
+        std::vector<u32> lookup_fails;
+        e.Emit(0xE1800000u | (kRs << 16) | (kRs << 12) | kRd); // ORR kRs, kRs, kRd
+        e.Ubfx(kRd, kRs, 1, kFastSlotBits);
+        e.Mov32(kT1, static_cast<u32>(reinterpret_cast<uintptr_t>(g_link_table.data())));
+        e.Emit(0xE0800000u | (kT1 << 16) | (kT1 << 12) | (4u << 7) | kRd); // ADD kT1, kT1, kRd, LSL #4
+        e.LdrImm(kRd, kT1, 0);
+        e.Emit(0xE1500000u | (kRd << 16) | kRs); // CMP kRd, kRs
+        lookup_fails.push_back(e.BranchPlaceholder(kCondNe));
+        e.LdrdImm(kRn, kCpu, g_offsets.link);
+        e.LdrImm(kRd, kT1, 4);
+        e.LdrImm(kT1, kT1, 8);
+        e.Emit(0xE0500000u | (kRn << 16) | (kRn << 12) | kT1); // SUBS kRn, kRn, kT1
+        lookup_fails.push_back(e.BranchPlaceholder(kCondLo));
+        e.Emit(0xE2800001u | (kRm << 16) | (kRm << 12)); // ADD kRm, kRm, #1
+        e.StrdImm(kRn, kCpu, g_offsets.link);
+        e.MsrFlags(kT0);
+        e.Emit(0xE12FFF10u | kRd); // BX kRd -> entrada del destino
+        if (!fails.empty()) {
+            DeferCold(std::move(fails), [this] {
+                e.MsrFlags(kT0);
+                BranchExitNoFlush();
+            });
+        }
+        DeferCold(std::move(lookup_fails), [this, in_regs] {
+            e.MsrFlags(kT0);
+            if (in_regs) {
+                // kRs es la clave: el PC es ella sin el bit de modo.
+                e.Emit(0xE3C00001u | (kRs << 16) | (kRs << 12)); // BIC kRs, kRs, #1
+                e.StrImm(kRs, kCpu, RegOffset(15));
+            }
+            BranchExitNoFlush();
+        });
     }
 
     /**
@@ -4159,7 +4303,7 @@ public:
                 e.Mov32(kRd, 0);
                 e.StrImm(kRd, kCpu, g_offsets.t);
                 e.Mov32(kRs, branch_target_);
-                StoreGuest(kRs, 15);
+                StorePcForIndirect();
                 ExitIndirect(true);
                 break;
             }
@@ -4172,7 +4316,7 @@ public:
             e.Mov32(kRd, 1);
             e.StrImm(kRd, kCpu, g_offsets.t);
             e.Mov32(kRs, target);
-            StoreGuest(kRs, 15);
+            StorePcForIndirect();
             ExitIndirect(true);
             break;
         }
@@ -4188,7 +4332,7 @@ public:
             e.Ubfx(kRd, kRs, 0, 1);
             e.StrImm(kRd, kCpu, g_offsets.t);
             e.Emit(0xE3C00001u | (kRs << 16) | (kRs << 12)); // BIC kRs, kRs, #1
-            StoreGuest(kRs, 15);
+            StorePcForIndirect();
             ExitIndirect(true);
             break;
         }
@@ -4289,6 +4433,7 @@ void ResetAll() {
     g_patch_queue.clear();
     g_blocks.clear();
     g_fast.fill(FastSlot{});
+    ResetLinkTable();
     g_code_used_words = 0;
     g_cold_used_words = kSharedWords;
     g_check_used_words = 0;
@@ -5100,6 +5245,7 @@ void PublishEntry(Block& block) {
     }
     block.link.entry = block.chain_entry;
     g_cost.publishes++;
+    SetLinkSlot(block);
     if (block.incoming.empty() || block.chain_entry == 0 ||
         direct_link_patch.load(std::memory_order_relaxed) == 0 || block.patch_queued) {
         return;
@@ -5154,6 +5300,7 @@ void UnpatchIncoming(Block& block) {
 /// Despublica la entrada: los enlaces parcheados vuelven a mirar entry.
 void WithdrawEntry(Block& block) {
     block.link.entry = 0;
+    ClearLinkSlot(block);
     g_cost.withdraws++;
     if (!HasPatchedIncoming(block)) {
         return;
@@ -5618,6 +5765,7 @@ u32 TryRun(ARMul_State* cpu, u64 budget_left) {
      * puede ser destino de un enlace del codigo generado (0.1.8.1).
      */
     PublishEntry(*block);
+    RefreshLinkSlot(*block);
     /**
      * Una entrada de cada kTimeSampleEvery otra vez (0.2.1.0). En 0.1.8.1 se
      * cronometraban todas para quitar ruido al reparto entre "jit" y "resto",
@@ -5685,6 +5833,7 @@ u32 TryRun(ARMul_State* cpu, u64 budget_left) {
          * que ya paso (y se cerro en el despacho) la ultima de las iniciales.
          */
         PublishEntry(*next);
+        RefreshLinkSlot(*next);
         g_local.dispatches++;
         done += RunCompiled(cpu, *next, jit_pages, budget_left - done - next->link.count);
     }
@@ -6330,6 +6479,7 @@ void ApplyInvalidations() {
             g_pending.active = false;
         }
         block->link.entry = 0;
+        ClearLinkSlot(*block);
         g_cost.withdraws++;
         if (vm.has_value() && vm->Ok()) {
             UnpatchIncoming(*block);
