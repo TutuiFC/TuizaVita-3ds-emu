@@ -167,6 +167,15 @@ extern std::atomic<u32> profile;
 extern std::atomic<u32> link_table;
 
 /**
+ * "ldr pc, [pc, #imm]" (los trampolines de los modulos .cro) como enlace
+ * directo al destino que tenia el literal al compilar, comprobando en cada
+ * ejecucion que sigue igual (0.3.3.7, ver EmitVeneer). 0 = salto indirecto,
+ * como hasta 0.3.3.6. Clave "jit_saltos_cro=" de ajustes.txt; al cambiarlo se
+ * vacia la cache de bloques.
+ */
+extern std::atomic<u32> veneers;
+
+/**
  * Llamar en el DESPACHO del interprete, con el PC ya alineado. Si hay codigo
  * para este bloque y cabe en el presupuesto, lo ejecuta y devuelve cuantas
  * instrucciones del juego ha ejecutado; con 0, el interprete sigue como

@@ -49,6 +49,7 @@ std::atomic<u32> vfp_native{1};
 std::atomic<u32> thumb{1};
 std::atomic<u32> profile{0};
 std::atomic<u32> link_table{1};
+std::atomic<u32> veneers{1};
 
 namespace {
 
@@ -998,6 +999,10 @@ struct Block {
     u32 side_exits = 0;
     /// Esta en g_patch_queue, con enlaces por parchear (0.3.3.5).
     bool patch_queued = false;
+    /// Acaba en "ldr pc, [pc, #imm]" y esto es lo que habia en el literal al
+    /// decodificarlo (0.3.3.7, ver EmitVeneer).
+    bool has_literal = false;
+    u32 literal = 0;
 };
 
 /// Palabras de un enlace directo que cambia el parche, desde la primera (ver
@@ -1633,6 +1638,18 @@ struct Decoded {
 
 u32 Bits(u32 value, u32 low, u32 high) {
     return (value >> low) & ((1u << (high - low + 1)) - 1);
+}
+
+/// "ldr pc, [pc, #+/-imm]" de palabra, sin escritura del base (0.3.3.7): el
+/// trampolin de los modulos .cro, con el destino en un literal.
+bool IsPcLiteralJump(u32 inst) {
+    return (inst >> 28) != 0xFu && (inst & 0x0F7FF000u) == 0x051FF000u;
+}
+
+/// La direccion del literal de esa instruccion en 'pc' (el PC se lee como + 8).
+u32 PcLiteralAddress(u32 inst, u32 pc) {
+    const u32 offset = inst & 0xFFFu;
+    return Bits(inst, 23, 23) == 1 ? pc + 8 + offset : pc + 8 - offset;
 }
 
 Decoded Reject(u32 reason) {
@@ -2477,6 +2494,11 @@ public:
         block_key_ = key;
         block_count_ = count;
     }
+    /// El literal del "ldr pc, [pc, #imm]" final, si lo hay (ver EmitVeneer).
+    void SetLiteral(bool has_literal, u32 literal) {
+        has_literal_ = has_literal;
+        literal_ = literal;
+    }
     /// Donde empieza el cuerpo, con la cache ya cargada (despues de BodyEnter).
     void MarkBodyStart() {
         body_start_ = e.Position();
@@ -2490,6 +2512,8 @@ private:
     u32 branch_target_ = 0;
     u32 block_key_ = 0xFFFFFFFFu;
     u32 block_count_ = 0;
+    bool has_literal_ = false;
+    u32 literal_ = 0;
     /// El terminador que se compila ahora es un salto lateral (0.2.3.1, ver
     /// DecodeArmBlock): lo que se devuelve si se toma, y si salta dentro, a que
     /// PC y cuantas instrucciones se salta.
@@ -4214,6 +4238,54 @@ public:
         });
     }
 
+    /// El "ldr pc, [pc, #imm]" final va por EmitVeneer.
+    bool VeneerUsable(u32 inst) const {
+        if (!has_literal_ || thumb_ || !Linking() || !IsPcLiteralJump(inst) ||
+            veneers.load(std::memory_order_relaxed) == 0) {
+            return false;
+        }
+        // Un destino ARM con el bit 1 puesto no es una clave de bloque.
+        return (literal_ & 3u) != 2u;
+    }
+
+    /**
+     * LOS TRAMPOLINES DE LOS MODULOS .CRO (0.3.3.7). Las llamadas entre
+     * modulos pasan por "ldr pc, [pc, #-4]" con el destino en la palabra de
+     * al lado, que escribe LDR:RO al cargar: en el perfil de Zafiro Alfa, un
+     * solo bloque asi era el 8 % de las entradas a los bloques calientes. Era
+     * una carga y un salto indirecto entero (unas 30 instrucciones). El
+     * literal puede cambiar sin que nadie invalide nada -- es un dato, y el
+     * juego podria escribirlo con un STR --, asi que se sigue leyendo en cada
+     * ejecucion, pero solo para compararlo con lo que valia al compilar: si
+     * coincide, enlace directo al destino (siete instrucciones, parcheable);
+     * si no, el camino de siempre, en la zona fria. Como LDR_INST, el bit 0
+     * del destino pasa a TFlag.
+     */
+    void EmitVeneer(u32 inst, u32 pc) {
+        e.Mov32(kRs, PcLiteralAddress(inst, pc));
+        MemoryAccess(kRs, false, kWord, kRs);
+        e.Mrs(kT0);
+        e.Mov32(kRd, literal_);
+        e.Emit(0xE1500000u | (kRs << 16) | kRd); // CMP kRs, kRd
+        const u32 changed = e.BranchPlaceholder(kCondNe);
+        e.MsrFlags(kT0);
+        if ((literal_ & 1u) != 0) {
+            // De ARM a Thumb; si el enlace falla, el despacho ya lo ve.
+            e.Mov32(kRd, 1);
+            e.StrImm(kRd, kCpu, g_offsets.t);
+        }
+        EmitDirectLink(LinkFor(literal_), literal_ & ~1u);
+        DeferCold({changed}, [this] {
+            e.MsrFlags(kT0);
+            // Lo de LoadStore con el valor nuevo, y la salida indirecta.
+            e.Ubfx(kRd, kRs, 0, 1);
+            e.StrImm(kRd, kCpu, g_offsets.t);
+            e.Emit(0xE3C00001u | (kRs << 16) | (kRs << 12)); // BIC kRs, kRs, #1
+            StorePcForIndirect();
+            ExitIndirect(true);
+        });
+    }
+
     /// El LinkInfo del bloque de 'pc', creando su entrada si hace falta (un
     /// bloque New no se enlaza hasta que se compile y se le ponga entry).
     static const LinkInfo* LinkFor(u32 key) {
@@ -4350,6 +4422,10 @@ public:
             ExitIndirect();
             break;
         case Kind::LoadStore:
+            if (VeneerUsable(inst)) {
+                EmitVeneer(inst, pc);
+                break;
+            }
             // "ldr pc, [...]": LoadStore pone Reg[15] y TFlag, y kRs y kRd.
             LoadStore(inst, pc);
             ExitIndirect(true);
@@ -4516,6 +4592,19 @@ bool DecodeArmBlock(ARMul_State* cpu, Block& block) {
     }
     block.guest_bytes = static_cast<u32>(block.words.size()) * 4;
     block.guest_count = static_cast<u32>(block.words.size());
+    // Acaba en "ldr pc, [pc, #imm]" con el literal alineado: se apunta lo que
+    // vale ahora (ver EmitVeneer). La lectura es la que hara el bloque.
+    block.has_literal = false;
+    block.literal = 0;
+    const u32 last = block.words.back();
+    if (IsPcLiteralJump(last)) {
+        const u32 last_pc = block.pc + block.guest_bytes - 4;
+        const u32 address = PcLiteralAddress(last, last_pc);
+        if ((address & 3u) == 0) {
+            block.has_literal = true;
+            block.literal = cpu->memory.Read32(address);
+        }
+    }
     return true;
 }
 
@@ -4689,6 +4778,8 @@ bool Analyze(ARMul_State* cpu, Block& block) {
     block.words.clear();
     block.sizes.clear();
     block.targets.clear();
+    block.has_literal = false;
+    block.literal = 0;
     block.cache_map.fill(-1);
     block.uses_cache = false;
     block.global_regs = false;
@@ -4990,6 +5081,7 @@ bool EmitVariant(Block& block, bool check_mode, u32* start, u32 capacity, u32* c
     compiler.SetCacheMap(block.cache_map);
     compiler.SetThumb(block.thumb);
     compiler.SetBlock(block.pc, block.guest_count);
+    compiler.SetLiteral(block.has_literal, block.literal);
     // La variante normal entra por g_shared_enter, que salta al cuerpo: la
     // misma entrada que los enlaces (0.2.3.8). La de comprobacion lleva su
     // prologo.
@@ -5516,8 +5608,9 @@ void Forget(Block& block) {
  * leer sus instrucciones: si son las mismas -- palabra por palabra, y en Thumb
  * tambien los tamanos y los destinos de los saltos --, el codigo generado
  * seria identico y vale el de antes. Lo que la traduccion lee del juego son
- * solo esas instrucciones (las constantes de la memoria se cargan al
- * ejecutar), y los ajustes del JIT no cambian sin un Reset, que tira todo.
+ * esas instrucciones y, desde 0.3.3.7, el literal de un "ldr pc, [pc, #imm]"
+ * final (lo demas de la memoria se carga al ejecutar); los ajustes del JIT no
+ * cambian sin un Reset, que tira todo.
  */
 bool Revive(ARMul_State* cpu, Block& block) {
     const u64 begin = Common::VitaMicros();
@@ -5528,10 +5621,13 @@ bool Revive(ARMul_State* cpu, Block& block) {
     probe.words.clear();
     probe.sizes.clear();
     probe.targets.clear();
+    probe.has_literal = false;
+    probe.literal = 0;
     const bool same = (cpu->Cpsr & (1u << 9)) == 0 &&
                       (block.thumb ? DecodeThumbBlock(cpu, probe) : DecodeArmBlock(cpu, probe)) &&
                       probe.guest_count == block.guest_count && probe.words == block.words &&
-                      probe.sizes == block.sizes && probe.targets == block.targets;
+                      probe.sizes == block.sizes && probe.targets == block.targets &&
+                      probe.has_literal == block.has_literal && probe.literal == block.literal;
     if (same) {
         block.state = BlockState::Compiled;
         // Como al compilar: lo ya comprobado con estas instrucciones no se

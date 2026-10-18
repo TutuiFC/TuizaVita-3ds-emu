@@ -420,6 +420,9 @@ struct UserSettings {
     /// 0.3.3.6: saltos indirectos del JIT por la tabla de enlaces
     /// (Core::ArmJit::link_table). Solo ajustes.txt.
     bool jit_link_table = true;
+    /// 0.3.3.7: trampolines de los .cro como enlace directo con guarda
+    /// (Core::ArmJit::veneers). Solo ajustes.txt.
+    bool jit_veneers = true;
 };
 UserSettings g_user;
 
@@ -491,6 +494,10 @@ void ApplyUserSettings() {
     }
     const u32 want_table = g_user.jit_link_table ? 1u : 0u;
     if (Core::ArmJit::link_table.exchange(want_table, std::memory_order_relaxed) != want_table) {
+        Core::ArmJit::Reset();
+    }
+    const u32 want_veneers = g_user.jit_veneers ? 1u : 0u;
+    if (Core::ArmJit::veneers.exchange(want_veneers, std::memory_order_relaxed) != want_veneers) {
         Core::ArmJit::Reset();
     }
     // 0.1.6.0: solo cambia que shaders se traducen a partir de ahora.
@@ -602,6 +609,7 @@ void LoadUserSettings() {
     }
     read_bool("copia_textura_gpu=", g_user.texture_copy_gpu);
     read_bool("jit_tabla_enlaces=", g_user.jit_link_table);
+    read_bool("jit_saltos_cro=", g_user.jit_veneers);
 }
 
 /// El contenido de ajustes.txt, una clave por linea.
@@ -615,7 +623,7 @@ int FormatUserSettings(char* buffer, std::size_t size) {
         "resolucion_gpu2=%d\nshaders_asinc=%d\njit_thumb=%d\njit_parche=%d\n"
         "jit_superbloques=%d\njit_regs_fijos=%d\njit_vfp_fijos=%d\nvertices_ram=%d\n"
         "dsp_hilo=%d\njit_perfil=%d\nvolcado_cada=%d\ncopia_textura_gpu=%d\n"
-        "jit_tabla_enlaces=%d\n",
+        "jit_tabla_enlaces=%d\njit_saltos_cro=%d\n",
         g_user.volume_percent, g_user.language, g_user.half_resolution ? 1 : 0,
         g_user.jit_reg_cache ? 1 : 0, g_user.jit_vfp_data ? 1 : 0, g_user.gxm_no_finish ? 1 : 0,
         g_user.gxm_present_direct ? 1 : 0, g_user.jit_direct_link ? 1 : 0,
@@ -627,7 +635,8 @@ int FormatUserSettings(char* buffer, std::size_t size) {
         g_user.jit_superblocks ? 1 : 0, g_user.jit_global_regs ? 1 : 0,
         g_user.jit_vfp_regs ? 1 : 0, g_user.vertex_ring_host ? 1 : 0,
         g_user.dsp_thread ? 1 : 0, g_user.jit_profile ? 1 : 0, g_user.present_writeback_every,
-        g_user.texture_copy_gpu ? 1 : 0, g_user.jit_link_table ? 1 : 0);
+        g_user.texture_copy_gpu ? 1 : 0, g_user.jit_link_table ? 1 : 0,
+        g_user.jit_veneers ? 1 : 0);
 }
 
 /// Los ajustes con los que se juega, a crash.txt en una linea (0.1.8.7): sin
