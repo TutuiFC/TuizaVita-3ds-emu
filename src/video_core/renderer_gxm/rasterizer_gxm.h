@@ -167,6 +167,12 @@ public:
     static constexpr u32 kBatchPhases = 6;
     static std::array<unsigned long long, kBatchPhases> batch_phase_us;
     static u32 batch_phase_samples;
+    /// Memo de lotes (0.3.4.4): lotes mirados, cuantos rehicieron pipeline o
+    /// programa de vertices, y escrituras que no cambiaban nada.
+    static std::atomic<u32> memo_batches;
+    static std::atomic<u32> memo_fs_rebuilds;
+    static std::atomic<u32> memo_vs_rebuilds;
+    static std::atomic<u32> memo_same_writes;
     /// Dentro de "estado" (0.2.1.0): abrir la escena y las texturas, que es
     /// donde puede esperar a la GPU o volver a mirar una textura entera.
     static unsigned long long state_scene_us;
@@ -202,6 +208,14 @@ public:
      * ajustes.txt; a 0, como antes.
      */
     static std::atomic<u32> wbuffer_on_gpu;
+    /**
+     * El memo de lotes compara VALORES (0.3.4.4): un registro reescrito con el
+     * mismo valor ya no rehace el pipeline ni el programa de vertices. Los
+     * juegos reenvian la configuracion entera en cada dibujo, y cada escritura
+     * contaba como cambio (~40 us por lote). Clave "memo_valor=" de
+     * ajustes.txt; a 0, como antes (cualquier escritura invalida).
+     */
+    static std::atomic<u32> memo_by_value;
     /**
      * Resolucion de dibujado en la GPU EN MITADES (ajuste "Resolucion GPU"):
      * 1 = 0.5x (0.2.0.4), 2 = 1x, 4 = 2x (0.2.0.3). Las superficies tienen

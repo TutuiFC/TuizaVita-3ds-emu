@@ -1464,7 +1464,11 @@ void PicaCore::ShadeVerticesParallel(const VertexLoader& loader, PAddr base_addr
     // Sombrea [begin, end) con una unidad propia. 'warmup' es el vertice que
     // precede al tramo, o null si el tramo abre el lote.
     const auto shade_range = [&](u32 begin, u32 end, const ParallelShading::Job* warmup) {
-        const unsigned long long busy_begin = Common::VitaMicros();
+        // Reloj en 1 de cada 4 tramos (0.3.4.4): es una llamada al sistema.
+        static std::atomic<u32> busy_clock_tick{0};
+        const bool busy_timed =
+            (busy_clock_tick.fetch_add(1, std::memory_order_relaxed) & 3u) == 0;
+        const unsigned long long busy_begin = busy_timed ? Common::VitaMicros() : 0;
         ShaderUnit unit;
         // El contador de muestreo de la autocomprobacion vive en la unidad, que
         // es nueva en cada tramo: empezaba en 0 y el primer vertice de CADA
@@ -1518,7 +1522,10 @@ void PicaCore::ShadeVerticesParallel(const VertexLoader& loader, PAddr base_addr
         Common::FrameStats::shade_fast_ops.fetch_add(unit.fast_ops, std::memory_order_relaxed);
         Common::FrameStats::shade_slow_instrs.fetch_add(unit.slow_instrs,
                                                         std::memory_order_relaxed);
-        Common::FrameStats::Add(Common::FrameStats::shade_busy_us, busy_begin);
+        if (busy_timed) {
+            Common::FrameStats::shade_busy_us.fetch_add((Common::VitaMicros() - busy_begin) * 4,
+                                                        std::memory_order_relaxed);
+        }
     };
 
     // Cache completa por lote (ver g_full_vertex_dedup): solo con indices, que
@@ -1588,7 +1595,9 @@ void PicaCore::ShadeVerticesParallel(const VertexLoader& loader, PAddr base_addr
         }
 
         // ---- Fase 2: sombreado ----
-        const unsigned long long shade_begin = Common::VitaMicros();
+        static u32 shade_clock_tick = 0;
+        const bool shade_timed = (++shade_clock_tick & 3u) == 0;
+        const unsigned long long shade_begin = shade_timed ? Common::VitaMicros() : 0;
         const u32 jobs = static_cast<u32>(ps.jobs.size());
         if (ps.outputs.size() < jobs) {
             ps.outputs.resize(jobs);
@@ -1617,7 +1626,10 @@ void PicaCore::ShadeVerticesParallel(const VertexLoader& loader, PAddr base_addr
             previous = ps.jobs[jobs - 1];
         }
         Common::FrameStats::vertices_shaded.fetch_add(jobs, std::memory_order_relaxed);
-        Common::FrameStats::Add(Common::FrameStats::shade_us, shade_begin);
+        if (shade_timed) {
+            Common::FrameStats::shade_us.fetch_add((Common::VitaMicros() - shade_begin) * 4,
+                                                   std::memory_order_relaxed);
+        }
 
         // ---- Fase 3: entrega, en el orden del lote ----
         //

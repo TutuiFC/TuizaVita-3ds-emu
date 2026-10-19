@@ -68,6 +68,7 @@ std::atomic<u32> RasterizerGXM::transfer_on_gpu{1};
 std::atomic<u32> RasterizerGXM::present_writeback_every{4};
 std::atomic<u32> RasterizerGXM::texture_copy_gpu{0};
 std::atomic<u32> RasterizerGXM::wbuffer_on_gpu{1};
+std::atomic<u32> RasterizerGXM::memo_by_value{1};
 std::atomic<u32> RasterizerGXM::resolution_scale{2};
 std::atomic<u32> RasterizerGXM::gpu_transfers{0};
 std::atomic<u32> RasterizerGXM::transfer_materialized{0};
@@ -2536,6 +2537,19 @@ constexpr std::array<u64, 12> MemoMask(u32 first, u32 end) {
     return mask;
 }
 
+/**
+ * PUERTOS DE DATOS (0.3.4.4, memo por valor). Escribir en ellos sube codigo o
+ * tablas aunque el valor del registro no cambie (dos palabras seguidas iguales
+ * del shader, por ejemplo): para el memo cuentan como cambiados siempre.
+ * Tablas del procedural (0x0AF-0x0B7), codigo y swizzle del shader de
+ * geometria (0x29B-0x2AD) y del de vertices (0x2CB-0x2DD). Los de las tablas de
+ * luz y niebla ya estan entre los ignorados.
+ */
+constexpr bool IsMemoPortReg(u32 reg) {
+    return (reg >= 0x0AF && reg <= 0x0B7) || (reg >= 0x29B && reg <= 0x2AD) ||
+           (reg >= 0x2CB && reg <= 0x2DD);
+}
+
 /// Deciden el programa de fragmentos (y parte del de vertices: salidas y luz).
 constexpr std::array<u64, 12> kFsMemoMask = MemoMask(0x040, 0x200);
 /// Deciden el resto del de vertices: atributos, programa y geometria.
@@ -2602,6 +2616,8 @@ bool AnyDirty(const Pica::DirtyRegs& dirty, const std::array<u64, 12>& mask) {
  * los punteros no borran entradas utiles mientras vive el rasterizador.
  */
 struct RasterizerGXM::BatchMemo {
+    /// Valor de cada registro la ultima vez que el memo lo miro (memo_by_value).
+    std::array<u32, 0x300> shadow{};
     struct Location {
         bool found = false;
         u8 loader = 0;
@@ -6162,9 +6178,11 @@ void RasterizerGXM::DrawTriangles() {
         batch.clear();
         return;
     }
-    // Una lectura de reloj por lote (unos trescientos por fotograma). Ver
-    // Common::FrameStats::batch_us.
-    const unsigned long long batch_begin = Common::VitaMicros();
+    // Reloj en 1 de cada 8 lotes (0.3.4.4): leerlo es una llamada al sistema y
+    // eran dos por lote. Ver Common::FrameStats::batch_us.
+    static u32 batch_clock_tick = 0;
+    const bool batch_timed = (++batch_clock_tick & 7u) == 0;
+    const unsigned long long batch_begin = batch_timed ? Common::VitaMicros() : 0;
     const bool drawn = DrawBatchOnGpu();
     if (!drawn) {
         // No se ha podido dibujar en la GPU (sin memoria, shader rechazado a
@@ -6181,7 +6199,10 @@ void RasterizerGXM::DrawTriangles() {
     batch.clear();
     batch_decided = false;
     batch_on_gpu = false;
-    Common::FrameStats::Add(Common::FrameStats::batch_us, batch_begin);
+    if (batch_timed) {
+        Common::FrameStats::batch_us.fetch_add((Common::VitaMicros() - batch_begin) * 8,
+                                               std::memory_order_relaxed);
+    }
 }
 
 void RasterizerGXM::FlushAll() {
@@ -6605,18 +6626,49 @@ bool RasterizerGXM::AccelerateDrawBatch(bool is_indexed) {
     // Lo que no haya cambiado desde el lote anterior se reutiliza (BatchMemo).
     BatchMemo& memo = *batch_memo;
     {
+        /**
+         * LO QUE DE VERDAD HA CAMBIADO (0.3.4.4). Los bits de dirty_regs se
+         * ponen en cada ESCRITURA; con memo_by_value solo cuentan los
+         * registros cuyo valor es distinto del que vio el memo la ultima vez
+         * (o los puertos de datos, ver IsMemoPortReg). Lo que no es del memo
+         * (luces, niebla, colores) sigue mirando las escrituras, como antes.
+         */
+        const auto& dirty = pica.dirty_regs.qwords;
+        // La sombra se actualiza tambien con el ajuste apagado: si se enciende
+        // a mitad de partida, compara contra lo que de verdad vio el memo.
+        const bool by_value = memo_by_value.load(std::memory_order_relaxed) != 0;
+        std::array<u64, 12> changed = dirty;
+        const auto& values = regs.reg_array;
+        for (u32 i = 0; i < dirty.size(); i++) {
+            u64 bits = dirty[i] & (kFsMemoMask[i] | kVsMemoMask[i] | kVsBoolMask[i]);
+            while (bits != 0) {
+                const u32 bit = static_cast<u32>(__builtin_ctzll(bits));
+                bits &= bits - 1;
+                const u32 reg = i * 64 + bit;
+                if (IsMemoPortReg(reg) || values[reg] != memo.shadow[reg]) {
+                    memo.shadow[reg] = values[reg];
+                } else if (by_value) {
+                    changed[i] &= ~(1ull << bit);
+                    memo_same_writes.fetch_add(1, std::memory_order_relaxed);
+                }
+            }
+        }
         bool fs_dirty = false;
         bool vs_dirty = false;
-        const auto& dirty = pica.dirty_regs.qwords;
-        for (u32 i = 0; i < dirty.size(); i++) {
-            fs_dirty = fs_dirty || (dirty[i] & kFsMemoMask[i]) != 0;
-            vs_dirty = vs_dirty || (dirty[i] & kVsMemoMask[i]) != 0;
+        bool bools_dirty = false;
+        bool vs_from_fs_dirty = false;
+        for (u32 i = 0; i < changed.size(); i++) {
+            fs_dirty = fs_dirty || (changed[i] & kFsMemoMask[i]) != 0;
+            vs_dirty = vs_dirty || (changed[i] & kVsMemoMask[i]) != 0;
+            bools_dirty = bools_dirty || (changed[i] & kVsBoolMask[i]) != 0;
+            vs_from_fs_dirty = vs_from_fs_dirty || (changed[i] & kVsFromFsMask[i]) != 0;
         }
         if (fs_dirty) {
             memo.pipeline = nullptr;
             memo.pipeline_fail = nullptr;
+            memo_fs_rebuilds.fetch_add(1, std::memory_order_relaxed);
         }
-        if (memo.layout.specialized && AnyDirty(pica.dirty_regs, kVsBoolMask)) {
+        if (memo.layout.specialized && bools_dirty) {
             vs_dirty = true;
         }
         /**
@@ -6626,12 +6678,14 @@ bool RasterizerGXM::AccelerateDrawBatch(bool is_indexed) {
          * lotes por fotograma). Del rango de fragmentos solo cuentan los de
          * kVsFromFsMask, y lit y proj del pipeline, que se miran al tenerlo.
          */
-        if (AnyDirty(pica.dirty_regs, kVsFromFsMask)) {
+        if (vs_from_fs_dirty) {
             vs_dirty = true;
         }
         if (vs_dirty) {
             memo.vs_valid = false;
+            memo_vs_rebuilds.fetch_add(1, std::memory_order_relaxed);
         }
+        memo_batches.fetch_add(1, std::memory_order_relaxed);
         memo.lights_dirty = memo.lights_dirty || AnyDirty(pica.dirty_regs, kLightsMask);
         memo.fog_dirty = memo.fog_dirty || AnyDirty(pica.dirty_regs, kFogLutMask);
         memo.colors_dirty = memo.colors_dirty || AnyDirty(pica.dirty_regs, kConstColorMask);
@@ -7269,6 +7323,10 @@ bool RasterizerGXM::AccelerateDrawBatch(bool is_indexed) {
 
 std::array<unsigned long long, RasterizerGXM::kBatchPhases> RasterizerGXM::batch_phase_us{};
 u32 RasterizerGXM::batch_phase_samples = 0;
+std::atomic<u32> RasterizerGXM::memo_batches{0};
+std::atomic<u32> RasterizerGXM::memo_fs_rebuilds{0};
+std::atomic<u32> RasterizerGXM::memo_vs_rebuilds{0};
+std::atomic<u32> RasterizerGXM::memo_same_writes{0};
 unsigned long long RasterizerGXM::state_scene_us = 0;
 unsigned long long RasterizerGXM::state_texture_us = 0;
 
@@ -7356,7 +7414,8 @@ std::string RasterizerGXM::TakeBatchProfile() {
         "us por lote: preguntas {:.1f} vs {:.1f} enlazar {:.1f} datos {:.1f} estado {:.1f} "
         "(escena {:.1f} texturas {:.1f}, de ellas copias gpu {:.1f}) uniforms {:.1f} ({} "
         "muestras) | texturas a revisar por: vaciado {} invalidar {} ambos {} relleno {} "
-        "copia {} | vs nuevos {} (del indice {}, {} ms, traducir {} ms, el peor {} ms)",
+        "copia {} | vs nuevos {} (del indice {}, {} ms, traducir {} ms, el peor {} ms) | memo: "
+        "lotes {} fs rehecho {} vs rehecho {} escrituras iguales {}",
         avg(batch_phase_us[0]), avg(batch_phase_us[1]), avg(batch_phase_us[2]),
         avg(batch_phase_us[3]), avg(batch_phase_us[4]), avg(state_scene_us),
         avg(state_texture_us), avg(g_state_copy_us), avg(batch_phase_us[5]), samples,
@@ -7369,7 +7428,11 @@ std::string RasterizerGXM::TakeBatchProfile() {
         g_vs_index_hits.exchange(0, std::memory_order_relaxed),
         g_vs_build_us.exchange(0, std::memory_order_relaxed) / 1000,
         g_vs_generate_us.exchange(0, std::memory_order_relaxed) / 1000,
-        g_vs_build_max_us.exchange(0, std::memory_order_relaxed) / 1000);
+        g_vs_build_max_us.exchange(0, std::memory_order_relaxed) / 1000,
+        memo_batches.exchange(0, std::memory_order_relaxed),
+        memo_fs_rebuilds.exchange(0, std::memory_order_relaxed),
+        memo_vs_rebuilds.exchange(0, std::memory_order_relaxed),
+        memo_same_writes.exchange(0, std::memory_order_relaxed));
     batch_phase_us.fill(0);
     batch_phase_samples = 0;
     state_scene_us = 0;
