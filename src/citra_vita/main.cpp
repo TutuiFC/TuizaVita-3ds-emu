@@ -33,6 +33,7 @@
 
 #include <cryptopp/integer.h>
 
+#include "citra_vita/vita_i18n.h"
 #include "citra_vita/vita_input.h"
 #include "citra_vita/vita_jit_probe.h"
 #include "citra_vita/vita_version.h"
@@ -103,6 +104,12 @@ namespace {
 /// en vita_version.h, que es el unico sitio donde se escribe (el overlay del
 /// juego usa la misma constante).
 using VitaFrontend::kVersion;
+
+/// Menu texts. English only in this build (see vita_strings.inc).
+namespace I18n = VitaFrontend::I18n;
+const char* T(I18n::Str id) {
+    return I18n::TrIn(I18n::kEnglish, id);
+}
 
 constexpr char kUserDir[] = "ux0:/data/azahar/";
 constexpr char kRomDir[] = "ux0:/data/azahar/roms";
@@ -316,23 +323,23 @@ constexpr SceUInt64 kSettingsHoldUs = 2'000'000;
 
 struct LanguageOption {
     int value; ///< Service::CFG::SystemLanguage, o -1 = no tocar
-    const char* name;
+    I18n::Str name;
 };
 
 constexpr LanguageOption kLanguages[] = {
-    {-1, "Automatico (el de la consola emulada)"},
-    {Service::CFG::LANGUAGE_ES, "Espanol"},
-    {Service::CFG::LANGUAGE_EN, "Ingles"},
-    {Service::CFG::LANGUAGE_FR, "Frances"},
-    {Service::CFG::LANGUAGE_DE, "Aleman"},
-    {Service::CFG::LANGUAGE_IT, "Italiano"},
-    {Service::CFG::LANGUAGE_PT, "Portugues"},
-    {Service::CFG::LANGUAGE_NL, "Neerlandes"},
-    {Service::CFG::LANGUAGE_RU, "Ruso"},
-    {Service::CFG::LANGUAGE_JP, "Japones"},
-    {Service::CFG::LANGUAGE_ZH, "Chino simplificado"},
-    {Service::CFG::LANGUAGE_TW, "Chino tradicional"},
-    {Service::CFG::LANGUAGE_KO, "Coreano"},
+    {-1, I18n::kSysLangAuto},
+    {Service::CFG::LANGUAGE_ES, I18n::kSysLangEs},
+    {Service::CFG::LANGUAGE_EN, I18n::kSysLangEn},
+    {Service::CFG::LANGUAGE_FR, I18n::kSysLangFr},
+    {Service::CFG::LANGUAGE_DE, I18n::kSysLangDe},
+    {Service::CFG::LANGUAGE_IT, I18n::kSysLangIt},
+    {Service::CFG::LANGUAGE_PT, I18n::kSysLangPt},
+    {Service::CFG::LANGUAGE_NL, I18n::kSysLangNl},
+    {Service::CFG::LANGUAGE_RU, I18n::kSysLangRu},
+    {Service::CFG::LANGUAGE_JP, I18n::kSysLangJa},
+    {Service::CFG::LANGUAGE_ZH, I18n::kSysLangZh},
+    {Service::CFG::LANGUAGE_TW, I18n::kSysLangTw},
+    {Service::CFG::LANGUAGE_KO, I18n::kSysLangKo},
 };
 constexpr int kLanguageCount = static_cast<int>(sizeof(kLanguages) / sizeof(kLanguages[0]));
 
@@ -420,9 +427,8 @@ struct UserSettings {
 };
 UserSettings g_user;
 
-constexpr const char* kLayoutNames[VitaFrontend::kScreenLayoutCount] = {
-    "Normal (1:1)", "Superior grande + inferior", "Lado a lado", "Solo superior x2",
-    "Solo superior, pantalla completa"};
+constexpr I18n::Str kLayoutNames[VitaFrontend::kScreenLayoutCount] = {
+    I18n::kLayout0, I18n::kLayout1, I18n::kLayout2, I18n::kLayout3, I18n::kLayout4};
 
 int LanguageIndex(int value) {
     for (int i = 0; i < kLanguageCount; i++) {
@@ -656,35 +662,14 @@ void DrawSettings(vita2d_pgf* font, int row) {
 
     vita2d_start_drawing();
     vita2d_clear_screen();
-    vita2d_pgf_draw_text(font, 40, 45, kColorAccent, 1.4f, "Ajustes");
-    vita2d_pgf_draw_text(font, 40, 72, kColorDim, 0.85f,
-                         "Se guardan en ux0:/data/azahar/ajustes.txt. Las cifras de FPS son "
-                         "aproximadas y dependen del juego.");
+    vita2d_pgf_draw_text(font, 40, 45, kColorAccent, 1.4f, T(I18n::kSettingsTitle));
+    I18n::DrawTextFit(font, 40, 72, kColorDim, 0.85f, T(I18n::kSettingsSubtitle), 880);
 
-    const char* labels[kSettingsRows] = {"Volumen",
-                                         "Idioma del sistema",
-                                         "Resolucion (software)",
-                                         "Cache registros JIT",
-                                         "Coma flotante en JIT",
-                                         "Sin espera a la GPU",
-                                         "Presentar directo",
-                                         "Enlace directo JIT",
-                                         "Vertices con saltos a GPU",
-                                         "Cache de vertices completa",
-                                         "Sonido",
-                                         "Pantallas",
-                                         "Omitir imagenes repetidas",
-                                         "Vertices especializados a GPU",
-                                         "Copia y borrado en GPU",
-                                         "GPU en otro nucleo",
-                                         "Limite de velocidad",
-                                         "Resolucion GPU",
-                                         "Shaders asincronos"};
     char volume_text[16];
     std::snprintf(volume_text, sizeof(volume_text), "%d %%", g_user.volume_percent);
     const char* values[kSettingsRows] = {
         volume_text,
-        kLanguages[LanguageIndex(g_user.language)].name,
+        T(kLanguages[LanguageIndex(g_user.language)].name),
         g_user.half_resolution ? "0.5x" : "1x",
         g_user.jit_reg_cache ? "ON" : "OFF",
         g_user.jit_vfp_data ? "ON" : "OFF",
@@ -694,13 +679,13 @@ void DrawSettings(vita2d_pgf* font, int row) {
         g_user.vs_escapes ? "ON" : "OFF",
         g_user.full_vertex_dedup ? "ON" : "OFF",
         g_user.sound ? "ON" : "OFF",
-        kLayoutNames[std::clamp(g_user.screen_layout, 0, VitaFrontend::kScreenLayoutCount - 1)],
+        T(kLayoutNames[std::clamp(g_user.screen_layout, 0, VitaFrontend::kScreenLayoutCount - 1)]),
         g_user.skip_repeated ? "ON" : "OFF",
         g_user.vs_specialize ? "ON" : "OFF",
         g_user.gpu_screen_copy ? "ON" : "OFF",
         g_user.gpu_thread ? "ON" : "OFF",
-        g_user.unlimited_speed ? "Sin limite" : "100% (refresco)",
-        g_user.gpu_scale == 4 ? "2x (experimental)" : g_user.gpu_scale == 1 ? "0.5x" : "1x",
+        g_user.unlimited_speed ? T(I18n::kValUnlimited) : T(I18n::kValRefresh),
+        g_user.gpu_scale == 4 ? T(I18n::kVal2x) : g_user.gpu_scale == 1 ? "0.5x" : "1x",
         g_user.async_shaders ? "ON" : "OFF"};
 
     for (int i = 0; i < kSettingsRows; i++) {
@@ -710,7 +695,8 @@ void DrawSettings(vita2d_pgf* font, int row) {
             vita2d_draw_rectangle(30, static_cast<float>(y - 18), 900, 23, 0xFF402810);
         }
         const unsigned int color = selected ? kColorAccent : kColorText;
-        vita2d_pgf_draw_text(font, 44, y, color, 0.95f, labels[i]);
+        I18n::DrawTextFit(font, 44, y, color, 0.95f, T(I18n::Offset(I18n::kSetLabel0, i)),
+                          kValueX - 54);
         vita2d_pgf_draw_textf(font, kValueX, y, color, 0.95f, selected ? "<  %s  >" : "   %s",
                               values[i]);
     }
@@ -725,68 +711,14 @@ void DrawSettings(vita2d_pgf* font, int row) {
     /**
      * Que hace cada ajuste: que ganas (FPS, mas o menos) y que pierdes. Las
      * cifras son estimaciones de lo medido en Pokemon Rubi Omega; en otros
-     * juegos cambian.
+     * juegos cambian. Los textos estan en vita_strings.inc (kSetHelp<fila>).
      */
-    static const char* const help[kSettingsRows][3] = {
-        {"Volumen del juego. Se aplica al momento.", "No cambia los FPS.", ""},
-        {"El idioma que ve el juego. Se aplica al arrancar el juego.", "No cambia los FPS.",
-         "Si el juego no trae ese idioma, usa el primero de su region."},
-        {"0.5x: la CPU dibuja 1 de cada 4 pixeles y copia el resto.",
-         "Mas FPS SOLO en juegos que dibujan por software (no los 3D normales).",
-         "Contra: imagen mas pixelada. En partida, L+R cambia lo mismo."},
-        {"ON: los registros del juego se quedan en el procesador de la Vita.",
-         "Ganancia: CPU del juego ~10-20% mas rapida (varios FPS en juegos pesados).",
-         "Contra: ninguno conocido. Apagar solo si un juego se cuelga."},
-        {"ON: la coma flotante del juego va por el hardware de la Vita.",
-         "Ganancia: la mayor del JIT en juegos 3D (del orden de +10-25% de FPS).",
-         "Contra: si un juego calcula cosas raras (fisicas, animaciones), apagar."},
-        {"ON: no para la CPU a esperar a la GPU al cerrar cada escena.",
-         "Ganancia: ~3-7% de FPS en 3D.", "Contra: si la imagen se congela o parpadea, apagar."},
-        {"ON: la imagen dibujada por la GPU se muestra sin copiarla dos veces.",
-         "Ganancia: ~2-5% de FPS cuando el juego lo permite.",
-         "Contra: si la imagen sale girada o con colores raros, apagar."},
-        {"ON: la CPU emulada salta de bloque en bloque sin volver al emulador.",
-         "Ganancia: ~5-15% de FPS.",
-         "Contra: ninguno conocido. Apagar si hay cuelgues sin explicacion."},
-        {"ON: los shaders de vertices con saltos complicados van a la GPU.",
-         "Ganancia: la mayor en 3D (+30% o mas si el compilador los acepta).",
-         "Contra: la 1a vez tarda mas en cargar la escena. Si el 3D sale roto, apagar."},
-        {"ON: cada vertice repetido se calcula una sola vez por dibujo.",
-         "Ganancia: 0-15% en 3D, segun el juego.",
-         "Contra: si un modelo 3D sale con picos o deformado, apagar."},
-        {"OFF: sin sonido. Se ahorra el estirado y el envio del audio.",
-         "Ganancia: ~2-5% de FPS. Se aplica al arrancar el juego.", "Contra: no hay sonido."},
-        {"Como se colocan las pantallas. La escala la hace la GPU de la Vita.",
-         "No cambia los FPS. Con solo la superior no se ve la tactil ni se puede tocar.",
-         "Se aplica al momento, tambien en partida."},
-        {"ON: si el juego no ha dibujado nada nuevo, no se vuelve a mostrar.",
-         "Ganancia: ~5-10% de FPS en juegos a 30 FPS o menos.",
-         "Contra: si un juego deja la imagen congelada, apagar."},
-        {"ON: los shaders con saltos se compilan una vez por combinacion de opciones.",
-         "Ganancia: la mayor en 3D (Zafiro Alfa: de ~2.5 FPS con OFF a varias veces mas).",
-         "Contra: la 1a vez que sale cada uno, la escena se para unos segundos. Si crashea, apagar."},
-        {"ON: copia de pantalla y borrados en la GPU, sin bajar a la CPU y volver a subir.",
-         "Ganancia: el 2D de Zafiro Alfa paso de 11 a 22 FPS; en 3D, varios ms por fotograma.",
-         "Contra: si ves imagenes viejas, colores raros o parpadeos, apagar."},
-        {"ON: la GPU emulada y la imagen van en el nucleo 1; el juego, solo en el 0.",
-         "Ganancia: lo que tarde la GPU por fotograma (calculo: +20-50% donde pesa). Al arrancar juego.",
-         "Contra: nuevo. Si un juego se cuelga, va a saltos o se ve raro, apagar."},
-        {"Sin limite: no espera al refresco de la pantalla; puede pasar del 100% de velocidad.",
-         "Ganancia: menus y escenas ligeras van mas rapido que en la consola.",
-         "Contra: el juego puede ir acelerado y el sonido estirado. Se aplica al momento."},
-        {"0.5x: la GPU dibuja la mitad por eje (menos nitido). 2x: el doble (mas nitido).",
-         "0.5x alivia la GPU de la Vita; 2x cuesta GPU y memoria de video. Al arrancar el juego.",
-         "Contra: experimental. Lo que vaya por software sigue a 1x. Si va lento o raro, 1x."},
-        {"ON: mientras se compila el shader de vertices de un modelo, ese modelo no se dibuja.",
-         "Ganancia: la 1a vez que se entra a una escena 3D va fluida en vez de a 2-3 FPS.",
-         "Contra: los modelos aparecen unos segundos despues. OFF: se ven ya, pero a saltos."},
-    };
-    vita2d_pgf_draw_text(font, 40, 414, kColorDim, 0.9f, help[row][0]);
-    vita2d_pgf_draw_text(font, 40, 438, kColorAccent, 0.9f, help[row][1]);
-    vita2d_pgf_draw_text(font, 40, 462, kColorDim, 0.9f, help[row][2]);
+    const I18n::Str help = I18n::Offset(I18n::kSetHelp0a, row * 3);
+    I18n::DrawTextFit(font, 40, 428, kColorDim, 0.9f, T(help), 880);
+    I18n::DrawTextFit(font, 40, 450, kColorAccent, 0.9f, T(I18n::Offset(help, 1)), 880);
+    I18n::DrawTextFit(font, 40, 472, kColorDim, 0.9f, T(I18n::Offset(help, 2)), 880);
 
-    vita2d_pgf_draw_text(font, 40, 504, kColorDim, 0.9f,
-                         "ARRIBA/ABAJO: elegir   IZQ/DER: cambiar   CIRCULO o START: guardar y volver");
+    I18n::DrawTextFit(font, 40, 504, kColorDim, 0.9f, T(I18n::kSettingsFooter), 880);
     vita2d_pgf_draw_text(font, 40, 528, kColorDim, 0.85f, kVersion);
     vita2d_end_drawing();
     vita2d_swap_buffers();
@@ -928,14 +860,14 @@ void DrawMenu(vita2d_pgf* font, const std::vector<RomEntry>& roms, int selected,
     vita2d_pgf_draw_text(font, 40, 50, kColorAccent, 1.4f, "Azahar  -  PS Vita");
     vita2d_pgf_draw_text(font, 40, 524, kColorDim, 0.85f, kVersion);
     vita2d_pgf_draw_text(font, 40, 80, kColorDim, 0.9f,
-                         "Emulador de Nintendo 3DS  |  JIT ARM + renderizado GXM");
+                         "Nintendo 3DS emulator  |  ARM JIT + GXM rendering");
 
     if (roms.empty()) {
         vita2d_pgf_draw_text(font, 40, kListTop + 20, kColorText, 1.0f,
-                             "No hay ningun juego en ux0:/data/azahar/roms");
+                             "No games in ux0:/data/azahar/roms");
         vita2d_pgf_draw_text(font, 40, kListTop + 55, kColorDim, 0.9f,
-                             "Copia ahi ficheros .3ds / .cci / .cxi / .app / .3dsx y vuelve.");
-        vita2d_pgf_draw_text(font, 40, 500, kColorDim, 0.9f, "CIRCULO: salir");
+                             "Copy .3ds / .cci / .cxi / .app / .3dsx files there and come back.");
+        vita2d_pgf_draw_text(font, 40, 500, kColorDim, 0.9f, "CIRCLE: quit");
     } else {
         for (int row = 0; row < kVisibleRows; row++) {
             const int index = scroll + row;
@@ -953,7 +885,7 @@ void DrawMenu(vita2d_pgf* font, const std::vector<RomEntry>& roms, int selected,
         }
 
         vita2d_pgf_draw_textf(font, 40, 500, kColorDim, 0.9f,
-                              "CRUZ: jugar   CIRCULO: salir   (%d/%d)", selected + 1,
+                              "CROSS: play   CIRCLE: quit   (%d/%d)", selected + 1,
                               static_cast<int>(roms.size()));
 
         // El motor grafico se elige aqui y se aplica al siguiente juego: cada
@@ -962,17 +894,17 @@ void DrawMenu(vita2d_pgf* font, const std::vector<RomEntry>& roms, int selected,
         // del bucle de emulacion).
         if (Settings::values.graphics_api.GetValue() == Settings::GraphicsAPI::GXM) {
             vita2d_pgf_draw_text(font, 40, 470, kColorDim, 0.9f,
-                                 "SELECT: motor grafico  (GXM)");
+                                 "SELECT: graphics engine  (GXM)");
         } else {
             vita2d_pgf_draw_text(font, 40, 470, kColorDim, 0.9f,
-                                 "SELECT: motor grafico  (software)");
+                                 "SELECT: graphics engine  (software)");
         }
     }
 
     // Ajustes: la pista siempre, y mientras se mantiene START, la barra que se
     // llena en los dos segundos que hacen falta.
     vita2d_pgf_draw_text(font, 40, 440, kColorDim, 0.9f,
-                         "Manten START 2 s: ajustes (volumen, idioma, resolucion)");
+                         "Hold START 2 s: settings (volume, language, resolution)");
     if (settings_hold > 0.0f) {
         vita2d_draw_rectangle(560, 430, 300, 10, 0xFF404040);
         vita2d_draw_rectangle(560, 430, 300.0f * std::min(settings_hold, 1.0f), 10, kColorAccent);
@@ -986,7 +918,7 @@ void DrawMenu(vita2d_pgf* font, const std::vector<RomEntry>& roms, int selected,
 void DrawShaderLoading(vita2d_pgf* font, u32 done, u32 total) {
     vita2d_start_drawing();
     vita2d_clear_screen();
-    vita2d_pgf_draw_text(font, 40, 200, kColorAccent, 1.3f, "Cargando shaders...");
+    vita2d_pgf_draw_text(font, 40, 200, kColorAccent, 1.3f, T(I18n::kLoadingShaders));
     constexpr float kBarX = 40.0f;
     constexpr float kBarY = 240.0f;
     constexpr float kBarWidth = 880.0f;
@@ -995,12 +927,10 @@ void DrawShaderLoading(vita2d_pgf* font, u32 done, u32 total) {
         vita2d_draw_rectangle(kBarX, kBarY,
                               kBarWidth * static_cast<float>(done) / static_cast<float>(total),
                               18.0f, kColorAccent);
-        vita2d_pgf_draw_textf(font, 40, 300, kColorText, 1.0f, "%u / %u shaders", done, total);
+        vita2d_pgf_draw_textf(font, 40, 300, kColorText, 1.0f, T(I18n::kShaderCount), done, total);
     } else {
-        vita2d_pgf_draw_text(font, 40, 300, kColorDim, 1.0f,
-                             "No hay shaders guardados de este juego todavia: se iran");
-        vita2d_pgf_draw_text(font, 40, 330, kColorDim, 1.0f,
-                             "guardando al jugar y la proxima vez cargaran aqui.");
+        I18n::DrawTextFit(font, 40, 300, kColorDim, 1.0f, T(I18n::kNoShaders1), 880);
+        I18n::DrawTextFit(font, 40, 330, kColorDim, 1.0f, T(I18n::kNoShaders2), 880);
     }
     vita2d_end_drawing();
     vita2d_swap_buffers();
@@ -1020,19 +950,19 @@ void DrawMessage(vita2d_pgf* font, const char* line1, const char* line2) {
 const char* LoadErrorMessage(Core::System::ResultStatus status) {
     switch (status) {
     case Core::System::ResultStatus::ErrorGetLoader:
-        return "No hay un cargador para este fichero.";
+        return T(I18n::kLoadErrNoLoader);
     case Core::System::ResultStatus::ErrorLoader:
-        return "No se ha podido cargar el juego.";
+        return T(I18n::kLoadErrLoader);
     case Core::System::ResultStatus::ErrorLoader_ErrorEncrypted:
-        return "El juego esta cifrado: hay que descifrarlo antes de usarlo.";
+        return T(I18n::kLoadErrEncrypted);
     case Core::System::ResultStatus::ErrorLoader_ErrorInvalidFormat:
-        return "Formato de fichero no soportado.";
+        return T(I18n::kLoadErrFormat);
     case Core::System::ResultStatus::ErrorLoader_ErrorGbaTitle:
-        return "Es un titulo de Consola Virtual de GBA, no soportado.";
+        return T(I18n::kLoadErrGba);
     case Core::System::ResultStatus::ErrorSystemFiles:
-        return "Faltan ficheros de sistema del 3DS.";
+        return T(I18n::kLoadErrSystemFiles);
     case Core::System::ResultStatus::ErrorNotInitialized:
-        return "El nucleo de CPU no se ha inicializado.";
+        return T(I18n::kLoadErrNotInitialized);
     case Core::System::ResultStatus::ErrorSystemMode:
         // OJO: este no significa lo que dice. Es el cajon de sastre de
         // Core::System::Load: LoadKernelMemoryMode solo falla si no consigue
@@ -1043,9 +973,9 @@ const char* LoadErrorMessage(Core::System::ResultStatus status) {
         // El texto lo dice ahora, y ademas la pantalla de error enseña el
         // tamaño del fichero: un ROM de mas de 2 GB era exactamente este
         // sintoma antes de pasar la lectura de ficheros a sceIo.
-        return "No se ha podido leer el ROM (cabecera ilegible, claves, o fichero corrupto).";
+        return T(I18n::kLoadErrRead);
     default:
-        return "Error desconocido al cargar el juego.";
+        return T(I18n::kLoadErrUnknown);
     }
 }
 
@@ -1512,7 +1442,7 @@ void DrawFatalError(vita2d_pgf* font, const char* title, const std::string& deta
         y += 26;
     }
 
-    vita2d_pgf_draw_textf(font, 40, 440, kColorDim, 0.95f, "Memoria de usuario libre: %d KB",
+    vita2d_pgf_draw_textf(font, 40, 440, kColorDim, 0.95f, T(I18n::kFreeUserMemory),
                           FreeMemoryKB());
 
     // El heap de libc es cosa aparte de la memoria libre de la consola: lo
@@ -1523,11 +1453,11 @@ void DrawFatalError(vita2d_pgf* font, const char* title, const std::string& deta
     // cuando lo que faltaba era heap. Con estas cifras se ve de un vistazo.
     const struct mallinfo info = mallinfo();
     vita2d_pgf_draw_textf(font, 40, 464, kColorDim, 0.95f,
-                          "Heap: %u MB totales, %d KB en uso, %d KB libres dentro",
+                          T(I18n::kHeapInfo),
                           static_cast<unsigned int>(AZAHAR_HEAP_MB),
                           static_cast<int>(info.uordblks / 1024),
                           static_cast<int>(info.fordblks / 1024));
-    vita2d_pgf_draw_text(font, 40, 500, kColorDim, 0.95f, "CIRCULO: volver al menu");
+    vita2d_pgf_draw_text(font, 40, 500, kColorDim, 0.95f, T(I18n::kCircleBack));
     vita2d_end_drawing();
     vita2d_swap_buffers();
 
@@ -1536,7 +1466,7 @@ void DrawFatalError(vita2d_pgf* font, const char* title, const std::string& deta
 
 /// Carga y ejecuta un juego hasta que el usuario sale o falla.
 void RunGame(vita2d_pgf* font, const std::string& path) {
-    DrawMessage(font, "Cargando...", path.c_str());
+    DrawMessage(font, T(I18n::kLoading), path.c_str());
     LOG_INFO(Frontend, "Cargando {} (memoria libre: {} KB)", path, FreeMemoryKB());
 
     // Las rutas que use el emulador quedan anotadas: si algo peta recorriendo
@@ -1563,16 +1493,14 @@ void RunGame(vita2d_pgf* font, const std::string& path) {
         load_result = system.Load(*window, path);
     } catch (const std::bad_alloc&) {
         LOG_ERROR(Frontend, "Sin memoria al cargar {}", path);
-        DrawFatalError(font, "Sin memoria",
-                       "No hay memoria suficiente para cargar este juego. Prueba con uno mas "
-                       "pequeno, o recompila ajustando AZAHAR_HEAP_MB.");
+        DrawFatalError(font, T(I18n::kErrNoMemory), T(I18n::kErrNoMemoryDetail));
         if (system.IsPoweredOn()) {
             system.Shutdown();
         }
         return;
     } catch (const std::exception& e) {
         LOG_ERROR(Frontend, "Excepcion al cargar {}: {}", path, e.what());
-        DrawFatalError(font, "Error al cargar", e.what());
+        DrawFatalError(font, T(I18n::kErrLoad), e.what());
         if (system.IsPoweredOn()) {
             system.Shutdown();
         }
@@ -1674,25 +1602,22 @@ void RunGame(vita2d_pgf* font, const std::string& path) {
                     static_cast<unsigned int>((sceKernelGetProcessTimeWide() - start_us) / 1000000);
                 vita2d_start_drawing();
                 vita2d_clear_screen();
-                vita2d_pgf_draw_text(font, 40, 80, kColorAccent, 1.3f, "Emulando...");
-                vita2d_pgf_draw_text(font, 40, 130, kColorText, 0.95f,
-                                     "El juego aun no ha dibujado su primer fotograma.");
-                vita2d_pgf_draw_textf(font, 40, 170, kColorDim, 0.95f,
-                                      "Tiempo: %u s    Ciclos de emulacion: %u", seconds, loops);
-                vita2d_pgf_draw_textf(font, 40, 210, kColorDim, 0.95f,
-                                      "Memoria libre: %d KB", FreeMemoryKB());
+                vita2d_pgf_draw_text(font, 40, 80, kColorAccent, 1.3f, T(I18n::kEmulating));
+                vita2d_pgf_draw_text(font, 40, 130, kColorText, 0.95f, T(I18n::kNoFirstFrame));
+                vita2d_pgf_draw_textf(font, 40, 170, kColorDim, 0.95f, T(I18n::kTimeCycles),
+                                      seconds, loops);
+                vita2d_pgf_draw_textf(font, 40, 210, kColorDim, 0.95f, T(I18n::kFreeMemory),
+                                      FreeMemoryKB());
 
                 // Si algun hilo murio por una excepcion, se avisa aqui sin
                 // tapar el contador: interesa mas saber si la emulacion avanza.
                 if (!g_last_error.empty()) {
-                    vita2d_pgf_draw_text(font, 40, 280, 0xFF4040FF, 0.9f,
-                                         "Un hilo murio por una excepcion:");
+                    vita2d_pgf_draw_text(font, 40, 280, 0xFF4040FF, 0.9f, T(I18n::kThreadDied));
                     vita2d_pgf_draw_text(font, 40, 308, kColorDim, 0.85f,
                                          g_last_error.substr(0, 74).c_str());
                 }
 
-                vita2d_pgf_draw_text(font, 40, 500, kColorDim, 0.9f,
-                                     "START + SELECT: volver al menu");
+                vita2d_pgf_draw_text(font, 40, 500, kColorDim, 0.9f, T(I18n::kExitCombo));
                 vita2d_end_drawing();
                 vita2d_swap_buffers();
             }
@@ -1745,7 +1670,7 @@ void RunGame(vita2d_pgf* font, const std::string& path) {
                           system.GetStatusDetails());
                 WriteCrashLog("RunLoop error", system.GetStatusDetails().c_str());
                 system.GPU().StopThread();
-                DrawFatalError(font, "Error durante la emulacion", system.GetStatusDetails());
+                DrawFatalError(font, T(I18n::kErrEmulation), system.GetStatusDetails());
                 break;
             }
             if (result == Core::System::ResultStatus::ShutdownRequested) {
@@ -1758,19 +1683,17 @@ void RunGame(vita2d_pgf* font, const std::string& path) {
         WriteCrashLog("emulacion", "bad_alloc: sin memoria durante la emulacion");
         LOG_ERROR(Frontend, "Sin memoria durante la emulacion");
         system.GPU().StopThread();
-        DrawFatalError(font, "Sin memoria durante la emulacion",
-                       "El juego cargo pero se agoto la memoria al ejecutarlo.");
+        DrawFatalError(font, T(I18n::kErrEmulationMemory), T(I18n::kErrEmulationMemoryDetail));
     } catch (const std::exception& e) {
         std::string detail = std::string("[") + typeid(e).name() + "] " + e.what();
         WriteCrashLog("emulacion", detail.c_str());
         LOG_ERROR(Frontend, "Excepcion durante la emulacion: {}", e.what());
         system.GPU().StopThread();
-        DrawFatalError(font, "Error durante la emulacion", detail);
+        DrawFatalError(font, T(I18n::kErrEmulation), detail);
     } catch (...) {
         WriteCrashLog("emulacion", "excepcion de tipo no estandar");
         system.GPU().StopThread();
-        DrawFatalError(font, "Error durante la emulacion",
-                       "Excepcion de un tipo no estandar.");
+        DrawFatalError(font, T(I18n::kErrEmulation), T(I18n::kErrNonStandard));
     }
     watchdog_stop.store(true, std::memory_order_relaxed);
     watchdog.join();
@@ -1830,17 +1753,16 @@ void RunGame(vita2d_pgf* font, const std::string& path) {
         for (int frame = 0; frame < 60 * 8; frame++) {
             vita2d_start_drawing();
             vita2d_clear_screen();
-            vita2d_pgf_draw_text(g_font, 40, 80, 0xFF4040FF, 1.3f, "Excepcion no capturada");
+            vita2d_pgf_draw_text(g_font, 40, 80, 0xFF4040FF, 1.3f, T(I18n::kErrUncaught));
             int y = 130;
             for (std::size_t i = 0; i < detail.size() && y < 420; i += 70) {
                 vita2d_pgf_draw_text(g_font, 40, y, kColorText, 0.95f,
                                      detail.substr(i, 70).c_str());
                 y += 26;
             }
-            vita2d_pgf_draw_textf(g_font, 40, 460, kColorDim, 0.95f,
-                                  "Memoria de usuario libre: %d KB", FreeMemoryKB());
-            vita2d_pgf_draw_textf(g_font, 40, 500, kColorDim, 0.95f,
-                                  "Anotado en ux0:/data/azahar/crash.txt  -  cerrando en %d s",
+            vita2d_pgf_draw_textf(g_font, 40, 460, kColorDim, 0.95f, T(I18n::kFreeUserMemory),
+                                  FreeMemoryKB());
+            vita2d_pgf_draw_textf(g_font, 40, 500, kColorDim, 0.95f, T(I18n::kErrUncaughtFooter),
                                   8 - frame / 60);
             vita2d_end_drawing();
             vita2d_swap_buffers();
@@ -1853,14 +1775,14 @@ void RunGame(vita2d_pgf* font, const std::string& path) {
 
 /// Pinta en que paso del arranque estamos. Si la app muere, lo ultimo que se
 /// vea en pantalla dice exactamente donde.
-void DrawStep(vita2d_pgf* font, const char* step) {
+void DrawStep(vita2d_pgf* font, const char* step, I18n::Str shown) {
     WriteCrashLog("paso", step);
     vita2d_start_drawing();
     vita2d_clear_screen();
     vita2d_pgf_draw_text(font, 40, 60, kColorAccent, 1.3f, "Azahar  -  PS Vita");
     vita2d_pgf_draw_text(font, 40, 90, kColorDim, 0.85f, kVersion);
-    vita2d_pgf_draw_text(font, 40, 140, kColorText, 1.0f, "Iniciando...");
-    vita2d_pgf_draw_text(font, 40, 180, kColorDim, 1.0f, step);
+    vita2d_pgf_draw_text(font, 40, 140, kColorText, 1.0f, T(I18n::kStarting));
+    vita2d_pgf_draw_text(font, 40, 180, kColorDim, 1.0f, T(shown));
 
     // El presupuesto de memoria, a la vista desde el primer fotograma.
     //
@@ -1871,10 +1793,9 @@ void DrawStep(vita2d_pgf* font, const char* step) {
     // hace falta reproducir ningun fallo para leerlo.
     const bool extended = ExtendedMemoryGranted();
     vita2d_pgf_draw_textf(font, 40, 232, extended ? 0xFF80FF80 : 0xFF60C0FF, 0.85f,
-                          "mem usuario %d MB totales, %d MB libres  (modo ampliado %s)",
-                          TotalUserMemoryKB() / 1024, FreeMemoryKB() / 1024,
-                          extended ? "SI" : "no");
-    vita2d_pgf_draw_textf(font, 40, 256, kColorDim, 0.85f, "heap %u MB    CDRAM libre %d MB",
+                          T(I18n::kMemoryLine), TotalUserMemoryKB() / 1024,
+                          FreeMemoryKB() / 1024, extended ? T(I18n::kYes) : T(I18n::kNo));
+    vita2d_pgf_draw_textf(font, 40, 256, kColorDim, 0.85f, T(I18n::kHeapCdramLine),
                           static_cast<unsigned int>(AZAHAR_HEAP_MB), FreeCdramKB() / 1024);
 
     vita2d_end_drawing();
@@ -1884,11 +1805,11 @@ void DrawStep(vita2d_pgf* font, const char* step) {
 /// Cuerpo real del programa. main() lo envuelve para poder enseñar por pantalla
 /// cualquier excepcion en vez de morir con un abort() mudo.
 void Run(vita2d_pgf* font) {
-    DrawStep(font, "1/7 creando carpetas");
+    DrawStep(font, "1/7 creando carpetas", I18n::kStep1);
     CreateDirectories();
     FileUtil::SetUserPath(kUserDir);
 
-    DrawStep(font, "2/7 iniciando registro de eventos");
+    DrawStep(font, "2/7 iniciando registro de eventos", I18n::kStep2);
     Common::Log::Initialize();
     Common::Log::SetGlobalFilter(Common::Log::Filter(Common::Log::Level::Info));
     Common::Log::Start();
@@ -1897,18 +1818,18 @@ void Run(vita2d_pgf* font) {
     // resuelve abriendo el fichero, sin tener que cruzar fechas.
     LOG_INFO(Frontend, "Azahar para PS Vita iniciando ({})", kVersion);
 
-    DrawStep(font, "3/7 aplicando ajustes");
+    DrawStep(font, "3/7 aplicando ajustes", I18n::kStep3);
     ConfigureSettings();
     // Encima, lo que el usuario eligio en la ventana de ajustes la ultima vez.
     LoadUserSettings();
     ApplyUserSettings();
     NoteUserSettings();
 
-    DrawStep(font, "4/7 configurando mandos");
+    DrawStep(font, "4/7 configurando mandos", I18n::kStep4);
     VitaFrontend::Input::Init();
     VitaFrontend::Input::ApplyDefaultMapping();
 
-    DrawStep(font, "5/7 preparando el nucleo");
+    DrawStep(font, "5/7 preparando el nucleo", I18n::kStep5);
 
     // CryptoPP inicializa sus tablas de punteros a funcion de forma perezosa,
     // la primera vez que se construye un Integer. Ese camino tiene una carrera
@@ -1924,11 +1845,11 @@ void Run(vita2d_pgf* font) {
 
     auto& system = Core::System::GetInstance();
 
-    DrawStep(font, "6/7 registrando applets");
+    DrawStep(font, "6/7 registrando applets", I18n::kStep6);
     Frontend::RegisterDefaultApplets(system);
     system.RegisterImageInterface(std::make_shared<Frontend::ImageInterface>());
 
-    DrawStep(font, "7/7 buscando juegos");
+    DrawStep(font, "7/7 buscando juegos", I18n::kStep7);
     std::vector<RomEntry> roms = ScanRoms();
     int selected = 0;
     int scroll = 0;
@@ -2142,9 +2063,9 @@ int main(int argc, char** argv) {
     try {
         Run(font);
     } catch (const std::exception& e) {
-        DrawFatalError(font, "Error fatal al iniciar", e.what());
+        DrawFatalError(font, T(I18n::kErrFatalStart), e.what());
     } catch (...) {
-        DrawFatalError(font, "Error fatal al iniciar", "Excepcion de tipo desconocido.");
+        DrawFatalError(font, T(I18n::kErrFatalStart), T(I18n::kErrUnknownException));
     }
 
     vita2d_free_pgf(font);

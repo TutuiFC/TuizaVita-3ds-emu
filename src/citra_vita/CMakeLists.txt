@@ -2,10 +2,13 @@
 
 add_executable(azahar
     main.cpp
+    vita_i18n.cpp
+    vita_i18n.h
     vita_input.cpp
     vita_input.h
     vita_jit_probe.cpp
     vita_jit_probe.h
+    vita_strings.inc
     vita_version.h
     vita_window.cpp
     vita_window.h
