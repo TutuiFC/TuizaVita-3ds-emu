@@ -34,7 +34,7 @@ set(CMAKE_C_STANDARD 11)
 # ---------------------------------------------------------------------------
 # Identidad de la app Vita
 # ---------------------------------------------------------------------------
-set(VITA_APP_NAME "Azahar")
+set(VITA_APP_NAME "Tuiza Vita")
 set(VITA_TITLEID  "AZHR00001")
 set(VITA_VERSION  "03.01")
 

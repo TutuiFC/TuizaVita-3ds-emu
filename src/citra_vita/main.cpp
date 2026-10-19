@@ -857,7 +857,7 @@ void DrawMenu(vita2d_pgf* font, const std::vector<RomEntry>& roms, int selected,
     vita2d_start_drawing();
     vita2d_clear_screen();
 
-    vita2d_pgf_draw_text(font, 40, 50, kColorAccent, 1.4f, "Azahar  -  PS Vita");
+    vita2d_pgf_draw_text(font, 40, 50, kColorAccent, 1.4f, "Tuiza Vita");
     vita2d_pgf_draw_text(font, 40, 524, kColorDim, 0.85f, kVersion);
     vita2d_pgf_draw_text(font, 40, 80, kColorDim, 0.9f,
                          "Nintendo 3DS emulator  |  ARM JIT + GXM rendering");
@@ -1779,7 +1779,7 @@ void DrawStep(vita2d_pgf* font, const char* step, I18n::Str shown) {
     WriteCrashLog("paso", step);
     vita2d_start_drawing();
     vita2d_clear_screen();
-    vita2d_pgf_draw_text(font, 40, 60, kColorAccent, 1.3f, "Azahar  -  PS Vita");
+    vita2d_pgf_draw_text(font, 40, 60, kColorAccent, 1.3f, "Tuiza Vita");
     vita2d_pgf_draw_text(font, 40, 90, kColorDim, 0.85f, kVersion);
     vita2d_pgf_draw_text(font, 40, 140, kColorText, 1.0f, T(I18n::kStarting));
     vita2d_pgf_draw_text(font, 40, 180, kColorDim, 1.0f, T(shown));
@@ -1816,7 +1816,7 @@ void Run(vita2d_pgf* font) {
     // La version va en la PRIMERA linea del log a proposito: con varios ciclos
     // de compilar, instalar y mirar, la duda "¿pero que build es esta?" se
     // resuelve abriendo el fichero, sin tener que cruzar fechas.
-    LOG_INFO(Frontend, "Azahar para PS Vita iniciando ({})", kVersion);
+    LOG_INFO(Frontend, "Tuiza Vita iniciando ({})", kVersion);
 
     DrawStep(font, "3/7 aplicando ajustes", I18n::kStep3);
     ConfigureSettings();
