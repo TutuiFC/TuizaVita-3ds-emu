@@ -3289,6 +3289,35 @@ private:
             }
             return;
         }
+        /**
+         * BARRERAS Y TLS DE ESCRITURA EN LINEA (0.3.4.5). El SDK del 3DS pone
+         * "mcr p15, 0, rX, c7, c10, 5" (DMB) alrededor de cada LDREX/STREX de
+         * sus cerrojos, y cada una pagaba el trampolin entero (~45
+         * instrucciones: banco VFP, FPSCR dos veces, la llamada). En modo
+         * usuario WriteCP15Register solo guarda el valor en su hueco de CP15[]
+         * para estas cuatro: barrera de sincronizacion de datos, de memoria,
+         * vaciado del prefetch y el registro de hilo de lectura/escritura. Un
+         * STR, igual. En la variante de comprobacion sigue abandonando.
+         */
+        if (!read && !check_mode && Bits(inst, 21, 23) == 0) {
+            const u32 crn = Bits(inst, 16, 19);
+            const u32 crm = Bits(inst, 0, 3);
+            s32 index = -1;
+            if (crn == 7 && crm == 5 && opc2 == 4) {
+                index = CP15_FLUSH_PREFETCH_BUFFER;
+            } else if (crn == 7 && crm == 10 && opc2 == 4) {
+                index = CP15_DATA_SYNC_BARRIER;
+            } else if (crn == 7 && crm == 10 && opc2 == 5) {
+                index = CP15_DATA_MEMORY_BARRIER;
+            } else if (crn == 13 && crm == 0 && opc2 == 2) {
+                index = CP15_THREAD_UPRW;
+            }
+            if (index >= 0) {
+                LoadGuest(kRm, Bits(inst, 12, 15), pc);
+                e.StrImm(kRm, kCpu, g_offsets.cp15 + static_cast<u32>(index) * 4);
+                return;
+            }
+        }
         e.Mrs(kFlags);
         e.MovReg(kT0, kFlags);
         if (read) {

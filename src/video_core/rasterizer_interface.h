@@ -76,6 +76,12 @@ public:
         return false;
     }
 
+    /// True si el lote que va a sombrear la CPU se va a tirar entero (salto de
+    /// fotograma, shader compilandose...): asi no se sombrean sus vertices.
+    virtual bool WillDiscardBatch() {
+        return false;
+    }
+
     virtual void LoadDefaultDiskResources(
         [[maybe_unused]] const std::atomic_bool& stop_loading,
         [[maybe_unused]] const DiskResourceLoadCallback& callback) {}

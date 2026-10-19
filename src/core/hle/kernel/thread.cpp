@@ -510,6 +510,19 @@ void ThreadManager::Reschedule() {
     Thread* cur = GetCurrentThread();
     Thread* next = PopNextReadyThread();
 
+    /**
+     * EL MISMO HILO SIGUE (0.3.4.5): sin cambio de contexto. RunLoop pide un
+     * Reschedule varias veces por vuelta, y casi siempre el hilo que corre es
+     * el mejor. SwitchContext guardaba y cargaba los registros (que no
+     * cambian), desprogramaba su despertador (un hilo en marcha no tiene),
+     * lo sacaba y metia en la cola y bloqueaba varios weak_ptr: todo para
+     * dejarlo igual. Solo se apunta cuando ha corrido, como hace al guardar.
+     */
+    if (cur && next == cur && cur->status == ThreadStatus::Running) {
+        cur->last_running_ticks = cpu->GetTimer().GetTicks();
+        return;
+    }
+
     if (cur && next) {
         LOG_TRACE(Kernel, "context switch {} -> {}", cur->GetObjectId(), next->GetObjectId());
     } else if (cur) {

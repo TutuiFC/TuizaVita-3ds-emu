@@ -5363,6 +5363,36 @@ bool RasterizerGXM::AblatedByMode() const {
            (ablation == Ablation::kNoTexture && uses_texture);
 }
 
+/**
+ * LOS VERTICES DE UN LOTE QUE SE VA A TIRAR NO SE SOMBREAN (0.3.4.5).
+ *
+ * AddTriangle decide en el primer triangulo si el lote se salta (fotograma
+ * saltado, o su shader de fragmentos compilandose), pero para entonces la CPU
+ * ya ha sombreado todos sus vertices: 10-25 us cada uno, tirados. En Kirby's
+ * Extra Epic Yarn, con la cache de shaders vacia, eran cientos de ms por
+ * fotograma. Esto es la MISMA decision, tomada antes de LoadVertices.
+ */
+bool RasterizerGXM::WillDiscardBatch() {
+    if (!SwRenderer::FrameSkip::ShouldRender()) {
+        return true;
+    }
+    if (batch_decided || !available || !EnsureInitialized()) {
+        return false;
+    }
+    if (pica.regs.internal.rasterizer.depthmap_enable ==
+            RasterizerRegs::DepthBuffering::WBuffering &&
+        wbuffer_on_gpu.load(std::memory_order_relaxed) == 0) {
+        return false;
+    }
+    const char* reason = nullptr;
+    if (pipelines->Get(pica.regs.internal, &reason) == nullptr && reason != nullptr &&
+        std::strcmp(reason, "fs compilando") == 0) {
+        skipped_batches.fetch_add(1, std::memory_order_relaxed);
+        return true;
+    }
+    return false;
+}
+
 void RasterizerGXM::AddTriangle(const Pica::OutputVertex& v0, const Pica::OutputVertex& v1,
                                 const Pica::OutputVertex& v2) {
     if (!SwRenderer::FrameSkip::ShouldRender() || batch_skip) {

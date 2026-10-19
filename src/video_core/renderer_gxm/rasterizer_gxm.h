@@ -107,6 +107,7 @@ public:
      * implementacion.
      */
     bool AccelerateDrawBatch(bool is_indexed) override;
+    bool WillDiscardBatch() override;
 
     /**
      * COPIA DE PANTALLA EN LA GPU (0.1.8.7). Cada fotograma el juego dibuja en

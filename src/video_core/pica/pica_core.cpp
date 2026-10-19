@@ -1163,6 +1163,14 @@ void PicaCore::DrawArrays(bool is_indexed) {
         return;
     }
 
+    // Un lote que el rasterizador va a tirar no se sombrea (0.3.4.5, ver
+    // RasterizerGXM::WillDiscardBatch). Solo sin shader de geometria y con el
+    // ensamblador vacio: si no, sus vertices pasarian al lote siguiente.
+    if (regs.internal.pipeline.use_gs != PipelineRegs::UseGS::Yes &&
+        primitive_assembler.IsEmpty() && rasterizer->WillDiscardBatch()) {
+        return;
+    }
+
     // We cannot accelerate the draw, so load and execute the vertex shader for each vertex.
     LoadVertices(is_indexed);
 
