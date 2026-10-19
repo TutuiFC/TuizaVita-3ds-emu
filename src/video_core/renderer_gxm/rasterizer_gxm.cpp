@@ -1191,6 +1191,13 @@ struct RasterizerGXM::PipelineCache {
     /// Pasado esto desde que se pidio, "fs atascado": sus lotes ya no se
     /// saltan, van todos por la CPU (ver LongCompileCpuAllowed).
     static constexpr unsigned long long kAsyncFsSkipLimitUs = 30000000;
+    /**
+     * En la cola detras de un shader grande (0.3.4.3, ver CgWorkerOnHeavyJob):
+     * el compilador avanza, solo que ese tarda minutos. Hasta este tope el lote
+     * se sigue saltando en vez de irse entero por software; pasado, se da el
+     * compilador por colgado como siempre.
+     */
+    static constexpr unsigned long long kAsyncFsBehindHeavyUs = 240000000;
 
     struct Entry {
         /**
@@ -1480,6 +1487,10 @@ struct RasterizerGXM::PipelineCache {
                 const unsigned long long now = Common::VitaMicros();
                 const unsigned long long started =
                     pending.job->started_us.load(std::memory_order_relaxed);
+                if (started == 0 && CgWorkerOnHeavyJob() &&
+                    now - pending.job->submitted_us < kAsyncFsBehindHeavyUs) {
+                    return fail("fs compilando");
+                }
                 if ((started != 0 && now - started > kAsyncFsStuckUs) ||
                     (started == 0 && now - pending.job->submitted_us > kAsyncFsQueuedUs)) {
                     CgMarkStarved();
@@ -1946,6 +1957,9 @@ struct RasterizerGXM::HwShaderCache {
     static constexpr unsigned long long kAsyncVsWindowUs = 1000000;
     /// Como kAsyncFsSkipLimitUs, para los de vertices: "vs atascado".
     static constexpr unsigned long long kAsyncVsSkipLimitUs = 20000000;
+    /// Uno grande compilandose, o esperando detras de uno grande (0.3.4.3): ver
+    /// kAsyncFsBehindHeavyUs. Hasta aqui "compilando largo", no "atascado".
+    static constexpr unsigned long long kAsyncVsHeavyLimitUs = 240000000;
 
     /// Tope de programas traducidos. Un juego usa decenas; pasado esto se deja
     /// de traducir y los nuevos se quedan en la CPU, que es correcto.
@@ -1989,9 +2003,17 @@ struct RasterizerGXM::HwShaderCache {
                     const unsigned long long age =
                         Common::VitaMicros() - found.job->submitted_us;
                     const bool young = age < kAsyncVsWindowUs;
-                    *out_reason = young                          ? "vs compilando"
-                                  : age > kAsyncVsSkipLimitUs ? "vs atascado"
-                                                              : "vs compilando largo";
+                    // Grande y en marcha, o en la cola mientras compila uno
+                    // grande: avanza, solo que despacio (0.3.4.3).
+                    const bool slow_but_moving =
+                        (found.job->heavy ||
+                         found.job->started_us.load(std::memory_order_relaxed) == 0) &&
+                        CgWorkerOnHeavyJob();
+                    const unsigned long long limit =
+                        slow_but_moving ? kAsyncVsHeavyLimitUs : kAsyncVsSkipLimitUs;
+                    *out_reason = young           ? "vs compilando"
+                                  : age > limit   ? "vs atascado"
+                                                  : "vs compilando largo";
                     if (!young) {
                         CgMarkStarved();
                     }

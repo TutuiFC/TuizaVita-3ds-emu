@@ -149,4 +149,12 @@ struct CgActivity {
 };
 CgActivity GetCgActivity();
 
+/**
+ * El hilo de compilacion esta con un trabajo grande (CgJob::heavy), de los que
+ * tardan minutos (0.3.4.3). Mientras tanto, lo que espera en la cola no esta
+ * "atascado": espera su turno detras de un compilador que avanza. Ver los
+ * motivos "fs atascado" y "vs atascado" en rasterizer_gxm.cpp.
+ */
+bool CgWorkerOnHeavyJob();
+
 } // namespace Gxm

@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <condition_variable>
 #include <cstdlib>
 #include <cstring>
@@ -1747,6 +1748,16 @@ std::atomic<bool> g_worker_boosted{false};
 std::atomic<bool> g_worker_heavy{false};
 /// Atado al nucleo 2 (0.2.3.8): no se sube nunca.
 bool g_worker_pinned = false;
+/// Cuando se encolo el ultimo trabajo que no es grande (0.3.4.3, ver CgWorkerMain).
+unsigned long long g_last_light_submit_us = 0;
+/**
+ * Calma antes de empezar uno grande (0.3.4.3). Un grande que ya ha empezado no
+ * se puede parar: en Kirby's Extra Epic Yarn uno de 21 KB tardo 104 s, y los de
+ * fragmentos que llegaron justo despues (1-2 s cada uno) esperaron esos 104 s
+ * con sus lotes por software a 0,5 FPS. Al entrar en una zona nueva los
+ * pequenos llegan a rafagas: se deja pasar la rafaga entera antes.
+ */
+constexpr unsigned long long kHeavyCalmUs = 3000000;
 /// Justo por encima de los ayudantes y del hilo de la GPU (159).
 constexpr int kCgBoostedPriority = Common::kVitaPriorityHelper - 1;
 
@@ -1776,20 +1787,30 @@ void* CgWorkerMain(void*) {
         std::shared_ptr<CgJob> job;
         {
             std::unique_lock lock{g_jobs_mutex};
-            g_jobs_ready.wait(lock, [] { return !g_jobs.empty(); });
             /**
              * LOS GRANDES, LOS ULTIMOS (0.2.2.3). Uno de 16-23 KB pasa minutos
              * aqui y el hilo es uno solo: por orden de llegada, todo lo que
              * viniera detras esperaba esos minutos, los de fragmentos tambien
              * (sin ellos el lote no se dibuja). Primero cualquiera que no sea
-             * grande; los grandes, cuando no queda otra cosa.
+             * grande; los grandes, cuando no queda otra cosa Y lleva
+             * kHeavyCalmUs sin llegar ninguno pequeno (0.3.4.3).
              */
-            auto pick = std::find_if(g_jobs.begin(), g_jobs.end(),
-                                     [](const std::shared_ptr<CgJob>& queued) {
-                                         return !queued->heavy;
-                                     });
-            if (pick == g_jobs.end()) {
-                pick = g_jobs.begin();
+            std::deque<std::shared_ptr<CgJob>>::iterator pick;
+            while (true) {
+                g_jobs_ready.wait(lock, [] { return !g_jobs.empty(); });
+                pick = std::find_if(g_jobs.begin(), g_jobs.end(),
+                                    [](const std::shared_ptr<CgJob>& queued) {
+                                        return !queued->heavy;
+                                    });
+                if (pick != g_jobs.end()) {
+                    break;
+                }
+                const unsigned long long since = Common::VitaMicros() - g_last_light_submit_us;
+                if (since >= kHeavyCalmUs) {
+                    pick = g_jobs.begin();
+                    break;
+                }
+                g_jobs_ready.wait_for(lock, std::chrono::microseconds(kHeavyCalmUs - since));
             }
             job = std::move(*pick);
             g_jobs.erase(pick);
@@ -1900,6 +1921,9 @@ void CgSubmit(std::shared_ptr<CgJob> job, bool urgent) {
         Common::VitaNote("gxm compila", "hilo de compilacion en segundo plano listo");
     }
     job->submitted_us = Common::VitaMicros();
+    if (!job->heavy) {
+        g_last_light_submit_us = job->submitted_us;
+    }
     if (urgent) {
         g_jobs.push_front(std::move(job));
     } else {
@@ -1907,6 +1931,11 @@ void CgSubmit(std::shared_ptr<CgJob> job, bool urgent) {
     }
     g_jobs_queued.store(static_cast<u32>(g_jobs.size()), std::memory_order_relaxed);
     g_jobs_ready.notify_one();
+}
+
+bool CgWorkerOnHeavyJob() {
+    return g_worker_heavy.load(std::memory_order_relaxed) &&
+           g_worker_busy_since.load(std::memory_order_relaxed) != 0;
 }
 
 CgActivity GetCgActivity() {
