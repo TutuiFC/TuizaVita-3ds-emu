@@ -2521,37 +2521,14 @@ void IndexRangeU8(const u8* in, u32 count, u32& min_index, u32& max_index) {
     max_index = hi;
 }
 
-/**
- * COPIA A MEMORIA SIN CACHE CON NEON (0.3.4.7). El anillo de vertices es LPDDR
- * sin cache (ver ReserveVertexSpace), y copiar ~10 KB por lote con el memcpy de
- * newlib costaba 25-38 us (crash.txt de Zafiro y Sol, "datos por partes:
- * copiar"): la escritura sin cache no aprovecha la combinacion de escrituras
- * cuando el bucle mete cargas y saltos entre medias. Aqui se precarga el origen
- * (que si tiene cache) con PLD y se escribe en rafagas de 64 bytes seguidos,
- * que es justo lo que el buffer de combinacion de escrituras necesita para
- * fundir cada rafaga en una sola transaccion de memoria. El origen esta
- * alineado a 4 (vertices) o a 2 (indices); el destino, a 16 (el anillo).
+/*
+ * EXPERIMENTO FALLIDO, NO REPETIR (0.3.4.7 -> 0.3.4.8). Se probo una copia con
+ * NEON (vld1q/vst1q en rafagas de 64 bytes, con PLD) para el anillo de
+ * vertices, que es memoria SIN CACHE (USER_RW_UNCACHE, ver gxm_memory.cpp). En
+ * Zafiro y Sol la fase "datos por partes: copiar" paso de 25-38 us por lote
+ * con el memcpy de newlib a 54-77 us, y el juego espero 15 ms por fotograma a
+ * la GPU en vez de 11. Se vuelve al memcpy.
  */
-void NeonCopyToUncached(u8* dst, const u8* src, u32 bytes) {
-    u32 i = 0;
-    for (; i + 64 <= bytes; i += 64) {
-        __builtin_prefetch(src + i + 192);
-        const uint8x16_t a = vld1q_u8(src + i);
-        const uint8x16_t b = vld1q_u8(src + i + 16);
-        const uint8x16_t c = vld1q_u8(src + i + 32);
-        const uint8x16_t d = vld1q_u8(src + i + 48);
-        vst1q_u8(dst + i, a);
-        vst1q_u8(dst + i + 16, b);
-        vst1q_u8(dst + i + 32, c);
-        vst1q_u8(dst + i + 48, d);
-    }
-    for (; i + 16 <= bytes; i += 16) {
-        vst1q_u8(dst + i, vld1q_u8(src + i));
-    }
-    if (i < bytes) {
-        std::memcpy(dst + i, src + i, bytes - i);
-    }
-}
 
 /// out[i] = in[i] - base, en 16 bits (como static_cast<u16>).
 void RebaseIndicesU16(const u16* in, u32 count, u16 base, u16* out) {
@@ -2596,13 +2573,25 @@ constexpr std::array<u64, 12> MemoMask(u32 first, u32 end) {
  * PUERTOS DE DATOS (0.3.4.4, memo por valor). Escribir en ellos sube codigo o
  * tablas aunque el valor del registro no cambie (dos palabras seguidas iguales
  * del shader, por ejemplo): para el memo cuentan como cambiados siempre.
- * Tablas del procedural (0x0AF-0x0B7), codigo y swizzle del shader de
- * geometria (0x29B-0x2AD) y del de vertices (0x2CB-0x2DD). Los de las tablas de
- * luz y niebla ya estan entre los ignorados.
+ * Tablas del procedural (0x0AF-0x0B7) y codigo y swizzle del shader de
+ * geometria (0x29B-0x2AD). Los de las tablas de luz y niebla ya estan entre los
+ * ignorados.
  */
 constexpr bool IsMemoPortReg(u32 reg) {
-    return (reg >= 0x0AF && reg <= 0x0B7) || (reg >= 0x29B && reg <= 0x2AD) ||
-           (reg >= 0x2CB && reg <= 0x2DD);
+    return (reg >= 0x0AF && reg <= 0x0B7) || (reg >= 0x29B && reg <= 0x2AD);
+}
+
+/**
+ * CODIGO Y SWIZZLE DEL SHADER DE VERTICES (0.3.4.8): 0x2CB-0x2DD. Antes
+ * contaban como cambiados en cada escritura, y un juego que vuelve a subir su
+ * shader en cada modelo (aunque sea el mismo) rehacia todo el programa de
+ * vertices por nada: en Zafiro Alfa, 5.583 de 14.295 lotes (0.3.4.6). Ahora
+ * no cuentan, y el cambio se detecta por el hash del codigo y del swizzle de
+ * pica.vs_setup, que ShaderSetup ya mantiene POR VALOR (solo se ensucia si una
+ * palabra es distinta) y devuelve al instante si no ha cambiado nada.
+ */
+constexpr bool IsVsCodePortReg(u32 reg) {
+    return reg >= 0x2CB && reg <= 0x2DD;
 }
 
 /// Deciden el programa de fragmentos (y parte del de vertices: salidas y luz).
@@ -2673,6 +2662,9 @@ bool AnyDirty(const Pica::DirtyRegs& dirty, const std::array<u64, 12>& mask) {
 struct RasterizerGXM::BatchMemo {
     /// Valor de cada registro la ultima vez que el memo lo miro (memo_by_value).
     std::array<u32, 0x300> shadow{};
+    /// Hash del codigo y del swizzle del shader de vertices que vio el memo.
+    u64 vs_code_hash = 0;
+    u64 vs_swizzle_hash = 0;
     struct Location {
         bool found = false;
         u8 loader = 0;
@@ -6863,7 +6855,11 @@ bool RasterizerGXM::AccelerateDrawBatch(bool is_indexed) {
                 const u32 bit = static_cast<u32>(__builtin_ctzll(bits));
                 bits &= bits - 1;
                 const u32 reg = i * 64 + bit;
-                if (IsMemoPortReg(reg) || values[reg] != memo.shadow[reg]) {
+                if (by_value && IsVsCodePortReg(reg)) {
+                    // Ver IsVsCodePortReg: lo mira el hash, mas abajo.
+                    memo.shadow[reg] = values[reg];
+                    changed[i] &= ~(1ull << bit);
+                } else if (IsMemoPortReg(reg) || values[reg] != memo.shadow[reg]) {
                     memo.shadow[reg] = values[reg];
                 } else if (by_value) {
                     changed[i] &= ~(1ull << bit);
@@ -6886,7 +6882,24 @@ bool RasterizerGXM::AccelerateDrawBatch(bool is_indexed) {
             memo.pipeline_fail = nullptr;
             memo_fs_rebuilds.fetch_add(1, std::memory_order_relaxed);
         }
+        // La causa de rehacer el programa de vertices, la primera que se halle.
+        u32 vs_cause = vs_dirty ? 1u : 0u; // 1 registros
+        if (by_value) {
+            const u64 code_hash = pica.vs_setup.GetProgramCodeHash();
+            const u64 swizzle_hash = pica.vs_setup.GetSwizzleDataHash();
+            if (code_hash != memo.vs_code_hash || swizzle_hash != memo.vs_swizzle_hash) {
+                memo.vs_code_hash = code_hash;
+                memo.vs_swizzle_hash = swizzle_hash;
+                if (!vs_dirty) {
+                    vs_cause = 2; // codigo o swizzle
+                }
+                vs_dirty = true;
+            }
+        }
         if (memo.layout.specialized && bools_dirty) {
+            if (!vs_dirty) {
+                vs_cause = 4; // booleanos
+            }
             vs_dirty = true;
         }
         /**
@@ -6897,11 +6910,28 @@ bool RasterizerGXM::AccelerateDrawBatch(bool is_indexed) {
          * kVsFromFsMask, y lit y proj del pipeline, que se miran al tenerlo.
          */
         if (vs_from_fs_dirty) {
+            if (!vs_dirty) {
+                vs_cause = 3; // salidas / luz (registros de fragmentos)
+            }
             vs_dirty = true;
         }
         if (vs_dirty) {
             memo.vs_valid = false;
             memo_vs_rebuilds.fetch_add(1, std::memory_order_relaxed);
+            switch (vs_cause) {
+            case 2:
+                memo_vs_by_code.fetch_add(1, std::memory_order_relaxed);
+                break;
+            case 3:
+                memo_vs_by_fs.fetch_add(1, std::memory_order_relaxed);
+                break;
+            case 4:
+                memo_vs_by_bools.fetch_add(1, std::memory_order_relaxed);
+                break;
+            default:
+                memo_vs_by_regs.fetch_add(1, std::memory_order_relaxed);
+                break;
+            }
         }
         memo_batches.fetch_add(1, std::memory_order_relaxed);
         memo.lights_dirty = memo.lights_dirty || AnyDirty(pica.dirty_regs, kLightsMask);
@@ -6946,6 +6976,7 @@ bool RasterizerGXM::AccelerateDrawBatch(bool is_indexed) {
     if (memo.vs_valid && (memo.layout.lit != pipeline->lit || memo.layout.proj != pipeline->proj ||
                           memo.layout.wbuffer != w_buffer)) {
         memo.vs_valid = false;
+        memo_vs_by_pipeline.fetch_add(1, std::memory_order_relaxed);
     }
     phase(0);
 
@@ -7439,7 +7470,7 @@ bool RasterizerGXM::AccelerateDrawBatch(bool is_indexed) {
         u8* ring = space;
         u32 staged = 0;
         const auto flush_staging = [&] {
-            NeonCopyToUncached(ring, reinterpret_cast<const u8*>(staging), staged * sizeof(float));
+            std::memcpy(ring, staging, staged * sizeof(float));
             ring += staged * sizeof(float);
             staged = 0;
         };
@@ -7487,7 +7518,7 @@ bool RasterizerGXM::AccelerateDrawBatch(bool is_indexed) {
         stream_count = 1;
     } else {
         for (u32 stream = 0; stream < stream_count; stream++) {
-            NeonCopyToUncached(space, stream_source[stream], stream_bytes[stream]);
+            std::memcpy(space, stream_source[stream], stream_bytes[stream]);
             stream_data[stream] = space;
             space += (stream_bytes[stream] + 15u) & ~15u;
         }
@@ -7602,6 +7633,11 @@ std::atomic<u32> RasterizerGXM::memo_batches{0};
 std::atomic<u32> RasterizerGXM::memo_fs_rebuilds{0};
 std::atomic<u32> RasterizerGXM::memo_vs_rebuilds{0};
 std::atomic<u32> RasterizerGXM::memo_same_writes{0};
+std::atomic<u32> RasterizerGXM::memo_vs_by_regs{0};
+std::atomic<u32> RasterizerGXM::memo_vs_by_code{0};
+std::atomic<u32> RasterizerGXM::memo_vs_by_fs{0};
+std::atomic<u32> RasterizerGXM::memo_vs_by_bools{0};
+std::atomic<u32> RasterizerGXM::memo_vs_by_pipeline{0};
 unsigned long long RasterizerGXM::state_scene_us = 0;
 unsigned long long RasterizerGXM::state_texture_us = 0;
 
@@ -7690,7 +7726,8 @@ std::string RasterizerGXM::TakeBatchProfile() {
         "(escena {:.1f} texturas {:.1f}, de ellas copias gpu {:.1f}) uniforms {:.1f} ({} "
         "muestras) | texturas a revisar por: vaciado {} invalidar {} ambos {} relleno {} "
         "copia {} | vs nuevos {} (del indice {}, {} ms, traducir {} ms, el peor {} ms) | memo: "
-        "lotes {} fs rehecho {} vs rehecho {} escrituras iguales {} | copias por partes: "
+        "lotes {} fs rehecho {} vs rehecho {} (por registros {} codigo {} salidas {} booleanos {} "
+        "pipeline {}) escrituras iguales {} | copias por partes: "
         "{} llamadas, rellenos {:.1f} us, superficies {:.1f} us ({:.1f} de media), copias "
         "{:.1f} us ({:.1f} de media) | datos por partes: reservar {:.1f} us, copiar {:.1f} us, "
         "indices {:.1f} us, {:.0f} bytes por lote",
@@ -7710,6 +7747,11 @@ std::string RasterizerGXM::TakeBatchProfile() {
         memo_batches.exchange(0, std::memory_order_relaxed),
         memo_fs_rebuilds.exchange(0, std::memory_order_relaxed),
         memo_vs_rebuilds.exchange(0, std::memory_order_relaxed),
+        memo_vs_by_regs.exchange(0, std::memory_order_relaxed),
+        memo_vs_by_code.exchange(0, std::memory_order_relaxed),
+        memo_vs_by_fs.exchange(0, std::memory_order_relaxed),
+        memo_vs_by_bools.exchange(0, std::memory_order_relaxed),
+        memo_vs_by_pipeline.exchange(0, std::memory_order_relaxed),
         memo_same_writes.exchange(0, std::memory_order_relaxed), g_copy_calls,
         g_copy_calls == 0 ? 0.0 : static_cast<double>(g_copy_fills_us) / g_copy_calls,
         g_copy_calls == 0 ? 0.0 : static_cast<double>(g_copy_surfaces_us) / g_copy_calls,

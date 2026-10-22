@@ -174,6 +174,15 @@ public:
     static std::atomic<u32> memo_fs_rebuilds;
     static std::atomic<u32> memo_vs_rebuilds;
     static std::atomic<u32> memo_same_writes;
+    /// Por que se rehizo el programa de vertices (0.3.4.8), una causa por lote
+    /// (la primera que se encontro): registros, codigo o swizzle del shader,
+    /// registros de salida (van en los de fragmentos), booleanos, y lit/proj/
+    /// W-buffer del pipeline. Con memo_by_value apagado no se cuentan.
+    static std::atomic<u32> memo_vs_by_regs;
+    static std::atomic<u32> memo_vs_by_code;
+    static std::atomic<u32> memo_vs_by_fs;
+    static std::atomic<u32> memo_vs_by_bools;
+    static std::atomic<u32> memo_vs_by_pipeline;
     /// Dentro de "estado" (0.2.1.0): abrir la escena y las texturas, que es
     /// donde puede esperar a la GPU o volver a mirar una textura entera.
     static unsigned long long state_scene_us;
