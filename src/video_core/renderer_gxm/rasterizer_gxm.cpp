@@ -2521,6 +2521,38 @@ void IndexRangeU8(const u8* in, u32 count, u32& min_index, u32& max_index) {
     max_index = hi;
 }
 
+/**
+ * COPIA A MEMORIA SIN CACHE CON NEON (0.3.4.7). El anillo de vertices es LPDDR
+ * sin cache (ver ReserveVertexSpace), y copiar ~10 KB por lote con el memcpy de
+ * newlib costaba 25-38 us (crash.txt de Zafiro y Sol, "datos por partes:
+ * copiar"): la escritura sin cache no aprovecha la combinacion de escrituras
+ * cuando el bucle mete cargas y saltos entre medias. Aqui se precarga el origen
+ * (que si tiene cache) con PLD y se escribe en rafagas de 64 bytes seguidos,
+ * que es justo lo que el buffer de combinacion de escrituras necesita para
+ * fundir cada rafaga en una sola transaccion de memoria. El origen esta
+ * alineado a 4 (vertices) o a 2 (indices); el destino, a 16 (el anillo).
+ */
+void NeonCopyToUncached(u8* dst, const u8* src, u32 bytes) {
+    u32 i = 0;
+    for (; i + 64 <= bytes; i += 64) {
+        __builtin_prefetch(src + i + 192);
+        const uint8x16_t a = vld1q_u8(src + i);
+        const uint8x16_t b = vld1q_u8(src + i + 16);
+        const uint8x16_t c = vld1q_u8(src + i + 32);
+        const uint8x16_t d = vld1q_u8(src + i + 48);
+        vst1q_u8(dst + i, a);
+        vst1q_u8(dst + i + 16, b);
+        vst1q_u8(dst + i + 32, c);
+        vst1q_u8(dst + i + 48, d);
+    }
+    for (; i + 16 <= bytes; i += 16) {
+        vst1q_u8(dst + i, vld1q_u8(src + i));
+    }
+    if (i < bytes) {
+        std::memcpy(dst + i, src + i, bytes - i);
+    }
+}
+
 /// out[i] = in[i] - base, en 16 bits (como static_cast<u16>).
 void RebaseIndicesU16(const u16* in, u32 count, u16 base, u16* out) {
     const uint16x8_t sub = vdupq_n_u16(base);
@@ -7407,7 +7439,7 @@ bool RasterizerGXM::AccelerateDrawBatch(bool is_indexed) {
         u8* ring = space;
         u32 staged = 0;
         const auto flush_staging = [&] {
-            std::memcpy(ring, staging, staged * sizeof(float));
+            NeonCopyToUncached(ring, reinterpret_cast<const u8*>(staging), staged * sizeof(float));
             ring += staged * sizeof(float);
             staged = 0;
         };
@@ -7455,7 +7487,7 @@ bool RasterizerGXM::AccelerateDrawBatch(bool is_indexed) {
         stream_count = 1;
     } else {
         for (u32 stream = 0; stream < stream_count; stream++) {
-            std::memcpy(space, stream_source[stream], stream_bytes[stream]);
+            NeonCopyToUncached(space, stream_source[stream], stream_bytes[stream]);
             stream_data[stream] = space;
             space += (stream_bytes[stream] + 15u) & ~15u;
         }
