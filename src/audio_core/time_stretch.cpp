@@ -77,17 +77,22 @@ std::size_t TimeStretcher::Process(const s16* in, std::size_t num_in, s16* out,
               backlog_fullness);
 
     if constexpr (std::is_floating_point<soundtouch::SAMPLETYPE>()) {
-        // The SoundTouch library on most systems expects float samples
-        // use this vector to store input if soundtouch::SAMPLETYPE is a float
-        std::vector<soundtouch::SAMPLETYPE> float_in(2 * num_in);
-        std::vector<soundtouch::SAMPLETYPE> float_out(2 * num_out);
+        // The SoundTouch library on most systems expects float samples.
+        // Buffers reused across calls (0.3.4.6): no allocation per audio block.
+        static_assert(std::is_same_v<soundtouch::SAMPLETYPE, float>);
+        if (float_in.size() < 2 * num_in) {
+            float_in.resize(2 * num_in);
+        }
+        if (float_out.size() < 2 * num_out) {
+            float_out.resize(2 * num_out);
+        }
 
+        constexpr float kToFloat = 1.0f / std::numeric_limits<s16>::max();
         for (std::size_t i = 0; i < (2 * num_in); i++) {
             // Conventional integer PCM uses a range of -32768 to 32767,
             // but float samples use -1 to 1
             // As a result we need to scale sample values during conversion
-            const float temp = static_cast<float>(in[i]) / std::numeric_limits<s16>::max();
-            float_in[i] = static_cast<soundtouch::SAMPLETYPE>(temp);
+            float_in[i] = static_cast<float>(in[i]) * kToFloat;
         }
 
         sound_touch->putSamples(float_in.data(), static_cast<u32>(num_in));
@@ -100,12 +105,16 @@ std::size_t TimeStretcher::Process(const s16* in, std::size_t num_in, s16* out,
         // convertir a s16 un valor fuera de rango no satura: da la vuelta, y
         // +1.01 sale como un pico negativo enorme. Era el sonido "saturado" en
         // la Vita, donde el juego va muy lento y el estirado es extremo.
-        for (std::size_t i = 0; i < (2 * num_out); i++) {
+        // Lo que SoundTouch no ha llenado sale a cero, como cuando el buffer
+        // era nuevo en cada llamada.
+        const std::size_t filled = std::min(2 * samples_received, 2 * num_out);
+        for (std::size_t i = 0; i < filled; i++) {
             const float scaled = std::clamp(
                 static_cast<float>(float_out[i]) * std::numeric_limits<s16>::max(), -32768.0f,
                 32767.0f);
             out[i] = static_cast<s16>(scaled);
         }
+        std::fill(out + filled, out + 2 * num_out, s16{0});
 
         return samples_received;
     } else if (std::is_same<soundtouch::SAMPLETYPE, s16>()) {

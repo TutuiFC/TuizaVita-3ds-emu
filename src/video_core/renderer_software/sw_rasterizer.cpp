@@ -14,6 +14,7 @@
 #include "common/vector_math.h"
 #include "core/memory.h"
 #include "video_core/pica/output_vertex.h"
+#include "video_core/gpu.h"
 #include "video_core/pica/pica_core.h"
 #include "video_core/renderer_software/sw_framebuffer.h"
 #include "video_core/renderer_software/sw_lighting.h"
@@ -259,8 +260,17 @@ RasterizerSoftware::RasterizerSoftware(Memory::MemorySystem& memory_, Pica::Pica
        * pool la construye DENTRO del hilo y se la pasa como estado en cada
        * tarea. Ver el comentario de sw_workers en la cabecera.
        */
+      /**
+       * CON LA GPU EN OTRO NUCLEO, EMPEZANDO POR EL 2 (0.3.4.6). Quien llama
+       * ahora es el hilo de la GPU, atado al nucleo 1 (gpu.cpp): con el
+       * desplazamiento de siempre el primer ayudante caia en SU nucleo, con
+       * prioridad mas alta, y la banda 0 y la suya iban una detras de otra.
+       * Con 2 los ayudantes van a los nucleos 2 y 0 (el indice se toma modulo
+       * 3, ver VitaPinThreadToUserCore).
+       */
       sw_workers{num_sw_threads - 1, "SwRenderer workers",
-                 [](std::size_t) { return Pica::Texture::Etc1BlockCache{}; }, true, 1},
+                 [](std::size_t) { return Pica::Texture::Etc1BlockCache{}; }, true,
+                 VideoCore::GPU::async_enabled.load(std::memory_order_relaxed) ? 2u : 1u},
       fb{memory, regs.framebuffer} {
     // Divisor de la ocupacion del overlay: ver RasterizerStats::band_busy_us.
     RasterizerStats::raster_bands.store(static_cast<u32>(num_sw_threads),

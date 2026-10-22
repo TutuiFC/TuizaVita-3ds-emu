@@ -7,6 +7,7 @@
 #include <array>
 #include <cstddef>
 #include <memory>
+#include <vector>
 #include "common/common_types.h"
 
 namespace soundtouch {
@@ -36,6 +37,10 @@ public:
 private:
     std::unique_ptr<soundtouch::SoundTouch> sound_touch;
     double stretch_ratio = 1.0;
+    /// Conversion a y desde float, reutilizada entre bloques (0.3.4.6): antes
+    /// eran dos std::vector nuevos en cada bloque de salida de audio.
+    std::vector<float> float_in;
+    std::vector<float> float_out;
 };
 
 } // namespace AudioCore

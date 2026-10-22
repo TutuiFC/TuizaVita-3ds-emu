@@ -217,6 +217,9 @@ public:
      * ajustes.txt; a 0, como antes (cualquier escritura invalida).
      */
     static std::atomic<u32> memo_by_value;
+    /// Saltar el estado de GXM que no cambia entre lotes (0.3.4.6, ver
+    /// DrawStateShadow). Clave "estado_sombra=" de ajustes.txt.
+    static std::atomic<u32> state_shadow_enabled;
     /**
      * Resolucion de dibujado en la GPU EN MITADES (ajuste "Resolucion GPU"):
      * 1 = 0.5x (0.2.0.4), 2 = 1x, 4 = 2x (0.2.0.3). Las superficies tienen
@@ -691,6 +694,41 @@ private:
     /// que lo deciden (0.2.1.0). Ver BatchMemo en el .cpp.
     struct BatchMemo;
     std::unique_ptr<BatchMemo> batch_memo;
+
+    /**
+     * LO ULTIMO QUE SE LE DIJO A GXM EN ESTA ESCENA (0.3.4.6). SetupDrawState
+     * ponia en cada lote viewport, recorte, profundidad, plantilla, culling,
+     * programas y texturas aunque fueran los mismos del lote anterior: llamadas
+     * que cuestan, y estado que GXM vuelve a mandar a la GPU. Con esto se
+     * saltan las iguales. Se olvida al abrir escena (vita2d y el presentador
+     * comparten el contexto entre escenas) y en todo lo que pone estado por su
+     * cuenta: el borrado, los blits y EndScene. Interruptor: estado_sombra.
+     */
+    struct DrawStateShadow {
+        bool valid = false;
+        float viewport[6]{};
+        SceGxmRegionClipMode clip_mode{};
+        u32 clip[4]{};
+        SceGxmDepthFunc depth_func{};
+        SceGxmDepthWriteMode depth_write{};
+        bool stencil_on = false;
+        SceGxmStencilFunc stencil_func{};
+        SceGxmStencilOp stencil_ops[3]{};
+        u8 stencil_compare = 0;
+        u8 stencil_write = 0;
+        u32 stencil_ref = 0;
+        SceGxmCullMode cull{};
+        const SceGxmVertexProgram* vertex_program = nullptr;
+        const SceGxmFragmentProgram* fragment_program = nullptr;
+        /// Bit por unidad de textura de fragmentos con descriptor conocido.
+        u32 textures_known = 0;
+        std::array<SceGxmTexture, 16> textures{};
+    };
+    DrawStateShadow state_shadow;
+    void ForgetDrawState() {
+        state_shadow.valid = false;
+        state_shadow.textures_known = 0;
+    }
     std::unique_ptr<TextureCache> textures;
     std::vector<std::unique_ptr<Surface>> surfaces;
     Surface* open_surface = nullptr;
@@ -725,6 +763,18 @@ private:
     bool batch_on_gpu = false;
     /// El lote en curso se salta: su shader de fragmentos se compila (0.1.9.8).
     bool batch_skip = false;
+    /**
+     * EL PIPELINE DEL LOTE, PEDIDO UNA VEZ (0.3.4.6). Un lote por la CPU lo
+     * pedia tres veces al cache (WillDiscardBatch, el primer AddTriangle y
+     * DrawBatchOnGpu), y cada vez es construir FSConfig y su hash. Los
+     * registros no cambian dentro del lote. 'pending_*' lo deja
+     * WillDiscardBatch para el primer AddTriangle; 'decided_pipeline' lo deja
+     * AddTriangle para DrawBatchOnGpu. Los dos se borran al acabar el lote.
+     */
+    bool pending_pipeline_valid = false;
+    const void* pending_pipeline = nullptr;
+    const char* pending_pipeline_reason = nullptr;
+    const void* decided_pipeline = nullptr;
     /**
      * Motivos de rechazo ya anotados, uno por hueco y una sola vez cada uno. En
      * orden: 0 libre (era el scissor, que ya no rechaza), 1 wbuffer, 2 shader,

@@ -90,6 +90,11 @@ target_include_directories(zstd INTERFACE "${EXT}/zstd/lib")
 # ---------------------------------------------------------------------------
 add_library(xxhash STATIC "${EXT}/xxHash/xxhash.c")
 target_include_directories(xxhash PUBLIC "${EXT}/xxHash")
+# -O3 (0.3.4.6): XXH3 es el hash de TODO lo caliente (revalidar texturas, la
+# clave del pipeline en cada lote, los shaders), y a -Os, como el resto del
+# proyecto, su bucle NEON no se mete en linea. En Inazuma Eleven GO revalidar
+# 1 MB de textura por fotograma costaba 6,3 ms (unos 160 MB/s).
+target_compile_options(xxhash PRIVATE -O3)
 add_library(xxHash::xxhash ALIAS xxhash)
 
 # ---------------------------------------------------------------------------
@@ -153,7 +158,11 @@ set(SOUNDSTRETCH    OFF CACHE BOOL "" FORCE)
 set(SOUNDTOUCH_DLL  OFF CACHE BOOL "" FORCE)
 add_subdirectory(soundtouch EXCLUDE_FROM_ALL)
 # Vita (0.1.8.5): el estirado del audio corre en cada bloque de salida.
-target_compile_options(SoundTouch PRIVATE -O3)
+# -funsafe-math-optimizations (0.3.4.6): sin el, GCC no vectoriza NADA de coma
+# flotante con NEON en ARMv7 (NEON no respeta los denormales de IEEE), y los
+# filtros FIR y la correlacion de SoundTouch, que son bucles de floats, se
+# quedaban en VFP escalar. El audio no necesita resultados exactos al bit.
+target_compile_options(SoundTouch PRIVATE -O3 -funsafe-math-optimizations)
 
 # ---------------------------------------------------------------------------
 # faad2 (decodificador AAC para el DSP)

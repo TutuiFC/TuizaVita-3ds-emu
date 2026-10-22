@@ -1206,12 +1206,16 @@ static_assert(sizeof(FastSlot) == 8 && offsetof(FastSlot, pc) == 0 && offsetof(F
               "el enlace indirecto lee g_fast como pares de palabras (pc, block)");
 
 /**
- * Hueco de g_fast de una clave, el MISMO calculo que el enlace indirecto del
- * codigo generado (0.2.1.9): clave >> 1. Las ARM (alineadas a 4) caen en los
- * huecos pares y las Thumb en todos; por eso la tabla paso de 4096 a 8192.
+ * Hueco de g_fast y de g_link_table de una clave, el MISMO calculo que el
+ * enlace indirecto del codigo generado: clave >> 2 desde 0.3.4.6. Con
+ * clave >> 1 (0.2.1.9) las claves ARM, alineadas a 4, solo caian en los huecos
+ * PARES: la mitad de cada tabla vacia y el doble de choques para el codigo
+ * ARM, que es casi todo. Ahora usan los 8192. Una Thumb comparte hueco con la
+ * de la media palabra de al lado (pc y pc + 2), que casi nunca son las dos
+ * entradas de bloque.
  */
 inline u32 FastIndex(u32 key) {
-    return (key >> 1) & (kFastSlots - 1);
+    return (key >> 2) & (kFastSlots - 1);
 }
 /// Desplazamiento de Block::link dentro de Block (0 en la practica; se mide en
 /// Init porque Block no tiene disposicion estandar).
@@ -1245,7 +1249,9 @@ static_assert(sizeof(LinkSlot) == 16 && offsetof(LinkSlot, key) == 0 &&
 alignas(64) std::array<LinkSlot, kFastSlots> g_link_table{};
 
 LinkSlot EmptyLinkSlot(u32 index) {
-    return LinkSlot{((index + 1) & (kFastSlots - 1)) << 1, 0, 0, 0};
+    // Una clave que cae en OTRO hueco (index + 1): no coincide con ninguna que
+    // se busque en este (ver FastIndex).
+    return LinkSlot{((index + 1) & (kFastSlots - 1)) << 2, 0, 0, 0};
 }
 
 void ResetLinkTable() {
@@ -4035,7 +4041,7 @@ private:
      * a cero) y kRd = TFlag si 'in_regs'; si no, de Reg[15] y TFlag, como en
      * EmitIndirectLink, con la misma prueba del bit 0. Lo caliente:
      *
-     *   MRS kT0; ORR kRs, kRs, kRd (clave); UBFX kRd, kRs, #1, #13;
+     *   MRS kT0; ORR kRs, kRs, kRd (clave); UBFX kRd, kRs, #2, #13;
      *   MOVW/MOVT kT1, tabla; ADD kT1, kT1, kRd, LSL #4;
      *   LDR kRd, [kT1] (clave del hueco); CMP kRd, kRs; BNE fallo;
      *   LDRD kRn, kRm (presupuesto y enlaces); LDR kRd, [kT1, #4] (entrada);
@@ -4060,7 +4066,7 @@ private:
         }
         std::vector<u32> lookup_fails;
         e.Emit(0xE1800000u | (kRs << 16) | (kRs << 12) | kRd); // ORR kRs, kRs, kRd
-        e.Ubfx(kRd, kRs, 1, kFastSlotBits);
+        e.Ubfx(kRd, kRs, 2, kFastSlotBits); // como FastIndex
         e.Mov32(kT1, static_cast<u32>(reinterpret_cast<uintptr_t>(g_link_table.data())));
         e.Emit(0xE0800000u | (kT1 << 16) | (kT1 << 12) | (4u << 7) | kRd); // ADD kT1, kT1, kRd, LSL #4
         e.LdrImm(kRd, kT1, 0);
@@ -4235,8 +4241,8 @@ private:
          * coincide con ninguna y el enlace falla igual que con la prueba.
          */
         e.Emit(0xE1800000u | (kRs << 16) | (kRs << 12) | kRd); // ORR kRs, kRs, kRd
-        // kT1 = &g_fast[(clave >> 1) & (kFastSlots - 1)]
-        e.Ubfx(kRd, kRs, 1, kFastSlotBits);
+        // kT1 = &g_fast[(clave >> 2) & (kFastSlots - 1)], como FastIndex
+        e.Ubfx(kRd, kRs, 2, kFastSlotBits);
         e.Mov32(kT1, static_cast<u32>(reinterpret_cast<uintptr_t>(g_fast.data())));
         e.Emit(0xE0800000u | (kT1 << 16) | (kT1 << 12) | (3u << 7) | kRd); // ADD kT1, kT1, kRd, LSL #3
         e.LdrImm(kRd, kT1, 0);                                            // slot.pc

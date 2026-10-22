@@ -29,6 +29,12 @@ void AddressArbiter::WaitThread(std::shared_ptr<Thread> thread, VAddr wait_addre
 }
 
 u64 AddressArbiter::ResumeAllThreads(VAddr address) {
+    // Nadie esperando en esta direccion (lo normal en una senal): sin
+    // stable_partition, que reserva un buffer temporal en cada llamada.
+    if (std::none_of(waiting_threads.begin(), waiting_threads.end(),
+                     [address](const auto& thread) { return thread->wait_address == address; })) {
+        return 0;
+    }
     // Determine which threads are waiting on this address, those should be woken up.
     auto itr = std::stable_partition(waiting_threads.begin(), waiting_threads.end(),
                                      [address](const auto& thread) {
@@ -47,6 +53,11 @@ u64 AddressArbiter::ResumeAllThreads(VAddr address) {
 }
 
 bool AddressArbiter::ResumeHighestPriorityThread(VAddr address) {
+    // Ver ResumeAllThreads: sin nadie esperando no hace falta reordenar.
+    if (std::none_of(waiting_threads.begin(), waiting_threads.end(),
+                     [address](const auto& thread) { return thread->wait_address == address; })) {
+        return false;
+    }
     // Determine which threads are waiting on this address, those should be considered for wakeup.
     auto matches_start = std::stable_partition(
         waiting_threads.begin(), waiting_threads.end(), [address](const auto& thread) {

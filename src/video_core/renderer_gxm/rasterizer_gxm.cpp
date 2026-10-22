@@ -69,6 +69,7 @@ std::atomic<u32> RasterizerGXM::present_writeback_every{4};
 std::atomic<u32> RasterizerGXM::texture_copy_gpu{0};
 std::atomic<u32> RasterizerGXM::wbuffer_on_gpu{1};
 std::atomic<u32> RasterizerGXM::memo_by_value{1};
+std::atomic<u32> RasterizerGXM::state_shadow_enabled{1};
 std::atomic<u32> RasterizerGXM::resolution_scale{2};
 std::atomic<u32> RasterizerGXM::gpu_transfers{0};
 std::atomic<u32> RasterizerGXM::transfer_materialized{0};
@@ -78,6 +79,28 @@ namespace {
 /// pasaron de ~11 us en 0.2.2.1 a ~46 en 0.2.2.8, y hay que saber si es eso o
 /// el cache.
 unsigned long long g_state_copy_us = 0;
+/**
+ * TextureFromCopy por partes (0.3.4.6): rellenos pendientes, el recorrido de
+ * superficies (con sus volcados) y el de copias de pantalla, y cuantas de cada
+ * mira. En Pokemon X la funcion entera eran 35 us por lote sin que se viera en
+ * que.
+ */
+unsigned long long g_copy_fills_us = 0;
+unsigned long long g_copy_surfaces_us = 0;
+unsigned long long g_copy_copies_us = 0;
+unsigned long long g_copy_surfaces_seen = 0;
+unsigned long long g_copy_copies_seen = 0;
+unsigned long long g_copy_calls = 0;
+/**
+ * La fase "datos" por partes (0.3.4.6): reservar el anillo (con sus esperas a
+ * la GPU), copiar los flujos de vertices, rebasar los indices, y los bytes
+ * copiados. Son 46-53 us por lote en Zafiro, Smash y Pokemon X.
+ */
+unsigned long long g_data_reserve_us = 0;
+unsigned long long g_data_copy_us = 0;
+unsigned long long g_data_index_us = 0;
+unsigned long long g_data_bytes = 0;
+unsigned long long g_data_samples = 0;
 /**
  * Programas de vertices nuevos (HwShaderCache::Build, 0.3.1.4): cuantos, lo que
  * cuestan en el hilo de la GPU y cuanto de eso es traducir. En crash.txt de
@@ -2908,6 +2931,7 @@ void RasterizerGXM::NoteSkip(u32 index, const char* reason) {
 }
 
 void RasterizerGXM::EndScene() {
+    ForgetDrawState();
     if (open_surface == nullptr) {
         // Vertices repartidos sin llegar a dibujarse: no los lee nadie, pero
         // cualquier valla ya enviada sirve para soltarlos.
@@ -3056,6 +3080,19 @@ void RasterizerGXM::WaitFence(u32 fence, GpuWait why) {
      * valor sea IGUAL, y si la GPU ya ha pasado de esa escena no volveria.
      * Con un tope de 2 s, por si la GPU no la escribiera nunca.
      */
+    /**
+     * UN MOMENTO MIRANDO ANTES DE DORMIR (0.3.4.6). sceKernelDelayThread(50)
+     * duerme bastante mas de 50 us (lo que tarde el planificador en volver),
+     * y muchas vallas llegan a los pocos microsegundos. Unas miles de lecturas
+     * de la valla (memoria sin cache, ~100 ns cada una) cubren los primeros
+     * ~150 us sin llamar al sistema; "yield" no duerme, solo avisa al nucleo.
+     */
+    for (u32 spin = 0; spin < 1500; spin++) {
+        if (FenceDone(fence)) {
+            return;
+        }
+        __asm__ volatile("yield" ::: "memory");
+    }
     const unsigned long long begin = Common::VitaMicros();
     const Common::ScopedVitaStage stage{"gxm espera a una valla"};
     while (!FenceDone(fence)) {
@@ -3487,8 +3524,23 @@ const SceGxmTexture* RasterizerGXM::TextureFromCopy(u32 unit) {
     }
     const PAddr address = config->GetPhysicalAddress();
     const u32 span = TextureBytes(format, config->width, config->height);
+    const bool timed = profile_state;
+    unsigned long long mark = timed ? Common::VitaMicros() : 0;
+    const auto lap = [&](unsigned long long& slot) {
+        if (timed) {
+            const unsigned long long now = Common::VitaMicros();
+            slot += now - mark;
+            mark = now;
+        }
+    };
+    if (timed) {
+        g_copy_calls++;
+        g_copy_surfaces_seen += surfaces.size();
+        g_copy_copies_seen += screen_copies.size();
+    }
     // El cache decodifica de la memoria del invitado.
     ApplyLazyFills(address, span);
+    lap(g_copy_fills_us);
     /**
      * El origen de una copia de mosaico a mosaico no se vuelca al presentar
      * (copied), y la transferencia por software lo volcaba en cada fotograma:
@@ -3510,6 +3562,14 @@ const SceGxmTexture* RasterizerGXM::TextureFromCopy(u32 unit) {
                 std::memory_order_relaxed);
         }
     }
+    lap(g_copy_surfaces_us);
+    // Al salir, por donde sea, lo que quede es del recorrido de copias.
+    struct CopiesLap {
+        decltype(lap)& done;
+        ~CopiesLap() {
+            done(g_copy_copies_us);
+        }
+    } const copies_lap{lap};
     for (auto& copy : screen_copies) {
         if (!copy->valid || !copy->tiled || address >= copy->dst + copy->dst_size ||
             copy->dst >= address + span) {
@@ -3907,6 +3967,7 @@ RasterizerGXM::ScreenCopy* RasterizerGXM::GetScreenCopy(PAddr dst, u32 width, u3
 
 bool RasterizerGXM::BlitToCopy(ScreenCopy& copy, Surface& source, u32 first_row, bool flip,
                                u32 in_width, u32 in_height) {
+    ForgetDrawState();
     if (source.clear_pending) {
         FlushClear(source);
     }
@@ -4632,6 +4693,8 @@ bool RasterizerGXM::AccelerateFillOnGpu(const Pica::MemoryFillConfig& config) {
  * espera a la primera escena de cada fotograma).
  */
 void RasterizerGXM::DrawClearQuad(Surface& surface) {
+    // Pone su propio estado (programas, profundidad, recorte...).
+    ForgetDrawState();
     surface.clear_pending = false;
     const u32 count = surface.clear_count;
     surface.clear_count = 0;
@@ -5385,11 +5448,16 @@ bool RasterizerGXM::WillDiscardBatch() {
         return false;
     }
     const char* reason = nullptr;
-    if (pipelines->Get(pica.regs.internal, &reason) == nullptr && reason != nullptr &&
-        std::strcmp(reason, "fs compilando") == 0) {
+    const PipelineCache::Entry* entry = pipelines->Get(pica.regs.internal, &reason);
+    if (entry == nullptr && reason != nullptr && std::strcmp(reason, "fs compilando") == 0) {
         skipped_batches.fetch_add(1, std::memory_order_relaxed);
+        pending_pipeline_valid = false;
         return true;
     }
+    // Para el primer AddTriangle de este mismo lote (ver pending_pipeline).
+    pending_pipeline_valid = true;
+    pending_pipeline = entry;
+    pending_pipeline_reason = reason;
     return false;
 }
 
@@ -5447,8 +5515,18 @@ void RasterizerGXM::AddTriangle(const Pica::OutputVertex& v0, const Pica::Output
                                         RasterizerRegs::DepthBuffering::WBuffering &&
                                     wbuffer_on_gpu.load(std::memory_order_relaxed) == 0;
             const char* reason = nullptr;
-            batch_on_gpu =
-                !wbuffering && pipelines->Get(pica.regs.internal, &reason) != nullptr;
+            const PipelineCache::Entry* entry = nullptr;
+            if (!wbuffering) {
+                if (pending_pipeline_valid) {
+                    entry = static_cast<const PipelineCache::Entry*>(pending_pipeline);
+                    reason = pending_pipeline_reason;
+                } else {
+                    entry = pipelines->Get(pica.regs.internal, &reason);
+                }
+            }
+            pending_pipeline_valid = false;
+            batch_on_gpu = entry != nullptr;
+            decided_pipeline = entry;
             /**
              * Su shader de fragmentos se esta compilando en segundo plano
              * (0.1.9.8): el lote no se dibuja, ni por software. Es un momento,
@@ -5569,7 +5647,10 @@ bool RasterizerGXM::DrawBatchOnGpu() {
      * reservar y cuanto se escribe por vertice. Si no hay pipeline, ademas, se
      * ahorra el empaquetado entero.
      */
-    const PipelineCache::Entry* pipeline = pipelines->Get(pica.regs.internal);
+    // El que decidio AddTriangle para este lote (ver decided_pipeline).
+    const PipelineCache::Entry* pipeline =
+        decided_pipeline != nullptr ? static_cast<const PipelineCache::Entry*>(decided_pipeline)
+                                    : pipelines->Get(pica.regs.internal);
     if (pipeline == nullptr) {
         return false;
     }
@@ -5668,14 +5749,17 @@ bool RasterizerGXM::DrawBatchOnGpu() {
         float* out = vertices;
         for (u32 i = 0; i < vertex_count; i++) {
             const Pica::OutputVertex& v = batch[i];
+            // Con W-buffer, de los valores en registros: 'out' es memoria SIN
+            // CACHE, y releer de ella (como hacia 0.3.4.2) cuesta como una
+            // lectura de la RAM entera cada vez.
+            const float pos_z = v.pos.z.ToFloat32();
+            const float pos_w = v.pos.w.ToFloat32();
             out[0] = v.pos.x.ToFloat32();
             out[1] = v.pos.y.ToFloat32();
-            out[2] = v.pos.z.ToFloat32();
-            out[3] = v.pos.w.ToFloat32();
-            if (w_buffer) {
-                const float depth = std::clamp(out[2] * w_scale + out[3] * w_offset, 0.0f, 1.0f);
-                out[2] = depth * out[3];
-            }
+            out[2] = w_buffer
+                         ? std::clamp(pos_z * w_scale + pos_w * w_offset, 0.0f, 1.0f) * pos_w
+                         : pos_z;
+            out[3] = pos_w;
             out[4] = v.color.x.ToFloat32();
             out[5] = v.color.y.ToFloat32();
             out[6] = v.color.z.ToFloat32();
@@ -5797,10 +5881,16 @@ bool RasterizerGXM::SetupDrawState(Surface* surface, const Entry* pipeline,
         }
         surface->scene_open = true;
         open_surface = surface;
+        ForgetDrawState();
         if (surface->clear_pending) {
             DrawClearQuad(*surface);
         }
     }
+    if (state_shadow_enabled.load(std::memory_order_relaxed) == 0) {
+        ForgetDrawState();
+    }
+    DrawStateShadow& shadow = state_shadow;
+    const bool known = shadow.valid;
     if (timed) {
         const unsigned long long now = Common::VitaMicros();
         state_scene_us += now - mark;
@@ -5881,10 +5971,19 @@ bool RasterizerGXM::SetupDrawState(Surface* surface, const Entry* pipeline,
      */
     const float guest_height = static_cast<float>(surface->height);
     const float scale = static_cast<float>(surface->scale) * 0.5f;
-    sceGxmSetViewport(context, (halfsize_x + corner_x) * scale, halfsize_x * scale,
-                      (guest_height - halfsize_y - corner_y) * scale, -halfsize_y * scale,
-                      depth_offset, depth_scale);
-    sceGxmSetFrontPolygonMode(context, SCE_GXM_POLYGON_MODE_TRIANGLE_FILL);
+    const float viewport[6] = {(halfsize_x + corner_x) * scale, halfsize_x * scale,
+                               (guest_height - halfsize_y - corner_y) * scale,
+                               -halfsize_y * scale,  depth_offset,
+                               depth_scale};
+    if (!known || std::memcmp(viewport, shadow.viewport, sizeof(viewport)) != 0) {
+        sceGxmSetViewport(context, viewport[0], viewport[1], viewport[2], viewport[3],
+                          viewport[4], viewport[5]);
+        std::memcpy(shadow.viewport, viewport, sizeof(viewport));
+    }
+    if (!known) {
+        // Siempre relleno: solo hace falta tras olvidar el estado.
+        sceGxmSetFrontPolygonMode(context, SCE_GXM_POLYGON_MODE_TRIANGLE_FILL);
+    }
 
     /**
      * El recorte de region, SIEMPRE y explicito.
@@ -5907,7 +6006,16 @@ bool RasterizerGXM::SetupDrawState(Surface* surface, const Entry* pipeline,
         clip.x_max = std::max(Phys(clip.x_max + 1, s), clip.x_min + 1) - 1;
         clip.y_max = std::max(Phys(clip.y_max + 1, s), clip.y_min + 1) - 1;
     }
-    sceGxmSetRegionClip(context, clip.mode, clip.x_min, clip.y_min, clip.x_max, clip.y_max);
+    if (!known || clip.mode != shadow.clip_mode || clip.x_min != shadow.clip[0] ||
+        clip.y_min != shadow.clip[1] || clip.x_max != shadow.clip[2] ||
+        clip.y_max != shadow.clip[3]) {
+        sceGxmSetRegionClip(context, clip.mode, clip.x_min, clip.y_min, clip.x_max, clip.y_max);
+        shadow.clip_mode = clip.mode;
+        shadow.clip[0] = clip.x_min;
+        shadow.clip[1] = clip.y_min;
+        shadow.clip[2] = clip.x_max;
+        shadow.clip[3] = clip.y_max;
+    }
 
     const auto& merger = pica.regs.internal.framebuffer.output_merger;
     const SceGxmDepthFunc depth_func = MapDepthFunc(merger.depth_test_func.Value());
@@ -5915,15 +6023,18 @@ bool RasterizerGXM::SetupDrawState(Surface* surface, const Entry* pipeline,
                              pica.regs.internal.framebuffer.framebuffer.allow_depth_stencil_write != 0;
     const SceGxmDepthWriteMode write_mode =
         depth_write ? SCE_GXM_DEPTH_WRITE_ENABLED : SCE_GXM_DEPTH_WRITE_DISABLED;
-    if (!merger.depth_test_enable) {
-        sceGxmSetFrontDepthFunc(context, SCE_GXM_DEPTH_FUNC_ALWAYS);
-        sceGxmSetBackDepthFunc(context, SCE_GXM_DEPTH_FUNC_ALWAYS);
-    } else {
-        sceGxmSetFrontDepthFunc(context, depth_func);
-        sceGxmSetBackDepthFunc(context, depth_func);
+    const SceGxmDepthFunc applied_depth_func =
+        merger.depth_test_enable ? depth_func : SCE_GXM_DEPTH_FUNC_ALWAYS;
+    if (!known || applied_depth_func != shadow.depth_func) {
+        sceGxmSetFrontDepthFunc(context, applied_depth_func);
+        sceGxmSetBackDepthFunc(context, applied_depth_func);
+        shadow.depth_func = applied_depth_func;
     }
-    sceGxmSetFrontDepthWriteEnable(context, write_mode);
-    sceGxmSetBackDepthWriteEnable(context, write_mode);
+    if (!known || write_mode != shadow.depth_write) {
+        sceGxmSetFrontDepthWriteEnable(context, write_mode);
+        sceGxmSetBackDepthWriteEnable(context, write_mode);
+        shadow.depth_write = write_mode;
+    }
 
     /**
      * La prueba de plantilla.
@@ -5965,13 +6076,28 @@ bool RasterizerGXM::SetupDrawState(Surface* surface, const Entry* pipeline,
                 ? static_cast<u8>(stencil_test.write_mask)
                 : 0;
         const u32 reference = stencil_test.reference_value;
-        sceGxmSetFrontStencilRef(context, reference);
-        sceGxmSetBackStencilRef(context, reference);
-        sceGxmSetFrontStencilFunc(context, stencil_func, on_stencil_fail, on_depth_fail,
-                                  on_depth_pass, compare_mask, stencil_write_mask);
-        sceGxmSetBackStencilFunc(context, stencil_func, on_stencil_fail, on_depth_fail,
-                                 on_depth_pass, compare_mask, stencil_write_mask);
-    } else {
+        if (!known || !shadow.stencil_on || reference != shadow.stencil_ref) {
+            sceGxmSetFrontStencilRef(context, reference);
+            sceGxmSetBackStencilRef(context, reference);
+            shadow.stencil_ref = reference;
+        }
+        if (!known || !shadow.stencil_on || stencil_func != shadow.stencil_func ||
+            on_stencil_fail != shadow.stencil_ops[0] || on_depth_fail != shadow.stencil_ops[1] ||
+            on_depth_pass != shadow.stencil_ops[2] || compare_mask != shadow.stencil_compare ||
+            stencil_write_mask != shadow.stencil_write) {
+            sceGxmSetFrontStencilFunc(context, stencil_func, on_stencil_fail, on_depth_fail,
+                                      on_depth_pass, compare_mask, stencil_write_mask);
+            sceGxmSetBackStencilFunc(context, stencil_func, on_stencil_fail, on_depth_fail,
+                                     on_depth_pass, compare_mask, stencil_write_mask);
+            shadow.stencil_func = stencil_func;
+            shadow.stencil_ops[0] = on_stencil_fail;
+            shadow.stencil_ops[1] = on_depth_fail;
+            shadow.stencil_ops[2] = on_depth_pass;
+            shadow.stencil_compare = compare_mask;
+            shadow.stencil_write = stencil_write_mask;
+        }
+        shadow.stencil_on = true;
+    } else if (!known || shadow.stencil_on) {
         // Apagada de verdad: pasa siempre y no toca el buffer. Hay que
         // escribirlo, no basta con no escribir nada, porque el estado del lote
         // anterior sigue puesto en el contexto.
@@ -5979,6 +6105,7 @@ bool RasterizerGXM::SetupDrawState(Surface* surface, const Entry* pipeline,
                                   SCE_GXM_STENCIL_OP_KEEP, SCE_GXM_STENCIL_OP_KEEP, 0xFF, 0x00);
         sceGxmSetBackStencilFunc(context, SCE_GXM_STENCIL_FUNC_ALWAYS, SCE_GXM_STENCIL_OP_KEEP,
                                  SCE_GXM_STENCIL_OP_KEEP, SCE_GXM_STENCIL_OP_KEEP, 0xFF, 0x00);
+        shadow.stencil_on = false;
     }
 
     /**
@@ -5991,21 +6118,34 @@ bool RasterizerGXM::SetupDrawState(Surface* surface, const Entry* pipeline,
      * intercambiados. En 0.1.0.20 se cambiaron los dos por un diagnostico
      * equivocado (ver el viewport, arriba) y los dos vuelven a su sitio.
      */
+    SceGxmCullMode cull = SCE_GXM_CULL_NONE;
     switch (rasterizer.cull_mode.Value()) {
     case RasterizerRegs::CullMode::KeepAll:
     case RasterizerRegs::CullMode::KeepAll2:
-        sceGxmSetCullMode(context, SCE_GXM_CULL_NONE);
+        cull = SCE_GXM_CULL_NONE;
         break;
     case RasterizerRegs::CullMode::KeepClockWise:
-        sceGxmSetCullMode(context, SCE_GXM_CULL_CCW);
+        cull = SCE_GXM_CULL_CCW;
         break;
     case RasterizerRegs::CullMode::KeepCounterClockWise:
-        sceGxmSetCullMode(context, SCE_GXM_CULL_CW);
+        cull = SCE_GXM_CULL_CW;
         break;
     }
+    if (!known || cull != shadow.cull) {
+        sceGxmSetCullMode(context, cull);
+        shadow.cull = cull;
+    }
 
-    sceGxmSetVertexProgram(context, vertex_program);
-    sceGxmSetFragmentProgram(context, fragment_program);
+    if (!known || vertex_program != shadow.vertex_program) {
+        sceGxmSetVertexProgram(context, vertex_program);
+        shadow.vertex_program = vertex_program;
+    }
+    if (!known || fragment_program != shadow.fragment_program) {
+        sceGxmSetFragmentProgram(context, fragment_program);
+        shadow.fragment_program = fragment_program;
+    }
+    // Lo de arriba ya esta puesto: el resto de lotes de la escena lo comparan.
+    shadow.valid = true;
 
     // Texturas: por cada sampler que el shader use de verdad, su unidad. Si
     // alguna no se puede servir (formato, borde, unidad apagada...), el lote
@@ -6029,7 +6169,16 @@ bool RasterizerGXM::SetupDrawState(Surface* surface, const Entry* pipeline,
             NoteSkip(4, "textura");
             return false;
         }
-        sceGxmSetFragmentTexture(context, pipeline->sampler_units[i], texture);
+        const u32 unit = pipeline->sampler_units[i];
+        const u32 bit = unit < shadow.textures.size() ? 1u << unit : 0u;
+        if (bit == 0 || (shadow.textures_known & bit) == 0 ||
+            std::memcmp(&shadow.textures[unit], texture, sizeof(SceGxmTexture)) != 0) {
+            sceGxmSetFragmentTexture(context, unit, texture);
+            if (bit != 0) {
+                shadow.textures[unit] = *texture;
+                shadow.textures_known |= bit;
+            }
+        }
     }
     if (timed) {
         state_texture_us += Common::VitaMicros() - mark;
@@ -6038,6 +6187,10 @@ bool RasterizerGXM::SetupDrawState(Surface* surface, const Entry* pipeline,
         // La version vigente: ver UpdateLightingLut.
         sceGxmSetFragmentTexture(context, pipeline->lighting_lut_unit,
                                  &lighting_lut_textures[lighting_lut_version]);
+        // La unidad de la tabla de luz no pasa por la sombra: se olvida.
+        if (pipeline->lighting_lut_unit < shadow.textures.size()) {
+            shadow.textures_known &= ~(1u << pipeline->lighting_lut_unit);
+        }
         lighting_lut_in_scene = true;
     }
 
@@ -6203,8 +6356,10 @@ bool RasterizerGXM::SetupDrawState(Surface* surface, const Entry* pipeline,
 
 void RasterizerGXM::DrawTriangles() {
     batch_skip = false;
+    pending_pipeline_valid = false;
     if (!batch_on_gpu) {
         batch_decided = false;
+        decided_pipeline = nullptr;
         batch.clear();
         return;
     }
@@ -6229,6 +6384,7 @@ void RasterizerGXM::DrawTriangles() {
     batch.clear();
     batch_decided = false;
     batch_on_gpu = false;
+    decided_pipeline = nullptr;
     if (batch_timed) {
         Common::FrameStats::batch_us.fetch_add((Common::VitaMicros() - batch_begin) * 8,
                                                std::memory_order_relaxed);
@@ -7196,49 +7352,104 @@ bool RasterizerGXM::AccelerateDrawBatch(bool is_indexed) {
             sequential[i] = static_cast<u16>(i);
         }
     }
+    unsigned long long data_mark = profile ? Common::VitaMicros() : 0;
+    const auto data_lap = [&](unsigned long long& slot) {
+        if (profile) {
+            const unsigned long long now = Common::VitaMicros();
+            slot += now - data_mark;
+            data_mark = now;
+        }
+    };
     u8* space = ReserveVertexSpace(total_bytes);
+    data_lap(g_data_reserve_us);
     if (space == nullptr) {
         return HwVsReject("memoria vertices");
     }
+    if (profile) {
+        g_data_samples++;
+        g_data_bytes += total_bytes;
+    }
     std::array<const u8*, 12> stream_data{};
     if (converted) {
-        // Un float por componente, en el orden de gxm_attributes (ver arriba).
-        float* out = reinterpret_cast<float*>(space);
+        /**
+         * Un float por componente, en el orden de gxm_attributes (ver arriba).
+         *
+         * EN DOS PASOS (0.3.4.6). Antes se escribia float a float directamente
+         * en el anillo, que es memoria SIN CACHE, con un switch por componente
+         * y releyendo el campo de bits del paso de cada cargador en cada
+         * vertice. Ahora lo constante de cada atributo se saca una vez por
+         * lote, cada vertice se convierte en un bloque de 4 KB de la pila (con
+         * cache) y el bloque entero pasa al anillo con un memcpy: escrituras
+         * seguidas, que es lo que la memoria sin cache lleva bien. Los valores
+         * y su orden son exactamente los de antes.
+         */
+        struct AttributePlan {
+            const u8* base;
+            u32 stride;
+            u8 format;
+            u8 components;
+            u8 declared;
+        };
+        std::array<AttributePlan, 16> plan{};
+        u32 floats_per_vertex = 0;
+        for (u32 i = 0; i < attribute_count; i++) {
+            const AttributeSource& source = attribute_sources[i];
+            plan[i].stride =
+                attributes.attribute_loaders[loader_of_stream[source.stream]].byte_count;
+            plan[i].base = stream_source[source.stream] + source.offset;
+            plan[i].format = source.format;
+            plan[i].components = source.components;
+            plan[i].declared = static_cast<u8>(gxm_attributes[i].componentCount);
+            floats_per_vertex += plan[i].declared;
+        }
+        constexpr u32 kStagingFloats = 1024;
+        alignas(16) float staging[kStagingFloats];
+        u8* ring = space;
+        u32 staged = 0;
+        const auto flush_staging = [&] {
+            std::memcpy(ring, staging, staged * sizeof(float));
+            ring += staged * sizeof(float);
+            staged = 0;
+        };
         for (u32 v = 0; v < vertex_range; v++) {
+            if (staged + floats_per_vertex > kStagingFloats) {
+                flush_staging();
+            }
+            float* out = staging + staged;
             for (u32 i = 0; i < attribute_count; i++) {
-                const AttributeSource& source = attribute_sources[i];
-                const u32 stride =
-                    attributes.attribute_loaders[loader_of_stream[source.stream]].byte_count;
-                const u8* in = stream_source[source.stream] + v * stride + source.offset;
-                const u32 components = source.components;
-                for (u32 c = components; c < gxm_attributes[i].componentCount; c++) {
-                    out[c] = c == 3 ? 1.0f : 0.0f;
-                }
-                for (u32 c = 0; c < components; c++) {
-                    switch (static_cast<PipelineRegs::VertexAttributeFormat>(source.format)) {
-                    case PipelineRegs::VertexAttributeFormat::BYTE:
-                        *out++ = static_cast<float>(static_cast<s8>(in[c]));
-                        break;
-                    case PipelineRegs::VertexAttributeFormat::UBYTE:
-                        *out++ = static_cast<float>(in[c]);
-                        break;
-                    case PipelineRegs::VertexAttributeFormat::SHORT: {
+                const AttributePlan& attr = plan[i];
+                const u8* in = attr.base + v * attr.stride;
+                const u32 components = attr.components;
+                switch (static_cast<PipelineRegs::VertexAttributeFormat>(attr.format)) {
+                case PipelineRegs::VertexAttributeFormat::BYTE:
+                    for (u32 c = 0; c < components; c++) {
+                        out[c] = static_cast<float>(static_cast<s8>(in[c]));
+                    }
+                    break;
+                case PipelineRegs::VertexAttributeFormat::UBYTE:
+                    for (u32 c = 0; c < components; c++) {
+                        out[c] = static_cast<float>(in[c]);
+                    }
+                    break;
+                case PipelineRegs::VertexAttributeFormat::SHORT:
+                    for (u32 c = 0; c < components; c++) {
                         s16 value;
                         std::memcpy(&value, in + c * 2, sizeof(value));
-                        *out++ = static_cast<float>(value);
-                        break;
+                        out[c] = static_cast<float>(value);
                     }
-                    default: {
-                        float value;
-                        std::memcpy(&value, in + c * 4, sizeof(value));
-                        *out++ = value;
-                        break;
-                    }
-                    }
+                    break;
+                default:
+                    std::memcpy(out, in, components * sizeof(float));
+                    break;
                 }
-                out += gxm_attributes[i].componentCount - components;
+                for (u32 c = components; c < attr.declared; c++) {
+                    out[c] = c == 3 ? 1.0f : 0.0f;
+                }
+                out += attr.declared;
             }
+            staged += floats_per_vertex;
         }
+        flush_staging();
         stream_data[0] = space;
         space += (converted_stride * vertex_range + 15u) & ~15u;
         stream_count = 1;
@@ -7249,6 +7460,7 @@ bool RasterizerGXM::AccelerateDrawBatch(bool is_indexed) {
             space += (stream_bytes[stream] + 15u) & ~15u;
         }
     }
+    data_lap(g_data_copy_us);
     const u16* draw_indices = static_cast<const u16*>(index_buffer.Data());
     if (is_indexed) {
         // Rebasados a 0: los flujos empiezan en min_index.
@@ -7261,6 +7473,7 @@ bool RasterizerGXM::AccelerateDrawBatch(bool is_indexed) {
         }
         draw_indices = out;
     }
+    data_lap(g_data_index_us);
 
     phase(3);
     profile_state = profile;
@@ -7445,7 +7658,10 @@ std::string RasterizerGXM::TakeBatchProfile() {
         "(escena {:.1f} texturas {:.1f}, de ellas copias gpu {:.1f}) uniforms {:.1f} ({} "
         "muestras) | texturas a revisar por: vaciado {} invalidar {} ambos {} relleno {} "
         "copia {} | vs nuevos {} (del indice {}, {} ms, traducir {} ms, el peor {} ms) | memo: "
-        "lotes {} fs rehecho {} vs rehecho {} escrituras iguales {}",
+        "lotes {} fs rehecho {} vs rehecho {} escrituras iguales {} | copias por partes: "
+        "{} llamadas, rellenos {:.1f} us, superficies {:.1f} us ({:.1f} de media), copias "
+        "{:.1f} us ({:.1f} de media) | datos por partes: reservar {:.1f} us, copiar {:.1f} us, "
+        "indices {:.1f} us, {:.0f} bytes por lote",
         avg(batch_phase_us[0]), avg(batch_phase_us[1]), avg(batch_phase_us[2]),
         avg(batch_phase_us[3]), avg(batch_phase_us[4]), avg(state_scene_us),
         avg(state_texture_us), avg(g_state_copy_us), avg(batch_phase_us[5]), samples,
@@ -7462,7 +7678,27 @@ std::string RasterizerGXM::TakeBatchProfile() {
         memo_batches.exchange(0, std::memory_order_relaxed),
         memo_fs_rebuilds.exchange(0, std::memory_order_relaxed),
         memo_vs_rebuilds.exchange(0, std::memory_order_relaxed),
-        memo_same_writes.exchange(0, std::memory_order_relaxed));
+        memo_same_writes.exchange(0, std::memory_order_relaxed), g_copy_calls,
+        g_copy_calls == 0 ? 0.0 : static_cast<double>(g_copy_fills_us) / g_copy_calls,
+        g_copy_calls == 0 ? 0.0 : static_cast<double>(g_copy_surfaces_us) / g_copy_calls,
+        g_copy_calls == 0 ? 0.0 : static_cast<double>(g_copy_surfaces_seen) / g_copy_calls,
+        g_copy_calls == 0 ? 0.0 : static_cast<double>(g_copy_copies_us) / g_copy_calls,
+        g_copy_calls == 0 ? 0.0 : static_cast<double>(g_copy_copies_seen) / g_copy_calls,
+        g_data_samples == 0 ? 0.0 : static_cast<double>(g_data_reserve_us) / g_data_samples,
+        g_data_samples == 0 ? 0.0 : static_cast<double>(g_data_copy_us) / g_data_samples,
+        g_data_samples == 0 ? 0.0 : static_cast<double>(g_data_index_us) / g_data_samples,
+        g_data_samples == 0 ? 0.0 : static_cast<double>(g_data_bytes) / g_data_samples);
+    g_data_reserve_us = 0;
+    g_data_copy_us = 0;
+    g_data_index_us = 0;
+    g_data_bytes = 0;
+    g_data_samples = 0;
+    g_copy_calls = 0;
+    g_copy_fills_us = 0;
+    g_copy_surfaces_us = 0;
+    g_copy_copies_us = 0;
+    g_copy_surfaces_seen = 0;
+    g_copy_copies_seen = 0;
     batch_phase_us.fill(0);
     batch_phase_samples = 0;
     state_scene_us = 0;

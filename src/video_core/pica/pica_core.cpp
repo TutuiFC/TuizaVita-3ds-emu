@@ -20,6 +20,7 @@
 #include "video_core/shader/shader.h"
 #ifdef __PSVITA__
 #include "common/thread_worker.h"
+#include "video_core/renderer_gxm/gxm_cg.h"
 #endif
 
 namespace Pica {
@@ -45,6 +46,14 @@ struct PicaCore::ParallelShading {
      * en el nucleo 0, y el 2 entero para el compilador (ver CgWorkerMain).
      */
     Common::StatefulThreadWorker<> workers{1, "VertexShader workers", {}, true, 0};
+    /**
+     * Y UN TERCER TRAMO EN EL NUCLEO 2, SOLO CON EL COMPILADOR PARADO
+     * (0.3.4.6). El nucleo 2 se dejo entero para el compilador de shaders
+     * (ver arriba), pero casi siempre esta ocioso: sin compilaciones en marcha
+     * ni en cola, el lote se reparte en tres. Con prioridad de ayudante (159)
+     * queda por debajo del audio (96) y de la mezcla del DSP (158).
+     */
+    Common::StatefulThreadWorker<> workers_core2{1, "VertexShader workers", {}, true, 2};
     struct Job {
         u32 index;  ///< Posicion en el lote (la que recibe LoadVertex).
         u32 vertex; ///< Vertice a cargar.
@@ -1610,7 +1619,10 @@ void PicaCore::ShadeVerticesParallel(const VertexLoader& loader, PAddr base_addr
         if (ps.outputs.size() < jobs) {
             ps.outputs.resize(jobs);
         }
-        const u32 parts = std::clamp<u32>(jobs / kMinJobsPerPart, 1, 2);
+        // El tercer tramo, en el nucleo 2, solo si el compilador no lo usa.
+        const Gxm::CgActivity compiler = Gxm::GetCgActivity();
+        const u32 max_parts = compiler.busy_since_us == 0 && compiler.queued == 0 ? 3u : 2u;
+        const u32 parts = std::clamp<u32>(jobs / kMinJobsPerPart, 1, max_parts);
         const ParallelShading::Job* first_warmup = has_previous ? &previous : nullptr;
         if (parts == 1) {
             shade_range(0, jobs, first_warmup);
@@ -1620,7 +1632,8 @@ void PicaCore::ShadeVerticesParallel(const VertexLoader& loader, PAddr base_addr
             for (u32 part = 1; part < parts; ++part) {
                 const u32 begin = jobs * part / parts;
                 const u32 end = jobs * (part + 1) / parts;
-                ps.workers.QueueWork([&shade_range, &ps, begin, end] {
+                auto& pool = part == 1 ? ps.workers : ps.workers_core2;
+                pool.QueueWork([&shade_range, &ps, begin, end] {
                     shade_range(begin, end, &ps.jobs[begin - 1]);
                 });
             }
@@ -1628,6 +1641,9 @@ void PicaCore::ShadeVerticesParallel(const VertexLoader& loader, PAddr base_addr
             // Misma barrera que las bandas del rasterizador: ver la razon de
             // la espera activa en WaitForRequestsSpin.
             ps.workers.WaitForRequestsSpin(4096);
+            if (parts > 2) {
+                ps.workers_core2.WaitForRequestsSpin(4096);
+            }
         }
         if (jobs != 0) {
             has_previous = true;

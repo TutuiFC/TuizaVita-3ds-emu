@@ -62,14 +62,21 @@ set_source_files_properties(
     codec.cpp
     hle/hle.cpp
     hle/source.cpp
-    hle/mixers.cpp
     hle/filter.cpp
     hle/decoder.cpp
     hle/aac_decoder.cpp
     interpolate.cpp
-    time_stretch.cpp
     dsp_interface.cpp
     PROPERTIES COMPILE_OPTIONS "-O3"
+)
+# Los bucles de floats del audio, vectorizables con NEON solo con
+# -funsafe-math-optimizations (0.3.4.6, ver SoundTouch en externals): la
+# mezcla a estereo y la conversion a/desde float del estirado. No son
+# referencia de nada: no hace falta que el resultado sea exacto al bit.
+set_source_files_properties(
+    hle/mixers.cpp
+    time_stretch.cpp
+    PROPERTIES COMPILE_OPTIONS "-O3;-funsafe-math-optimizations"
 )
 
 target_link_libraries(audio_core PUBLIC citra_common citra_core)
