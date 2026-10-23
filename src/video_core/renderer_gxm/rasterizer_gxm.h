@@ -226,6 +226,17 @@ public:
      * ajustes.txt; a 0, como antes (cualquier escritura invalida).
      */
     static std::atomic<u32> memo_by_value;
+    /**
+     * Tamano maximo, en KB de Cg, de un shader de vertices que se compila en
+     * partida (0.3.4.9). Estaba fijo en 23: un programa de mas (26 KB, la piel
+     * de los Pokemon de Zafiro Alfa) se quedaba SIEMPRE en la CPU, 88-92 ms de
+     * sombreado por fotograma (3,3 FPS) en esas zonas. El compilador va en su
+     * propio hilo y nucleo y lo compilado se guarda en la tarjeta: es un rato
+     * una sola vez, pero un programa grande puede tardar minutos y pedir mucho
+     * heap, asi que sigue en 23 por defecto (y vuelve a 23 si queda poco heap).
+     * Clave "vs_tope_kb=" de ajustes.txt, de 16 a 40.
+     */
+    static std::atomic<u32> vs_compile_limit_kb;
     /// Saltar el estado de GXM que no cambia entre lotes (0.3.4.6, ver
     /// DrawStateShadow). Clave "estado_sombra=" de ajustes.txt.
     static std::atomic<u32> state_shadow_enabled;

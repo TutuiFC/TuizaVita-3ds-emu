@@ -440,6 +440,9 @@ struct UserSettings {
     /// 0.3.4.4: memo de lotes por valor (Gxm::RasterizerGXM::memo_by_value).
     /// Solo ajustes.txt.
     bool memo_by_value = true;
+    /// 0.3.4.9: tamano maximo de un shader de vertices que se compila en partida,
+    /// en KB (Gxm::RasterizerGXM::vs_compile_limit_kb). Solo ajustes.txt.
+    int vs_limit_kb = 23;
     /// 0.3.4.6: no repetir el estado de GXM igual entre lotes
     /// (Gxm::RasterizerGXM::state_shadow_enabled). Solo ajustes.txt.
     bool state_shadow = true;
@@ -565,6 +568,8 @@ void ApplyUserSettings() {
                                              std::memory_order_relaxed);
     Gxm::RasterizerGXM::memo_by_value.store(g_user.memo_by_value ? 1u : 0u,
                                             std::memory_order_relaxed);
+    Gxm::RasterizerGXM::vs_compile_limit_kb.store(static_cast<u32>(g_user.vs_limit_kb),
+                                                  std::memory_order_relaxed);
     Gxm::RasterizerGXM::state_shadow_enabled.store(g_user.state_shadow ? 1u : 0u,
                                                    std::memory_order_relaxed);
 }
@@ -646,6 +651,9 @@ void LoadUserSettings() {
     read_bool("jit_reusar_base=", g_user.jit_reuse_base);
     read_bool("wbuffer_gpu=", g_user.wbuffer_gpu);
     read_bool("memo_valor=", g_user.memo_by_value);
+    if (read_int("vs_tope_kb=", value)) {
+        g_user.vs_limit_kb = std::clamp(value, 16, 40);
+    }
     read_bool("estado_sombra=", g_user.state_shadow);
     if (read_int("idioma_menu=", value)) {
         g_user.menu_language = std::clamp(value, 0, I18n::kLanguageCount - 1);
@@ -664,7 +672,7 @@ int FormatUserSettings(char* buffer, std::size_t size) {
         "jit_superbloques=%d\njit_regs_fijos=%d\njit_vfp_fijos=%d\nvertices_ram=%d\n"
         "dsp_hilo=%d\njit_perfil=%d\nvolcado_cada=%d\ncopia_textura_gpu=%d\n"
         "jit_tabla_enlaces=%d\njit_saltos_cro=%d\njit_reusar_base=%d\nidioma_menu=%d\n"
-        "wbuffer_gpu=%d\nmemo_valor=%d\nestado_sombra=%d\n",
+        "wbuffer_gpu=%d\nmemo_valor=%d\nestado_sombra=%d\nvs_tope_kb=%d\n",
         g_user.volume_percent, g_user.language, g_user.half_resolution ? 1 : 0,
         g_user.jit_reg_cache ? 1 : 0, g_user.jit_vfp_data ? 1 : 0, g_user.gxm_no_finish ? 1 : 0,
         g_user.gxm_present_direct ? 1 : 0, g_user.jit_direct_link ? 1 : 0,
@@ -678,7 +686,8 @@ int FormatUserSettings(char* buffer, std::size_t size) {
         g_user.dsp_thread ? 1 : 0, g_user.jit_profile ? 1 : 0, g_user.present_writeback_every,
         g_user.texture_copy_gpu ? 1 : 0, g_user.jit_link_table ? 1 : 0,
         g_user.jit_veneers ? 1 : 0, g_user.jit_reuse_base ? 1 : 0, g_user.menu_language,
-        g_user.wbuffer_gpu ? 1 : 0, g_user.memo_by_value ? 1 : 0, g_user.state_shadow ? 1 : 0);
+        g_user.wbuffer_gpu ? 1 : 0, g_user.memo_by_value ? 1 : 0, g_user.state_shadow ? 1 : 0,
+        g_user.vs_limit_kb);
 }
 
 /// Los ajustes con los que se juega, a crash.txt en una linea (0.1.8.7): sin

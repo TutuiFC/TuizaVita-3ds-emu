@@ -69,6 +69,7 @@ std::atomic<u32> RasterizerGXM::present_writeback_every{4};
 std::atomic<u32> RasterizerGXM::texture_copy_gpu{0};
 std::atomic<u32> RasterizerGXM::wbuffer_on_gpu{1};
 std::atomic<u32> RasterizerGXM::memo_by_value{1};
+std::atomic<u32> RasterizerGXM::vs_compile_limit_kb{23};
 std::atomic<u32> RasterizerGXM::state_shadow_enabled{1};
 std::atomic<u32> RasterizerGXM::resolution_scale{2};
 std::atomic<u32> RasterizerGXM::gpu_transfers{0};
@@ -2268,7 +2269,11 @@ private:
          * de compilador una vez, y luego salen de la cache de la tarjeta. Los
          * de 24 KB de Pokemon Sol siguen fuera.
          */
-        constexpr std::size_t kMaxCompileSource = 23u * 1024u;
+        // Ver vs_compile_limit_kb; con poco heap, el de siempre.
+        const std::size_t kMaxCompileSource =
+            (CgHeapLow() ? 23u
+                         : std::max(23u, vs_compile_limit_kb.load(std::memory_order_relaxed))) *
+            1024u;
         constexpr std::size_t kHeavySource = 16u * 1024u;
         // El tope mira la de siempre: con el de la otra, un programa que antes
         // se especializaba podria pasar a compilarse entero (ver
