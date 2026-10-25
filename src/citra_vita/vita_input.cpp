@@ -2,6 +2,7 @@
 // Licensed under GPLv2 or any later version
 // Refer to the license.txt file included.
 
+#include <atomic>
 #include <cmath>
 #include <memory>
 #include <psp2/ctrl.h>
@@ -43,6 +44,9 @@ constexpr float kDeadzone = 0.15f;
  * lectura de hace menos de kPadFreshUs, el estado es el mismo. Solo las llama
  * el hilo de emulacion.
  */
+/// Ver SetPilotButtons.
+std::atomic<unsigned int> g_pilot_buttons{0};
+
 SceCtrlData ReadPad() {
     constexpr SceUInt64 kPadFreshUs = 2000;
     static SceCtrlData cached{};
@@ -52,7 +56,9 @@ SceCtrlData ReadPad() {
         sceCtrlPeekBufferPositive(0, &cached, 1);
         cached_at = now;
     }
-    return cached;
+    SceCtrlData pad = cached;
+    pad.buttons |= g_pilot_buttons.load(std::memory_order_relaxed);
+    return pad;
 }
 
 class VitaButton final : public ::Input::ButtonDevice {
@@ -161,6 +167,14 @@ void Shutdown() {
     UnregisterFactory<ButtonDevice>(kEngineName);
     UnregisterFactory<AnalogDevice>(kEngineName);
     UnregisterFactory<MotionDevice>(kEngineName);
+}
+
+void SetPilotButtons(unsigned int buttons) {
+    g_pilot_buttons.store(buttons, std::memory_order_relaxed);
+}
+
+unsigned int PilotButtons() {
+    return g_pilot_buttons.load(std::memory_order_relaxed);
 }
 
 void ApplyDefaultMapping() {

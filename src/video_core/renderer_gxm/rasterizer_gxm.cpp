@@ -14,6 +14,8 @@
 #include <unordered_set>
 #include <utility>
 #include <fmt/format.h>
+#include <psp2/io/fcntl.h>
+#include <psp2/io/stat.h>
 #include <psp2/kernel/modulemgr.h>
 #include <psp2/kernel/threadmgr.h>
 #include <psp2/shacccg.h>
@@ -419,6 +421,41 @@ constexpr u32 kMaxVerticesPerDraw = 60000;
 /// color y su profundidad en CDRAM y no los suelta: sin tope, un juego que
 /// alterne framebuffers se come la memoria del chip grafico.
 constexpr std::size_t kMaxSurfaces = 8;
+
+/**
+ * EL CODIGO DE LOS PROGRAMAS DE VERTICES, A LA TARJETA (0.3.8.1). Con
+ * ux0:/data/azahar/volcar_vs.txt, cada fuente que genera el traductor se
+ * guarda en vs_fuentes/<hash>.cg, con el mismo hash que su .gxp de la cache y
+ * que el ranking de vs_trabajo.txt (gxm_caja_negra.cpp): asi se puede leer
+ * fuera de la consola el codigo de los que mas chip se llevan. Una vez por
+ * fuente; si el fichero ya esta, no se escribe.
+ */
+constexpr const char* kDumpVsFlagPath = "ux0:/data/azahar/volcar_vs.txt";
+constexpr const char* kDumpVsDir = "ux0:/data/azahar/vs_fuentes";
+bool g_dump_vs = false;
+
+void DumpVsSource(const std::string& source) {
+    static std::unordered_set<u64> dumped;
+    const u64 hash = Common::ComputeHash64(source.data(), source.size());
+    if (!dumped.insert(hash).second) {
+        return;
+    }
+    static bool dir_ready = false;
+    if (!dir_ready) {
+        sceIoMkdir(kDumpVsDir, 0777);
+        dir_ready = true;
+    }
+    const std::string path = fmt::format("{}/{:016x}.cg", kDumpVsDir, hash);
+    SceIoStat stat{};
+    if (sceIoGetstat(path.c_str(), &stat) >= 0) {
+        return;
+    }
+    const SceUID fd = sceIoOpen(path.c_str(), SCE_O_WRONLY | SCE_O_CREAT | SCE_O_TRUNC, 0777);
+    if (fd >= 0) {
+        sceIoWrite(fd, source.data(), static_cast<SceSize>(source.size()));
+        sceIoClose(fd);
+    }
+}
 
 SceGxmDepthFunc MapDepthFunc(FramebufferRegs::CompareFunc func) {
     switch (func) {
@@ -2219,6 +2256,8 @@ struct RasterizerGXM::HwShaderCache {
             vertex_program = nullptr;
         }
         // Tambien el fallo: nullptr en el mapa es "no se puede", sin reintentar.
+        BlackBox::NoteVertexProgram(vertex_program, CgOutputHash(program.output),
+                                    program.gxp != nullptr ? sceGxmProgramGetSize(program.gxp) : 0);
         linked.emplace(key, vertex_program);
         return vertex_program;
     }
@@ -2284,6 +2323,9 @@ private:
             auto source = GenerateVertexShader(setup, config, extra, inputs, write_lighting,
                                                write_w, &generator_reason);
             g_cg_variant.store(0, std::memory_order_relaxed);
+            if (g_dump_vs && source.has_value()) {
+                DumpVsSource(*source);
+            }
             g_vs_generate_us.fetch_add(Common::VitaMicros() - generate_begin,
                                        std::memory_order_relaxed);
             return source;
@@ -2306,6 +2348,9 @@ private:
             if (const SceShaccCgCompileOutput* cached = LoadCgCacheIndexed(IndexKey(key), &variant)) {
                 g_vs_index_hits.fetch_add(1, std::memory_order_relaxed);
                 Finish(program, cached, variant);
+                if (g_dump_vs) {
+                    (void)generate(variant); // Solo para volcarla (DumpVsSource).
+                }
                 return;
             }
         }
@@ -3176,6 +3221,14 @@ bool RasterizerGXM::EnsureInitialized() {
     *fence_address = 0;
     // Ver gxm_caja_negra.h: lo mandado a la GPU, en el volcado si se cuelga.
     BlackBox::Start(fence_address);
+    {
+        SceIoStat flag{};
+        g_dump_vs = sceIoGetstat(kDumpVsFlagPath, &flag) >= 0;
+        if (g_dump_vs) {
+            Common::VitaNote("gxm vs", "volcar_vs.txt: el codigo de cada programa de "
+                                       "vertices va a vs_fuentes");
+        }
+    }
     if (context == nullptr || patcher == nullptr) {
         status = "sin contexto gxm";
         Common::VitaNote("gxm init", "sin contexto");

@@ -431,6 +431,84 @@ void WriteSamplesIfReady() {
     g_samples_ready.store(-1, std::memory_order_release);
 }
 
+/*
+ * QUE PROGRAMAS DE VERTICES SE LLEVAN EL CHIP (0.3.8.1). El cronometro de
+ * 0.3.7.9 dijo que en el mapa de Zafiro el tiempo de chip de cada escena es
+ * casi exactamente proporcional a indices x bytes del programa de vertices
+ * (r2 0,97-0,99, casi nada fijo): el SGX va atado a nuestros shaders de
+ * vertices. Para saber cuales adelgazar primero se suma, por programa, lo que
+ * dibuja, y cada 30 s se escribe el ranking en vs_trabajo.txt con el hash de
+ * su fuente, que es el nombre de su .gxp y de su .cg en vs_fuentes (si existe
+ * volcar_vs.txt, ver el rasterizador).
+ */
+struct ProgramWork {
+    u32 program; ///< SceGxmVertexProgram*; 0 = libre.
+    u32 bytes;
+    u64 hash;
+    u64 indices;
+    u32 draws;
+};
+constexpr u32 kPrograms = 512;
+ProgramWork g_programs[kPrograms];
+constexpr const char* kRankingPath = "ux0:/data/azahar/vs_trabajo.txt";
+
+ProgramWork* ProgramSlot(u32 program) {
+    const u32 start = (program >> 4) * 2654435761u;
+    for (u32 i = 0; i < kPrograms; i++) {
+        ProgramWork& slot = g_programs[(start + i) & (kPrograms - 1)];
+        if (slot.program == program) {
+            return &slot;
+        }
+        if (slot.program == 0) {
+            slot.program = program;
+            return &slot;
+        }
+    }
+    return nullptr;
+}
+
+/// Desde el hilo de la caja: copia, ordena y escribe. Las cuentas se leen sin
+/// cerrojo mientras el hilo que dibuja suma: para un ranking da igual.
+void WriteRanking() {
+    static ProgramWork copy[kPrograms];
+    u32 n = 0;
+    unsigned long long total = 0;
+    for (const ProgramWork& slot : g_programs) {
+        if (slot.program != 0 && slot.indices != 0) {
+            copy[n++] = slot;
+            total += slot.indices * slot.bytes;
+        }
+    }
+    if (n == 0 || total == 0) {
+        return;
+    }
+    std::sort(copy, copy + n, [](const ProgramWork& a, const ProgramWork& b) {
+        return a.indices * a.bytes > b.indices * b.bytes;
+    });
+    static char text[48 * 1024];
+    std::size_t len = static_cast<std::size_t>(std::snprintf(
+        text, sizeof(text),
+        "programas de vertices por trabajo en el chip (indices x bytes) desde el arranque: %u\n"
+        "puesto,hash_fuente,bytes_gxp,indices,dibujados,trabajo_mb,porcentaje,acumulado\n",
+        n));
+    double acc = 0;
+    for (u32 i = 0; i < n && i < 60 && len + 160 < sizeof(text); i++) {
+        const ProgramWork& p = copy[i];
+        const double work = static_cast<double>(p.indices) * p.bytes;
+        acc += work;
+        len += static_cast<std::size_t>(std::snprintf(
+            text + len, sizeof(text) - len, "%u,%016llx,%u,%llu,%u,%.1f,%.1f,%.1f\n", i + 1,
+            static_cast<unsigned long long>(p.hash), p.bytes,
+            static_cast<unsigned long long>(p.indices), p.draws, work / 1048576.0,
+            100.0 * work / total, 100.0 * acc / total));
+    }
+    const SceUID fd = sceIoOpen(kRankingPath, SCE_O_WRONLY | SCE_O_CREAT | SCE_O_TRUNC, 0777);
+    if (fd >= 0) {
+        sceIoWrite(fd, text, static_cast<SceSize>(len));
+        sceIoClose(fd);
+    }
+}
+
 void* BoxMain(void*) {
     // Por encima del compilador de shaders, que comparte nucleo y pasa minutos
     // sin soltarlo: si la GPU se cuelga, esto tiene que poder mirar la valla.
@@ -447,9 +525,13 @@ void* BoxMain(void*) {
     box.last_advance_ms = NowMs();
     g_box.store(&box, std::memory_order_release);
     u32 last_done = 0;
+    u32 ticks = 0;
     while (true) {
         sceKernelDelayThread(100 * 1000);
         WriteSamplesIfReady();
+        if (g_timer_on && ++ticks % 300 == 0) {
+            WriteRanking();
+        }
         const u32 now = NowMs();
         const u32 done = g_fence != nullptr ? *g_fence : 0;
         box.now_ms = now;
@@ -562,6 +644,16 @@ void CloseScene(u32 fence) {
     g_scene_open = false;
 }
 
+void NoteVertexProgram(const void* program, u64 source_hash, u32 bytes) {
+    if (!g_timer_on || program == nullptr) {
+        return;
+    }
+    if (ProgramWork* slot = ProgramSlot(Address(program))) {
+        slot->hash = source_hash;
+        slot->bytes = bytes;
+    }
+}
+
 void NoteTexture(u32 slot, const SceGxmTexture* texture) {
     if (slot >= kTextures || texture == nullptr) {
         return;
@@ -605,8 +697,13 @@ void Record(const DrawInfo& info) {
         g_work.draws++;
         if (info.kind == DrawKind::VertexGpu) {
             g_work.vgpu_indices += info.count;
-            g_work.vs_work += static_cast<unsigned long long>(info.count) *
-                              ProgramBytes(info.vertex_program, true);
+            const u32 vs_bytes = ProgramBytes(info.vertex_program, true);
+            g_work.vs_work += static_cast<unsigned long long>(info.count) * vs_bytes;
+            if (ProgramWork* slot = ProgramSlot(Address(info.vertex_program))) {
+                slot->indices += info.count;
+                slot->draws++;
+                slot->bytes = vs_bytes;
+            }
         } else if (info.kind == DrawKind::VertexCpu) {
             g_work.vcpu_vertices += info.count;
         }

@@ -167,9 +167,14 @@ void LoadModuleIfMissing(int argc, char** argv) {
     // 0x8002d013: ya estaba cargado, pero despues de que arrancara este proceso
     // (sus importaciones no lo ven). Relanzar lo arregla igual.
     if (id < 0 && static_cast<u32>(id) != 0x8002d013u) {
-        Note("taiLoadStartKernelModule({}) = 0x{:08x}: todo por el JIT (otro 0x8002xxxx o "
-             "0x9001xxxx: activa 'Enable unsafe homebrew' en los ajustes de HENkaku)",
-             path, static_cast<u32>(id));
+        // 0x90010009 es TAI_ERROR_NOT_ALLOWED: taiHEN no deja cargar modulos de
+        // kernel a un eboot "safe" (25-10). Hay que generarlo con
+        // -DAZAHAR_UNSAFE=ON, como la app de prueba (vita_create_self UNSAFE).
+        Note("taiLoadStartKernelModule({}) = 0x{:08x}: todo por el JIT ({})", path,
+             static_cast<u32>(id),
+             static_cast<u32>(id) == 0x90010009u
+                 ? "el eboot es safe: hay que generarlo con -DAZAHAR_UNSAFE=ON"
+                 : "activa 'Enable unsafe homebrew' en los ajustes de HENkaku");
         return;
     }
     Note("modulo cargado desde {} (0x{:08x}): se relanza Azahar para usarlo", path,
@@ -587,6 +592,17 @@ void CodeChanged() {
 }
 
 
+/**
+ * AL CERRAR CADA SESION, todo fuera (0.3.8.3). Hasta ahora no la llamaba nadie,
+ * y MirrorPageTable solo limpia las tablas del modulo en el PRIMER reflejo del
+ * proceso (g_mirrors == 0). Una segunda partida en el mismo proceso -- otro
+ * juego desde el menu, o el mismo juego relanzandose, como hace Zafiro Alfa al
+ * arrancar -- heredaba las entradas de la primera, que apuntan a la memoria del
+ * invitado anterior, ya liberada: el 25-10 la emulacion se quedaba parada en
+ * cuanto empezaba (Inazuma Eleven GO tras Zafiro, y Zafiro tras su propio
+ * relanzamiento, con pc 0). Lo llama System::Shutdown, con los nucleos ya
+ * destruidos, y con g_mirrors a cero el siguiente reflejo empieza limpio.
+ */
 void Release() {
     if (!Available()) {
         return;
@@ -600,6 +616,17 @@ void Release() {
         AzNativeWorldDestroy(&w);
         g_world = false;
     }
+    g_mirrors = 0;
+    g_ranges = 0;
+    g_range_pages = 0;
+    g_range_cleared = 0;
+    g_code_changes = 0;
+    g_native_slices = 0;
+    g_native_svcs = 0;
+    g_native_bails = 0;
+    g_native_ticks = 0;
+    g_last_bail = nullptr;
+    Note("sesion cerrada: tablas del invitado y mundo liberados");
 }
 
 } // namespace Core::Native

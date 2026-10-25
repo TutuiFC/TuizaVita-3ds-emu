@@ -82,6 +82,10 @@ void CloseScene(u32 fence);
 /// La textura de un sampler (0..2) del dibujado que viene.
 void NoteTexture(u32 slot, const SceGxmTexture* texture);
 
+/// Un programa de vertices recien creado (GetLinked), con el hash de su fuente
+/// (el nombre de su .gxp en la cache) y sus bytes: para vs_trabajo.txt (0.3.8.1).
+void NoteVertexProgram(const void* program, u64 source_hash, u32 bytes);
+
 /// Justo ANTES de sceGxmDraw: si el que cuelga la GPU es ese, tiene que estar.
 void Record(const DrawInfo& info);
 

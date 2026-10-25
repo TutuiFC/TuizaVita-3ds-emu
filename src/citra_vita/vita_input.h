@@ -15,4 +15,9 @@ void Shutdown();
 /// Rellena Settings con el mapeo de botones Vita -> 3DS.
 void ApplyDefaultMapping();
 
+/// Botones de la Vita que el piloto automatico tiene pulsados (0.3.8.2, ver
+/// RunPilotIfAny en main.cpp). Se suman a los del mando en cada lectura.
+void SetPilotButtons(unsigned int buttons);
+unsigned int PilotButtons();
+
 } // namespace VitaFrontend::Input

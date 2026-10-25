@@ -86,6 +86,14 @@ const SceShaccCgCompileOutput* CompileCg(SceShaccCgTargetProfile profile, const 
 
 void ReleaseCgOutput(const SceShaccCgCompileOutput* output);
 
+/// El hash del codigo fuente de una salida (el nombre de su .gxp en la cache),
+/// o 0 si no es de las que se guardan (0.3.8.1, para el ranking de la caja negra).
+u64 CgOutputHash(const SceShaccCgCompileOutput* output);
+
+/// Olvida la compilacion en curso para el siguiente arranque: el proceso va a
+/// salir a proposito, no se muere compilando (0.3.8.3, piloto automatico).
+void CgForgetInterruptedCompile();
+
 /**
  * PRECARGA DE LA CACHE DE SHADERS (0.2.0.3). Cada shader que se lee o se
  * guarda en la cache de la tarjeta queda apuntado en una lista por juego

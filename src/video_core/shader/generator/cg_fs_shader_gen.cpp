@@ -1097,11 +1097,28 @@ private:
             out += ", 0.0, 0.0, 0.0)).r;\n";
         }
 
-        out += fmt::format(
-            "    combiner_output = float4(clamp(color_output_{0} * {1:.1f}, float3(0.0, 0.0, "
-            "0.0), float3(1.0, 1.0, 1.0)), clamp(alpha_output_{0} * {2:.1f}, 0.0, 1.0));\n",
-            index, static_cast<f32>(stage.GetColorMultiplier()),
-            static_cast<f32>(stage.GetAlphaMultiplier()));
+        /**
+         * SIN MULTIPLICADOR, SIN SEGUNDO CLAMP (0.3.8.5). Los combinadores ya
+         * limitan a [0, 1] (AppendColorCombiner/AppendAlphaCombiner) y redondear
+         * a 8 bits un valor de [0, 1] lo deja dentro, asi que con multiplicador 1
+         * -- casi todas las etapas -- el clamp y el "* 1.0" no cambian nada. El
+         * compilador no puede saberlo y los hacia en cada pixel. Mario 3D Land a
+         * 1x va atado a los fragmentos (25-10: 14,6 ms de chip por escena, 5,0 a
+         * media resolucion).
+         */
+        const u32 color_multiplier = stage.GetColorMultiplier();
+        const u32 alpha_multiplier = stage.GetAlphaMultiplier();
+        const std::string color_value =
+            color_multiplier == 1
+                ? fmt::format("color_output_{}", index)
+                : fmt::format("clamp(color_output_{} * {:.1f}, float3(0.0, 0.0, 0.0), "
+                              "float3(1.0, 1.0, 1.0))",
+                              index, static_cast<f32>(color_multiplier));
+        const std::string alpha_value =
+            alpha_multiplier == 1 ? fmt::format("alpha_output_{}", index)
+                                  : fmt::format("clamp(alpha_output_{} * {:.1f}, 0.0, 1.0)",
+                                                index, static_cast<f32>(alpha_multiplier));
+        out += fmt::format("    combiner_output = float4({}, {});\n", color_value, alpha_value);
 
         out += "    combiner_buffer = next_combiner_buffer;\n";
         if (config.TevStageUpdatesCombinerBufferColor(index)) {

@@ -38,6 +38,7 @@
 #endif
 #include "core/global.h"
 #include "core/hle/kernel/ipc_debugger/recorder.h"
+#include "core/arm/native/arm_native.h"
 #include "core/hle/kernel/kernel.h"
 #include "core/hle/kernel/process.h"
 #include "core/hle/kernel/thread.h"
@@ -877,6 +878,8 @@ void System::Shutdown(bool is_deserializing) {
     dsp_core.reset();
     kernel.reset();
     cpu_cores.clear();
+    // El motor nativo, con los nucleos ya destruidos: ver Core::Native::Release.
+    Core::Native::Release();
     exclusive_monitor.reset();
     timing.reset();
 

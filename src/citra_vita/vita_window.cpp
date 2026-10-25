@@ -9,6 +9,7 @@
 #include <psp2/touch.h>
 #include <fmt/format.h>
 #include <string>
+#include "citra_vita/vita_input.h"
 #include "citra_vita/vita_version.h"
 #include "citra_vita/vita_window.h"
 #include "common/settings.h"
@@ -144,6 +145,7 @@ void EmuWindow_Vita::PollEvents() {
 
     SceCtrlData pad{};
     sceCtrlPeekBufferPositive(0, &pad, 1);
+    pad.buttons |= VitaFrontend::Input::PilotButtons();
 
     // START + SELECT a la vez sale de la emulacion y vuelve al menu de ROMs.
     // Hacen falta las dos porque cada una por separado es un boton del 3DS.

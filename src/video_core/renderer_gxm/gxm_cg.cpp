@@ -334,8 +334,9 @@ struct CacheHeader {
 };
 static_assert(sizeof(CacheHeader) == 40, "cabecera de la cache de shaders");
 
-/// Salidas que vienen de la cache: se liberan con free, no con shacccg.
-std::set<const SceShaccCgCompileOutput*> g_cached_outputs;
+/// Salidas que vienen de la cache: se liberan con free, no con shacccg. Con el
+/// hash de su fuente, que es el nombre de su .gxp (0.3.8.1, ver CgOutputHash).
+std::unordered_map<const SceShaccCgCompileOutput*, u64> g_cached_outputs;
 /// Protege g_cached_outputs (0.1.9.6): leer de la cache de la tarjeta no
 /// necesita el compilador, asi que no espera a la compilacion en curso.
 std::mutex g_outputs_mutex;
@@ -506,7 +507,7 @@ const SceShaccCgCompileOutput* FromPreloaded(const CacheHeader& want,
     output->diagnostics = nullptr;
     {
         const std::lock_guard lock{g_outputs_mutex};
-        g_cached_outputs.insert(output);
+        g_cached_outputs.emplace(output, have.hash_city);
     }
     return output;
 }
@@ -569,7 +570,7 @@ const SceShaccCgCompileOutput* LoadCachedFromCard(const CacheHeader& want,
     output->diagnostics = nullptr;
     {
         const std::lock_guard lock{g_outputs_mutex};
-        g_cached_outputs.insert(output);
+        g_cached_outputs.emplace(output, have.hash_city);
     }
     return output;
 }
@@ -580,7 +581,7 @@ const SceShaccCgCompileOutput* LoadCachedFromCard(const CacheHeader& want,
  * destruir enseguida sin que
  * el programa registrado en el parcheador apunte a memoria suya.
  */
-const SceShaccCgCompileOutput* CopyOutput(const SceShaccCgCompileOutput& source) {
+const SceShaccCgCompileOutput* CopyOutput(const SceShaccCgCompileOutput& source, u64 hash) {
     void* memory = std::malloc(sizeof(SceShaccCgCompileOutput) + source.programSize);
     if (memory == nullptr) {
         return nullptr;
@@ -594,7 +595,7 @@ const SceShaccCgCompileOutput* CopyOutput(const SceShaccCgCompileOutput& source)
     output->diagnostics = nullptr;
     {
         const std::lock_guard lock{g_outputs_mutex};
-        g_cached_outputs.insert(output);
+        g_cached_outputs.emplace(output, hash);
     }
     return output;
 }
@@ -1019,9 +1020,18 @@ void LoadBadSources() {
         sceIoRemove(kCompilingPath);
         const u32 strikes =
             (g_has_suspect && g_suspect == interrupted.source) ? g_suspect_strikes + 1 : 1;
-        const u32 allowed = interrupted.source_size >= kBigSourceBytes ? kSuspectStrikesBig
-                                                                       : kSuspectStrikesSmall;
+        const bool big = interrupted.source_size >= kBigSourceBytes;
+        const u32 allowed = big ? kSuspectStrikesBig : kSuspectStrikesSmall;
         const char* const evidence = "sin volcado de la consola";
+        /**
+         * LOS GRANDES, NUNCA SIN VOLCADO (0.3.8.3). Uno de mas de kBigSourceBytes
+         * tarda de uno a tres minutos en compilar, asi que lo normal es que la
+         * sesion acabe a medias: el usuario cierra el juego, o lo cierra el
+         * piloto automatico. Contarlo como aviso mando a la lista negra, a los
+         * cuatro, el shader de piel del personaje de la intro de Zafiro Alfa
+         * (25-10): esa escena, en la CPU para siempre. Si el compilador muere de
+         * verdad deja un psp2core del proceso (DumpSince::Compiler, arriba).
+         */
         if (dump == DumpSince::Gpu) {
             // Ver CrashDumpSince: murio la GPU, no el compilador. Sin aviso.
             sceIoRemove(kCompilingSourcePath);
@@ -1031,7 +1041,7 @@ void LoadBadSources() {
                                          "bytes: no se le culpa",
                                          interrupted.source_size)
                                  .c_str());
-        } else if (strikes >= allowed) {
+        } else if (!big && strikes >= allowed) {
             StoreBadSource(interrupted.source);
             if (g_died_sources.insert(interrupted.source).second) {
                 AppendRecord(kDiedPath, interrupted.source);
@@ -1053,10 +1063,15 @@ void LoadBadSources() {
             sceIoRemove(kCompilingSourcePath);
             WriteSuspect(interrupted.source, strikes);
             Common::VitaNote("gxm shader",
-                             fmt::format("la sesion anterior acabo compilando un shader de {} "
-                                         "bytes ({}a vez, {}): se "
-                                         "compilara otra vez, a la lista negra a la {}a",
-                                         interrupted.source_size, strikes, evidence, allowed)
+                             (big ? fmt::format("la sesion anterior acabo compilando un shader "
+                                                "de {} bytes ({}a vez, {}): es de los grandes, "
+                                                "se compilara otra vez",
+                                                interrupted.source_size, strikes, evidence)
+                                  : fmt::format("la sesion anterior acabo compilando un shader de "
+                                                "{} bytes ({}a vez, {}): se compilara otra vez, "
+                                                "a la lista negra a la {}a",
+                                                interrupted.source_size, strikes, evidence,
+                                                allowed))
                                  .c_str());
         }
     } else if (crashed_fd >= 0) {
@@ -1746,7 +1761,7 @@ const SceShaccCgCompileOutput* CompileCg(SceShaccCgTargetProfile profile, const 
     // 0.1.7.9: la salida pasa a un bloque nuestro y el compilador suelta todo
     // lo suyo. Si no hay memoria ni para la copia, se devuelve la original
     // (como antes de 0.1.7.9) y el compilador se queda como estaba.
-    const SceShaccCgCompileOutput* copy = CopyOutput(*output);
+    const SceShaccCgCompileOutput* copy = CopyOutput(*output, key.hash_city);
     if (copy == nullptr) {
         ClearCompilingMarker();
         return output;
@@ -1770,6 +1785,16 @@ const SceShaccCgCompileOutput* CompileCg(SceShaccCgTargetProfile profile, const 
                                         .c_str());
     }
     return copy;
+}
+
+void CgForgetInterruptedCompile() {
+    ClearCompilingMarker();
+}
+
+u64 CgOutputHash(const SceShaccCgCompileOutput* output) {
+    const std::lock_guard lock{g_outputs_mutex};
+    const auto it = g_cached_outputs.find(output);
+    return it != g_cached_outputs.end() ? it->second : 0;
 }
 
 void ReleaseCgOutput(const SceShaccCgCompileOutput* output) {

@@ -10,6 +10,7 @@
 #include <cerrno>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <exception>
 #include <memory>
@@ -1610,6 +1611,7 @@ void RunGame(vita2d_pgf* font, const std::string& path) {
             if ((loops % 16) == 0) {
                 SceCtrlData pad{};
                 sceCtrlPeekBufferPositive(0, &pad, 1);
+                pad.buttons |= VitaFrontend::Input::PilotButtons();
                 if ((pad.buttons & SCE_CTRL_START) && (pad.buttons & SCE_CTRL_SELECT)) {
                     user_quit = true;
                 }
@@ -1838,6 +1840,183 @@ void DrawStep(vita2d_pgf* font, const char* step, I18n::Str shown) {
     vita2d_swap_buffers();
 }
 
+/**
+ * EL PILOTO AUTOMATICO (0.3.8.2). Para medir sin nadie delante: si existe
+ * ux0:/data/azahar/piloto.txt, Azahar arranca el juego que dice, sin pasar por
+ * el menu, y pulsa los botones de su guion a su hora. Al terminar mantiene
+ * START+SELECT, que sale del juego como siempre. El fichero se gasta al leerlo
+ * (pasa a piloto_usado.txt): abrir Azahar a mano despues no lo repite.
+ *
+ *   juego=POKEMON ZAFIRO ALFA (OROCHI IORI).cci
+ *   salir=240
+ *   # segundo  botones   milisegundos   (desde que empieza a cargar el juego)
+ *   30 start 300
+ *   34 a 300
+ *   60 abajo 3000
+ *   70 a+derecha 500
+ *
+ * Botones con el nombre de la 3DS: a b x y l r start select arriba abajo
+ * izquierda derecha (unidos con +). Se pulsan como los de la Vita a los que
+ * estan asignados (ver ApplyDefaultMapping).
+ */
+constexpr char kPilotPath[] = "ux0:/data/azahar/piloto.txt";
+constexpr char kPilotUsedPath[] = "ux0:/data/azahar/piloto_usado.txt";
+
+struct PilotStep {
+    double at_s = 0;
+    unsigned int buttons = 0;
+    unsigned int hold_ms = 0;
+};
+struct Pilot {
+    std::string rom;
+    double exit_s = 0;
+    std::vector<PilotStep> steps;
+    std::atomic<bool> stop{false};
+};
+
+unsigned int PilotButtonMask(const std::string& names) {
+    static const std::pair<const char*, unsigned int> kNames[] = {
+        {"a", SCE_CTRL_CIRCLE},       {"b", SCE_CTRL_CROSS},        {"x", SCE_CTRL_TRIANGLE},
+        {"y", SCE_CTRL_SQUARE},       {"l", SCE_CTRL_LTRIGGER},     {"r", SCE_CTRL_RTRIGGER},
+        {"start", SCE_CTRL_START},    {"select", SCE_CTRL_SELECT},  {"arriba", SCE_CTRL_UP},
+        {"abajo", SCE_CTRL_DOWN},     {"izquierda", SCE_CTRL_LEFT}, {"derecha", SCE_CTRL_RIGHT},
+    };
+    unsigned int mask = 0;
+    std::size_t begin = 0;
+    while (begin <= names.size()) {
+        const std::size_t end = std::min(names.find('+', begin), names.size());
+        const std::string name = names.substr(begin, end - begin);
+        for (const auto& [known, bit] : kNames) {
+            if (name == known) {
+                mask |= bit;
+            }
+        }
+        begin = end + 1;
+    }
+    return mask;
+}
+
+bool LoadPilot(Pilot& pilot) {
+    const SceUID fd = sceIoOpen(kPilotPath, SCE_O_RDONLY, 0);
+    if (fd < 0) {
+        return false;
+    }
+    std::string text;
+    char buffer[1024];
+    int read = 0;
+    while ((read = sceIoRead(fd, buffer, sizeof(buffer))) > 0) {
+        text.append(buffer, static_cast<std::size_t>(read));
+    }
+    sceIoClose(fd);
+    // Gastado: abrir Azahar a mano despues no vuelve a pilotar.
+    sceIoRemove(kPilotUsedPath);
+    sceIoRename(kPilotPath, kPilotUsedPath);
+    std::size_t begin = 0;
+    while (begin < text.size()) {
+        std::size_t end = text.find('\n', begin);
+        if (end == std::string::npos) {
+            end = text.size();
+        }
+        std::string line = text.substr(begin, end - begin);
+        begin = end + 1;
+        if (const std::size_t hash = line.find('#'); hash != std::string::npos) {
+            line.resize(hash);
+        }
+        while (!line.empty() && (line.back() == '\r' || line.back() == ' ')) {
+            line.pop_back();
+        }
+        if (line.empty()) {
+            continue;
+        }
+        if (line.rfind("juego=", 0) == 0) {
+            pilot.rom = line.substr(6);
+        } else if (line.rfind("salir=", 0) == 0) {
+            pilot.exit_s = std::atof(line.c_str() + 6);
+        } else {
+            char names[128] = {};
+            double at = 0;
+            unsigned int hold = 0;
+            if (std::sscanf(line.c_str(), "%lf %127s %u", &at, names, &hold) == 3) {
+                pilot.steps.push_back({at, PilotButtonMask(names), hold});
+            }
+        }
+    }
+    std::sort(pilot.steps.begin(), pilot.steps.end(),
+              [](const PilotStep& a, const PilotStep& b) { return a.at_s < b.at_s; });
+    return !pilot.rom.empty();
+}
+
+/// Duerme hasta 'until_us' (reloj de proceso) en trozos, para poder parar.
+bool PilotSleepUntil(const Pilot& pilot, SceUInt64 until_us) {
+    while (!pilot.stop.load(std::memory_order_relaxed)) {
+        const SceUInt64 now = sceKernelGetProcessTimeWide();
+        if (now >= until_us) {
+            return true;
+        }
+        sceKernelDelayThread(static_cast<SceUInt32>(std::min<SceUInt64>(until_us - now, 50000)));
+    }
+    return false;
+}
+
+void* PilotMain(void* arg) {
+    Pilot& pilot = *static_cast<Pilot*>(arg);
+    const SceUInt64 start = sceKernelGetProcessTimeWide();
+    for (const PilotStep& step : pilot.steps) {
+        if (!PilotSleepUntil(pilot, start + static_cast<SceUInt64>(step.at_s * 1e6))) {
+            return nullptr;
+        }
+        VitaFrontend::Input::SetPilotButtons(step.buttons);
+        PilotSleepUntil(pilot, sceKernelGetProcessTimeWide() + step.hold_ms * 1000ull);
+        VitaFrontend::Input::SetPilotButtons(0);
+    }
+    if (pilot.exit_s > 0 &&
+        PilotSleepUntil(pilot, start + static_cast<SceUInt64>(pilot.exit_s * 1e6))) {
+        Common::VitaNote("piloto", "fin del guion: START+SELECT para salir del juego");
+        VitaFrontend::Input::SetPilotButtons(SCE_CTRL_START | SCE_CTRL_SELECT);
+        PilotSleepUntil(pilot, sceKernelGetProcessTimeWide() + 3'000'000ull);
+        VitaFrontend::Input::SetPilotButtons(0);
+    }
+    return nullptr;
+}
+
+/// Si hay piloto.txt, juega su partida antes de enseñar el menu.
+void RunPilotIfAny(vita2d_pgf* font, const std::vector<RomEntry>& roms) {
+    Pilot pilot;
+    if (!LoadPilot(pilot)) {
+        return;
+    }
+    const auto rom = std::find_if(roms.begin(), roms.end(),
+                                  [&](const RomEntry& entry) { return entry.name == pilot.rom; });
+    if (rom == roms.end()) {
+        Common::VitaNote("piloto", fmt::format("no esta el juego '{}'", pilot.rom).c_str());
+        return;
+    }
+    Common::VitaNote("piloto", fmt::format("{}: {} pasos, salir a los {:.0f} s", pilot.rom,
+                                           pilot.steps.size(), pilot.exit_s)
+                                   .c_str());
+    pthread_t thread{};
+    const bool started = pthread_create(&thread, nullptr, &PilotMain, &pilot) == 0;
+    RunGame(font, rom->path);
+    pilot.stop.store(true, std::memory_order_relaxed);
+    if (started) {
+        pthread_join(thread, nullptr);
+    }
+    VitaFrontend::Input::SetPilotButtons(0);
+    if (pilot.exit_s > 0) {
+        /**
+         * Y AZAHAR SE CIERRA SOLO (0.3.8.3). Matarlo desde fuera (quit all de
+         * vitacompanion) en plena compilacion de un shader dejaba la marca de
+         * "compilando" puesta, y el siguiente arranque lo contaba como aviso
+         * contra ese shader: el bucle de pruebas acabaria mandando shaders
+         * sanos a la lista negra. Un segundo y medio para que salgan las notas.
+         */
+        Gxm::CgForgetInterruptedCompile();
+        Common::VitaNote("piloto", "partida terminada: Azahar se cierra");
+        sceKernelDelayThread(1500 * 1000);
+        sceKernelExitProcess(0);
+    }
+}
+
 /// Los argumentos de main(), para Core::Native::LoadModuleIfMissing.
 int g_argc = 0;
 char** g_argv = nullptr;
@@ -1902,6 +2081,7 @@ void Run(vita2d_pgf* font) {
     VitaFrontend::HomeMenu menu(font);
     const std::vector<RomEntry> roms = ScanRoms();
     menu.SetGames(roms);
+    RunPilotIfAny(font, roms);
     // Las caratulas que falten, en otro hilo (0.3.4.1). Ver vita_covers.h.
     std::vector<std::string> rom_paths;
     for (const RomEntry& rom : roms) {
