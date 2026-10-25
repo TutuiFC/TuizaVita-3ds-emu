@@ -1365,18 +1365,45 @@ private:
                  * uniform entero. Se escribe como un for corriente; el numero
                  * de vueltas es dinamico (sale del uniform), que es control de
                  * flujo que la USSE si sabe hacer.
+                 *
+                 * EL TOPE DE 255, Y POR QUE NO SE PUEDE CONFIAR EN EL UNIFORM
+                 * (0.3.7.4). El contador de LOOP de la PICA es de 8 bits
+                 * (uniforms.i es Vec4<u8>), asi que 255 es el maximo que el
+                 * hardware puede dar y recortar aqui no cambia ningun resultado.
+                 * Lo que cambia es lo que pasa cuando el uniform NO llega: el
+                 * buffer de uniformes por defecto de GXM se reserva por lote y
+                 * lo que no se escribe queda indefinido, asi que un
+                 * sceGxmReserveVertexDefaultUniformBuffer que falle -- o un
+                 * "vs_i" que el compilador haya renombrado y no se encuentre --
+                 * dejaba este tope en basura. Un for sin tope en un shader de
+                 * vertices que corre para 28.000 vertices no da un fallo: deja
+                 * la GPU girando hasta que salta el perro guardian del driver,
+                 * y eso es un GPUCRASH que se lleva la consola entera.
+                 *
+                 * Asi murio la intro de Zafiro Alfa (la bicicleta) en cada
+                 * intento del 24-10: psp2core-*-GPUCRASH, siempre en el mismo
+                 * punto, y los cuatro volcados GPUCRASH anteriores (5, 19, 22 y
+                 * 23-10, en otros juegos) tambien caen en escenas cargadas. Con
+                 * el recorte, lo peor que puede hacer un uniform perdido es
+                 * dibujar mal un lote.
+                 *
+                 * El tope va como una segunda comparacion y no como min(), a
+                 * proposito: min() con enteros depende de como resuelva
+                 * SceShaccCg la sobrecarga, y un shader que no compila en la
+                 * consola cuesta una partida entera de diagnostico. Dos
+                 * comparaciones no dependen de nada.
                  */
                 const u32 id = instr.flow_control.int_uniform_id.Value();
                 const std::string loop_var = fmt::format("loop{}", offset);
                 ForgetRelReads();
                 if (FloatAddress()) {
                     shader.AddLine("address_registers.z = vs_i[{}].y;", id);
-                    shader.AddLine("for (int {0} = 0; {0} <= (int)vs_i[{1}].x; "
+                    shader.AddLine("for (int {0} = 0; {0} <= 255 && {0} <= (int)vs_i[{1}].x; "
                                    "address_registers.z += vs_i[{1}].z, ++{0}) {{",
                                    loop_var, id);
                 } else {
                     shader.AddLine("address_registers.z = (int)vs_i[{}].y;", id);
-                    shader.AddLine("for (int {0} = 0; {0} <= (int)vs_i[{1}].x; "
+                    shader.AddLine("for (int {0} = 0; {0} <= 255 && {0} <= (int)vs_i[{1}].x; "
                                    "address_registers.z += (int)vs_i[{1}].z, ++{0}) {{",
                                    loop_var, id);
                 }

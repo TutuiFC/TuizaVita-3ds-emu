@@ -6,6 +6,7 @@
 #include <cstring>
 #include <memory>
 #include "core/arm/dyncom/arm_dyncom.h"
+#include "core/arm/native/arm_native.h"
 #include "core/arm/dyncom/arm_dyncom_interpreter.h"
 #include "core/arm/dyncom/arm_dyncom_trans.h"
 #include "core/arm/skyeye_common/armstate.h"
@@ -58,10 +59,22 @@ void ARM_DynCom::ClearInstructionCache() {
     // invalidacion explicita de rango, sea cual sea el tamano del buffer. Ver
     // GetTransCacheFlushCounts.
     ResetTransCacheFromInvalidation();
+#ifdef __PSVITA__
+    // Lo mismo que en InvalidateCacheRange: esto se llama en cada cambio de
+    // proceso y en cada invalidacion explicita, y en los dos casos el codigo
+    // que el invitado va a ejecutar puede haber cambiado bajo la cache de
+    // instrucciones del chip.
+    Core::Native::CodeChanged();
+#endif
 }
 
 void ARM_DynCom::InvalidateCacheRange(u32 start_address, std::size_t length) {
     ResetTransCacheFromRange(start_address, length);
+#ifdef __PSVITA__
+    // El codigo del invitado cambio: la cache de instrucciones del chip tambien
+    // hay que tirarla, no solo la de traduccion. Ver Core::Native::CodeChanged.
+    Core::Native::CodeChanged();
+#endif
 }
 
 void ARM_DynCom::SetPageTable(const std::shared_ptr<Memory::PageTable>& page_table) {
@@ -87,6 +100,25 @@ void ARM_DynCom::SetPageTable(const std::shared_ptr<Memory::PageTable>& page_tab
         return;
     }
     current_page_table = page_table;
+#ifdef __PSVITA__
+    /**
+     * EL ESPEJO DE LA TABLA EN LA MMU (0.3.6.2, ver core/arm/native). De momento
+     * no ejecuta nada nativo: solo refleja las paginas del 3DS en la tabla TTBR0
+     * del modulo de kernel y apunta cuantas son y lo que cuesta. Si el modulo no
+     * esta cargado no hace nada.
+     *
+     * VA AQUI, DESPUES DE LA COMPROBACION DE CAMBIO, y es importante: la nota de
+     * arriba ya avisaba de que SetPageTable se llama cuatro veces por rodaja con
+     * la MISMA tabla, miles de veces por segundo. En 0.3.6.2 lo puse ANTES "para
+     * que la primera vez refleje aunque la tabla sea la de siempre", y reflejar
+     * recorre un millon de entradas: el emulador se arrastraba. Es el mismo error
+     * que ya se habia cometido y corregido con la cache de traduccion, descrito
+     * tres parrafos mas arriba, y lo repeti habiendolo leido.
+     */
+    if (page_table && Core::Native::Available()) {
+        Core::Native::MirrorPageTable(page_table->RawPointers());
+    }
+#endif
     ClearInstructionCache();
 }
 
@@ -159,6 +191,31 @@ void ARM_DynCom::ExecuteInstructions(u64 num_instructions) {
     const bool timed = (++slice_tick & 3u) == 0;
     const unsigned long long slice_begin = timed ? Common::VitaMicros() : 0;
     Core::ArmJit::PmuSliceBegin();
+#endif
+#ifdef __PSVITA__
+    /**
+     * LA RODAJA EN NATIVO, SI SE PUEDE (0.3.6.7, ver core/arm/native).
+     *
+     * Va aqui, antes del interprete, y el reparto es deliberadamente cobarde:
+     * TryRun se queda con lo facil y en cuanto pasa cualquier cosa que no sabe
+     * tratar devuelve el estado exacto en el que esta y dice que no. Entonces
+     * el interprete sigue desde ahi con el codigo que ya existe, incluida la
+     * instruccion que provoco la salida. Lo peor que puede hacer una ejecucion
+     * nativa es no hacer nada.
+     *
+     * Apagado por defecto (ajuste "jit_nativo="): esto ejecuta codigo del juego
+     * directamente en la CPU de la consola.
+     */
+    {
+        u32 native_ticks = 0;
+        if (Core::Native::TryRun(*state, num_instructions, native_ticks)) {
+            if (timer) {
+                timer->AddTicks(native_ticks);
+            }
+            state->ServeBreak();
+            return;
+        }
+    }
 #endif
     const u32 ticks_executed = InterpreterMainLoop(state.get());
 #ifdef __PSVITA__

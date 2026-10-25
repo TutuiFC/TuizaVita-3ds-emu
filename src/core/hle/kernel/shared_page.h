@@ -133,7 +133,16 @@ private:
     Core::TimingEventType* update_time_event;
     std::chrono::seconds init_time;
 
-    SharedPageDef shared_page;
+/**
+ * ALINEADA A PAGINA (0.3.6.5). La ejecucion nativa mapea esta pagina en la
+ * direccion del 3DS a traves de la MMU de la Vita, y la MMU solo sabe mapear
+ * paginas de 4 KB alineadas. Sin esto, el log del 24-10 decia "2 paginas sin
+ * alinear" -- esta y la de SharedPage, las dos unicas del mapa del 3DS que no
+ * salen de los buffers de core/memory.cpp -- y el invitado no las podia leer.
+ * El 3DS las usa de verdad: la hora del sistema, el modelo de consola, el
+ * estado de la bateria.
+ */
+    alignas(0x1000) SharedPageDef shared_page;
 
     template <class Archive>
     void serialize(Archive& ar, const unsigned int);

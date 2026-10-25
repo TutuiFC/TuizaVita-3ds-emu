@@ -2536,7 +2536,21 @@ std::string Core::TakeSvcProfile() {
     }
     std::sort(rows.begin(), rows.end(),
               [](const Row& a, const Row& b) { return a.timed_us > b.timed_us; });
-    std::string text = "ms por s:";
+    /**
+     * EL TOTAL, NO SOLO LAS OCHO CARAS (0.3.5.5). Abajo solo se listan las ocho
+     * que mas tiempo se llevan, asi que sumarlas no da el numero de SVC que
+     * hace el juego. Y ese numero es justo el que decide si la ejecucion
+     * nativa merece la pena: cada SVC del invitado sera una salida del mundo
+     * nativo, medida en 4,9 us en el modulo de kernel. A 3.000 por fotograma
+     * se comeria toda la ganancia; a 150 no se nota.
+     */
+    unsigned long long total_calls = 0;
+    for (const Row& row : rows) {
+        total_calls += row.calls;
+    }
+    std::string text =
+        fmt::format("TOTAL {}/s en {} svc distintas | ms por s:",
+                    total_calls * 1000000ull / wall, rows.size());
     for (std::size_t i = 0; i < rows.size() && i < 8; i++) {
         const char* name = Kernel::g_svc_costs[rows[i].number].name.load(std::memory_order_relaxed);
         text += fmt::format(" {} {:.1f} ({}/s)", name != nullptr ? name : "?",

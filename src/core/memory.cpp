@@ -25,6 +25,7 @@
 #include "core/global.h"
 #include "core/hle/kernel/process.h"
 #include "core/hle/service/plgldr/plgldr.h"
+#include "core/arm/native/arm_native.h"
 #include "core/memory.h"
 #include "video_core/gpu.h"
 #include "video_core/renderer_base.h"
@@ -150,6 +151,39 @@ static u32 GetFCRAMAllocSize() {
 #endif
 }
 
+/**
+ * LA MEMORIA DEL 3DS, ALINEADA A PAGINA (0.3.6.4).
+ *
+ * `make_unique<u8[]>` alinea a 8 bytes, y eso basta para emular por software.
+ * Pero la ejecucion nativa mapea estas mismas paginas en las direcciones del
+ * 3DS a traves de la MMU de la Vita, y la MMU solo sabe mapear paginas de
+ * 4 KB ALINEADAS. Con el buffer desalineado, la primera medicion en hardware
+ * dio `va 00100000 -> pa 4d063e68`: todas las paginas corridas 3.688 bytes, y
+ * el invitado habria leido datos desplazados -- un fallo que no se habria
+ * manifestado hasta mucho despues y de forma incomprensible.
+ *
+ * Alinear no cuesta nada (4 KB de mas por buffer, cuatro buffers) y vale en
+ * todas las plataformas, asi que se hace siempre y no solo en la Vita.
+ */
+constexpr std::size_t kGuestRamAlign = 0x1000;
+
+struct GuestRam {
+    std::unique_ptr<u8[]> raw;
+    u8* ptr = nullptr;
+
+    GuestRam() = default;
+    explicit GuestRam(std::size_t size)
+        : raw{std::make_unique<u8[]>(size + kGuestRamAlign)} {
+        const auto base = reinterpret_cast<std::uintptr_t>(raw.get());
+        ptr = raw.get() + ((kGuestRamAlign - (base & (kGuestRamAlign - 1))) &
+                           (kGuestRamAlign - 1));
+    }
+
+    u8* get() const {
+        return ptr;
+    }
+};
+
 class MemorySystem::Impl {
 public:
     // Debe declararse antes que fcram: los miembros se inicializan en orden de
@@ -158,10 +192,10 @@ public:
 
     // Visual Studio would try to allocate these on compile time
     // if they are std::array which would exceed the memory limit.
-    std::unique_ptr<u8[]> fcram = std::make_unique<u8[]>(fcram_size);
-    std::unique_ptr<u8[]> vram = std::make_unique<u8[]>(Memory::VRAM_SIZE);
-    std::unique_ptr<u8[]> n3ds_extra_ram = std::make_unique<u8[]>(Memory::N3DS_EXTRA_RAM_SIZE);
-    std::unique_ptr<u8[]> dsp_ram = std::make_unique<u8[]>(Memory::DSP_RAM_SIZE);
+    GuestRam fcram{fcram_size};
+    GuestRam vram{Memory::VRAM_SIZE};
+    GuestRam n3ds_extra_ram{Memory::N3DS_EXTRA_RAM_SIZE};
+    GuestRam dsp_ram{Memory::DSP_RAM_SIZE};
 
     Core::System& system;
     std::shared_ptr<PageTable> current_page_table = nullptr;
@@ -582,6 +616,9 @@ void MemorySystem::UnregisterWatchpoint(const Kernel::Process& process, VAddr ad
 
 void MemorySystem::MapPages(PageTable& page_table, u32 base, u32 size, MemoryRef memory,
                             PageType type) {
+#ifdef __PSVITA__
+    const u32 start = base;
+#endif
     LOG_DEBUG(HW_Memory, "Mapping {} onto {:08X}-{:08X}", (void*)memory.GetPtr(),
               base * CITRA_PAGE_SIZE, (base + size) * CITRA_PAGE_SIZE);
 
@@ -607,6 +644,24 @@ void MemorySystem::MapPages(PageTable& page_table, u32 base, u32 size, MemoryRef
         if (memory != nullptr && memory.GetSize() > CITRA_PAGE_SIZE)
             memory += CITRA_PAGE_SIZE;
     }
+
+#ifdef __PSVITA__
+    /**
+     * Y a la MMU del invitado (0.3.7.1, ver core/arm/native). Aqui pasan TODOS
+     * los mapeos y desmapeos del espacio del 3DS, asi que es el unico sitio
+     * desde el que la vista del invitado puede mantenerse al dia. Reflejar solo
+     * cuando cambia el objeto de la tabla no basta: durante el arranque el
+     * emulador va mapeando el heap, el TLS y la pagina compartida sobre la MISMA
+     * tabla, y sin esto el invitado se queda con una vista congelada -- lo que
+     * colgo Zafiro Alfa girando en un bucle de espera sobre memoria vieja.
+     *
+     * Solo la tabla del proceso que esta corriendo: reflejar la de otro pondria
+     * en la MMU direcciones que no son las que el invitado va a ver.
+     */
+    if (impl->current_page_table.get() == &page_table) {
+        Core::Native::MirrorRange(page_table.RawPointers(), start, size);
+    }
+#endif
 }
 
 void MemorySystem::MapMemoryRegion(PageTable& page_table, VAddr base, u32 size, MemoryRef target) {

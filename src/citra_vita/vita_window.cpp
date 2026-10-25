@@ -19,6 +19,7 @@
 #include "core/arm/dyncom/arm_dyncom_trans.h"
 #include "common/vita_diag.h"
 #include "common/vita_threads.h"
+#include "core/arm/native/arm_native.h"
 #include "core/core.h"
 #include "core/vita_loop_profile.h"
 #include "video_core/gpu.h"
@@ -1456,6 +1457,7 @@ void EmuWindow_Vita::DrawStatsOverlay() {
                                  Gxm::RasterizerGXM::TakeSurfaceSummary().c_str());
                 Common::VitaNote("copias", Gxm::RasterizerGXM::TakeCopySummary().c_str());
                 Common::VitaNote("jit otro", Core::ArmJit::TakeRejectWords().c_str());
+                Core::Native::LogStats();
                 Common::VitaNote("bucle", Core::TakeLoopProfile().c_str());
                 Common::VitaNote("eventos", Core::TakeTimingProfile().c_str());
                 Common::VitaNote("svc", Core::TakeSvcProfile().c_str());

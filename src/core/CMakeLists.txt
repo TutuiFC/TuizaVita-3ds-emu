@@ -3,6 +3,8 @@ add_library(citra_core STATIC EXCLUDE_FROM_ALL
     arm/arm_interface.h
     arm/exception_handler.cpp
     arm/exception_handler.h
+    arm/native/arm_native.cpp
+    arm/native/arm_native.h
     arm/dyncom/arm_dyncom.cpp
     arm/dyncom/arm_dyncom.h
     arm/dyncom/arm_dyncom_dec.cpp
@@ -506,6 +508,57 @@ if (ENABLE_BUILTIN_KEYBLOB)
 endif()
 
 create_target_directory_groups(citra_core)
+
+# Los stubs del modulo de kernel nativo, con enlace DEBIL (0.3.6.2). Se
+# generan con vita-elf-export/vita-libs-gen desde el spike de ejecucion
+# nativa (la carpeta 'nativo' junto a esta): si se cambia la API del modulo,
+# hay que volver a copiarlos.
+#
+# Debil importa: asi, si el modulo no esta cargado, el ejecutable arranca
+# igualmente y los stubs quedan sin resolver. Core::Native los comprueba antes
+# de llamar a ninguno y, si no estan, el emulador funciona exactamente como
+# antes con el JIT. Con enlace fuerte el ejecutable NO cargaria sin el modulo.
+if(VITA)
+  # LA CABECERA DEL MODULO, COPIADA SOLA. aznative.h lleva AZ_NATIVE_VERSION, y
+  # si la copia de aqui se queda atras Azahar se niega a usar el modulo por
+  # desajuste de version -- un fallo silencioso que ya ha costado dos arranques
+  # inutiles de la consola. La fuente de verdad es el spike, en la carpeta
+  # 'nativo' junto a esta; si no esta, se usa la copia que haya.
+  # Se prueban las dos formas de llegar: por el enlace sin espacios con el que
+  # se compila (C:/Users/guira/aznat) y por la carpeta hermana del arbol real.
+  set(AZNATIVE_SRC_HEADER "")
+  foreach(CANDIDATO "C:/Users/guira/aznat/common/aznative.h"
+                    "${CMAKE_SOURCE_DIR}/../nativo/common/aznative.h")
+    if(EXISTS "${CANDIDATO}")
+      set(AZNATIVE_SRC_HEADER "${CANDIDATO}")
+      break()
+    endif()
+  endforeach()
+  if(AZNATIVE_SRC_HEADER)
+    configure_file("${AZNATIVE_SRC_HEADER}"
+                   "${CMAKE_CURRENT_SOURCE_DIR}/arm/native/aznative.h" COPYONLY)
+    message(STATUS "aznative.h copiado del spike")
+  endif()
+  # Y los stubs, por lo mismo: si se anade una funcion al modulo y aqui no esta
+  # su .S, el enlazador se queja (eso al menos es ruidoso, no silencioso como
+  # la version de la cabecera). Se copian del directorio de compilacion del
+  # spike, que es donde vita-libs-gen los deja.
+  set(AZNATIVE_STUB_DIR "C:/Users/guira/aznat/build/kernel/stubs")
+  if(EXISTS "${AZNATIVE_STUB_DIR}")
+    file(GLOB AZNATIVE_GEN_STUBS "${AZNATIVE_STUB_DIR}/*.S")
+    foreach(STUB ${AZNATIVE_GEN_STUBS})
+      get_filename_component(STUB_NAME "${STUB}" NAME)
+      configure_file("${STUB}" "${CMAKE_CURRENT_SOURCE_DIR}/arm/native/${STUB_NAME}" COPYONLY)
+    endforeach()
+    message(STATUS "stubs de aznative copiados del spike")
+  endif()
+  file(GLOB AZNATIVE_STUB_SRCS "${CMAKE_CURRENT_SOURCE_DIR}/arm/native/*.S")
+  if(AZNATIVE_STUB_SRCS)
+    add_library(aznative_stub STATIC ${AZNATIVE_STUB_SRCS})
+    target_compile_options(aznative_stub PRIVATE "-Wa,--defsym,GEN_WEAK_EXPORTS=1")
+    target_link_libraries(citra_core PRIVATE aznative_stub)
+  endif()
+endif()
 
 target_link_libraries(citra_core PUBLIC citra_common PRIVATE audio_core network video_core)
 target_link_libraries(citra_core PRIVATE Boost::boost Boost::serialization Boost::iostreams httplib)

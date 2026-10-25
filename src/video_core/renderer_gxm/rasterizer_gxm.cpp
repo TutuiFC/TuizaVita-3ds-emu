@@ -28,6 +28,7 @@
 #include "video_core/pica/regs_rasterizer.h"
 #include "video_core/pica_types.h"
 #include "video_core/utils.h"
+#include "video_core/renderer_gxm/gxm_caja_negra.h"
 #include "video_core/renderer_gxm/gxm_cg.h"
 #include "video_core/renderer_gxm/gxm_presenter.h"
 #include "video_core/renderer_gxm/gxm_texture_cache.h"
@@ -69,6 +70,8 @@ std::atomic<u32> RasterizerGXM::present_writeback_every{4};
 std::atomic<u32> RasterizerGXM::texture_copy_gpu{0};
 std::atomic<u32> RasterizerGXM::wbuffer_on_gpu{1};
 std::atomic<u32> RasterizerGXM::memo_by_value{1};
+std::atomic<u32> RasterizerGXM::vs_layout_cache{1};
+std::atomic<u32> RasterizerGXM::cache_pipeline{1};
 std::atomic<u32> RasterizerGXM::vs_compile_limit_kb{23};
 std::atomic<u32> RasterizerGXM::state_shadow_enabled{1};
 std::atomic<u32> RasterizerGXM::resolution_scale{2};
@@ -100,8 +103,81 @@ unsigned long long g_copy_calls = 0;
 unsigned long long g_data_reserve_us = 0;
 unsigned long long g_data_copy_us = 0;
 unsigned long long g_data_index_us = 0;
+/**
+ * LA FASE "vs" POR PARTES (0.3.5.6). Dos veces he dado por hecho que esos
+ * 12-16 us por lote eran rehacer la disposicion, y las dos me he equivocado:
+ * la cache acierta el 100 % y aun asi la fase no baja. Entre phase(0) y
+ * phase(1) hay tres cosas distintas -- el barrido de indices para hallar
+ * min/max, la busqueda en la cache, y rehacer la disposicion cuando no esta --
+ * y hasta no cronometrarlas por separado no hay forma de saber cual pesa. Se
+ * miden en los mismos lotes que el resto (1 de cada 8).
+ */
+/**
+ * CUANTO DE LO QUE SE SUBE YA SE HABIA SUBIDO (0.3.5.9).
+ *
+ * "copiar" son 33 us por lote (10 KB a 300 MB/s contra memoria sin cache) y es
+ * la fase mas cara del hilo de la GPU: 3,9 ms de los 35. Ni NEON ni prefetch
+ * la mueven, porque el muro esta en la escritura. Lo unico que queda es no
+ * copiar, y eso solo se puede si el juego sube los MISMOS bytes una y otra vez
+ * (geometria estatica redibujada cada fotograma).
+ *
+ * Primero se midio hasheando el contenido, y eso cerro esa puerta: hashear
+ * 10 KB cuesta ~46 us (la fase "copiar" paso de 33 a 79,7), MAS que copiarlos.
+ * Una cache que compare contenidos pagaria 46 para ahorrar 33 incluso
+ * acertando siempre. Asi que la clave tiene que ser direccion + tamano, que es
+ * gratis, y la validez tendria que venir de las invalidaciones que el
+ * emulador ya recibe cuando el invitado escribe en esa memoria. Esto de aqui
+ * mide con esa clave cuanto se repite; la tabla es de mapeo directo y se vacia
+ * en cada volcado, asi que el numero es "repetido dentro de la ventana".
+ */
+constexpr std::size_t kUploadSeenSlots = 4096;
+std::array<u64, kUploadSeenSlots> g_upload_seen{};
+unsigned long long g_upload_streams = 0;
+unsigned long long g_upload_repeats = 0;
+unsigned long long g_upload_bytes = 0;
+unsigned long long g_upload_repeat_bytes = 0;
+unsigned long long g_upload_hash_us = 0;
+unsigned long long g_upload_hash_samples = 0;
+
+unsigned long long g_vs_indices_us = 0;
+unsigned long long g_vs_cache_us = 0;
+unsigned long long g_vs_build_part_us = 0;
+unsigned long long g_vs_part_samples = 0;
 unsigned long long g_data_bytes = 0;
 unsigned long long g_data_samples = 0;
+/**
+ * COPIAR PIDIENDO EL ORIGEN POR ADELANTADO: TAMPOCO SIRVE (0.3.5.9).
+ *
+ * Con los indices, el prefetch fue un 4,6x (ver IndexRangeU16), asi que se
+ * probo lo mismo aqui, copiando por trozos de 1 KB y pidiendo el siguiente
+ * por adelantado. Medido: 33,3 us por 10.070 bytes = 302 MB/s, contra 32,6 us
+ * por 10.153 = 311 MB/s sin el. Igual o un pelin peor.
+ *
+ * Y tiene sentido: el barrido de indices es lectura pura y ahi la espera a la
+ * memoria lo era todo; esta copia esta limitada por el lado de la ESCRITURA,
+ * que va a memoria sin cache a ~300 MB/s pase lo que pase con el origen.
+ * Pedir el origen por adelantado no mueve ese muro. Queda escrito para no
+ * reintentarlo: lo unico que abarata esta copia es copiar MENOS.
+ */
+
+/**
+ * LA COPIA DE VERTICES: NEON NO SIRVE (medido el 24-10, 0.3.5.4).
+ *
+ * El anillo de vertices vive en memoria SIN CACHE (Pool::Host, ver
+ * vertex_ring_host): la GPU no es coherente con la cache de la CPU y desde
+ * usuario no se puede limpiar -- SCTLR.UCI = 0 en la Vita, leido con el modulo
+ * nativo, y sceKernelSyncVMDomain cuesta 51 us por 4 KB, mas que la copia
+ * entera. Copiar ahi va a 273 MB/s en un Cortex-A9 que deberia dar varios GB/s,
+ * asi que la idea era que con almacenamientos de 32 bytes (NEON) el buffer de
+ * escritura los juntara en rafagas.
+ *
+ * Se probo con los lotes pares por memcpy y los impares por NEON en la misma
+ * partida, y NEON salio a 111 MB/s: DOS VECES Y MEDIA MAS LENTO, consistente
+ * en todas las muestras. El vst1.8 de 32 bytes a memoria no cacheada no se
+ * fusiona, se parte. Queda escrito aqui para no volver a intentarlo: si algun
+ * dia hay que abaratar esta copia, el camino es copiar MENOS, no copiar con
+ * instrucciones mas anchas.
+ */
 /**
  * Programas de vertices nuevos (HwShaderCache::Build, 0.3.1.4): cuantos, lo que
  * cuestan en el hilo de la GPU y cuanto de eso es traducir. En crash.txt de
@@ -109,6 +185,10 @@ unsigned long long g_data_samples = 0;
  * y no habia forma de saber en que.
  */
 std::atomic<u32> g_vs_builds{0};
+/// Pipelines de fragmentos servidos por huella sin construir el FSConfig (0.3.6.1).
+std::atomic<u32> g_pipeline_hits{0};
+/// Disposiciones servidas desde la cache en vez de rehacerlas (0.3.5.0).
+std::atomic<u32> g_layout_hits{0};
 /// Programas de vertices leidos de la cache por el indice, sin traducir (0.3.2.8).
 std::atomic<u32> g_vs_index_hits{0};
 std::atomic<unsigned long long> g_vs_build_us{0};
@@ -2474,11 +2554,27 @@ constexpr u16 kMemoIgnoredRegs[] = {
  * espera el juego. De ocho en ocho (o de dieciseis, los de un byte) y con el
  * mismo resultado.
  */
+/**
+ * PIDIENDO LAS LINEAS POR ADELANTADO (0.3.5.7).
+ *
+ * Este barrido ya estaba en NEON (ocho indices por instruccion) y aun asi se
+ * lleva 12,4 us por lote en Zafiro, que es 1,4 ms por fotograma: medido con
+ * los relojes por partes de 0.3.5.6 ("vs por partes: indices 14,2 us", menos
+ * 1,8 de leer el reloj). Con ~700 indices por lote el calculo son unos cientos
+ * de ciclos, asi que el tiempo no se va en calcular sino en ESPERAR: son 1,4 KB
+ * de memoria del invitado que no estan en la cache, o sea una veintena de
+ * fallos de linea seguidos a ~100 ciclos cada uno.
+ *
+ * Contra eso NEON no puede hacer nada, pero el prefetch si: se piden las
+ * lineas dos vueltas por delante para que lleguen mientras se trabaja con las
+ * de ahora. 'pld' no bloquea y si la linea ya estaba no cuesta nada.
+ */
 void IndexRangeU16(const u16* in, u32 count, u32& min_index, u32& max_index) {
     uint16x8_t low = vdupq_n_u16(0xFFFF);
     uint16x8_t high = vdupq_n_u16(0);
     u32 i = 0;
     for (; i + 8 <= count; i += 8) {
+        __builtin_prefetch(in + i + 64);
         const uint16x8_t v = vld1q_u16(in + i);
         low = vminq_u16(low, v);
         high = vmaxq_u16(high, v);
@@ -2504,6 +2600,7 @@ void IndexRangeU8(const u8* in, u32 count, u32& min_index, u32& max_index) {
     uint8x16_t high = vdupq_n_u8(0);
     u32 i = 0;
     for (; i + 16 <= count; i += 16) {
+        __builtin_prefetch(in + i + 128);
         const uint8x16_t v = vld1q_u8(in + i);
         low = vminq_u8(low, v);
         high = vmaxq_u8(high, v);
@@ -2625,6 +2722,140 @@ constexpr std::array<u64, 12> kVsBoolMask = RegListMask({0x2B0});
 constexpr std::array<u64, 12> kVsFromFsMask =
     RegListMask({0x04F, 0x050, 0x051, 0x052, 0x053, 0x054, 0x055, 0x056, 0x1C6});
 
+/**
+ * REGISTROS QUE CAMBIAN EN CADA LOTE PERO NO DECIDEN LA DISPOSICION (0.3.5.1).
+ *
+ * El memo invalida la disposicion con TODO el rango 0x200-0x2FF, y ahi dentro
+ * viven las direcciones del lote: la base de los atributos (0x200), el
+ * desplazamiento de cada uno de los 12 cargadores (0x203 + 3i), los indices
+ * (0x227), el numero de vertices (0x228), el primer vertice (0x22A), los dos
+ * disparos de dibujado (0x22E y 0x22F), el puerto de los atributos por defecto
+ * (0x232-0x235) y los buffers de ordenes (0x238-0x23D). Ninguno aparece en la
+ * disposicion que se construye mas abajo: esta se arma con los formatos
+ * (0x201-0x202), las componentes y el paso de cada cargador (0x204+3i,
+ * 0x205+3i) y el mapa de entradas del shader. Las direcciones se aplican
+ * despues, al subir los datos del lote.
+ *
+ * Por eso van fuera de la huella de la cache: con ellas dentro, dos lotes del
+ * mismo modelo en sitios distintos de la memoria daban huellas distintas y la
+ * cache no acertaba NUNCA (crash.txt del 23-10: "disp reusada 0" en las cinco
+ * muestras, con 5.279 reconstrucciones de 14.943 lotes).
+ */
+constexpr bool IsPerDrawReg(u32 reg) {
+    if (reg == 0x200 || reg == 0x227 || reg == 0x228 || reg == 0x22A || reg == 0x22E ||
+        reg == 0x22F) {
+        return true;
+    }
+    if (reg >= 0x232 && reg <= 0x235) {
+        return true;
+    }
+    if (reg >= 0x238 && reg <= 0x23D) {
+        return true;
+    }
+    // data_offset de cada cargador: la primera de sus tres palabras.
+    return reg >= 0x203 && reg <= 0x226 && ((reg - 0x203) % 3) == 0;
+}
+
+/**
+ * LA HUELLA DE LA DISPOSICION (0.3.5.1). Exactamente lo que la invalida y nada
+ * mas: los registros del memo de vertices menos los puertos de datos y menos
+ * los del lote, mas los del rango de fragmentos que lee PicaVSConfig. El hash
+ * del codigo, el del swizzle y lit/proj/wbuffer se anaden aparte.
+ */
+constexpr std::array<u64, 12> MakeLayoutKeyMask() {
+    std::array<u64, 12> mask{};
+    for (u32 i = 0; i < 12; i++) {
+        mask[i] = kVsFromFsMask[i];
+    }
+    for (u32 reg = 0x200; reg < 0x300; reg++) {
+        if ((kVsMemoMask[reg >> 6] & (1ull << (reg & 63))) == 0) {
+            continue;
+        }
+        if (IsMemoPortReg(reg) || IsVsCodePortReg(reg) || IsPerDrawReg(reg)) {
+            continue;
+        }
+        mask[reg >> 6] |= 1ull << (reg & 63);
+    }
+    return mask;
+}
+
+constexpr std::array<u64, 12> kLayoutKeyMask = MakeLayoutKeyMask();
+
+/**
+ * LA HUELLA, AL VUELO (0.3.5.2). En 0.3.5.1 se calculaba recorriendo los ~200
+ * registros de kLayoutKeyMask en cada reconstruccion, y el log del 24-10 dijo
+ * lo que tenia que decir: la cache acerto el 100 % (5.480 de 5.480) y la fase
+ * "vs" se quedo igual, en 16 us por lote. Calcular la huella costaba lo mismo
+ * que rehacer la disposicion.
+ *
+ * Ahora la huella es el XOR de un hash por registro, y el XOR se puede
+ * deshacer: cuando un registro pasa de un valor a otro basta con quitar el
+ * termino viejo y meter el nuevo. El memo ya recorre exactamente los registros
+ * que han cambiado de valor, que son un punado por lote, asi que mantenerla
+ * sale casi gratis y buscar en la cache es comparar un entero de 64 bits.
+ *
+ * El hash de un registro a cero vale cero: asi la huella de un memo recien
+ * creado, con la sombra a ceros, es cero, y el invariante se cumple desde el
+ * primer lote sin tener que recorrer nada.
+ */
+constexpr u64 RegFingerprint(u32 reg, u32 value) {
+    if (value == 0) {
+        return 0;
+    }
+    u64 x = (static_cast<u64>(reg) << 32) ^ value;
+    x ^= x >> 33;
+    x *= 0xFF51AFD7ED558CCDull;
+    x ^= x >> 33;
+    x *= 0xC4CEB9FE1A85EC53ull;
+    x ^= x >> 33;
+    return x;
+}
+
+constexpr bool InLayoutKey(u32 reg) {
+    return (kLayoutKeyMask[reg >> 6] & (1ull << (reg & 63))) != 0;
+}
+
+/**
+ * LA HUELLA DEL PIPELINE DE FRAGMENTOS (0.3.6.1). Mismo patron que
+ * kLayoutKeyMask y por el mismo motivo medido: `pipelines->Get` corre en el
+ * 32 % de los lotes (los que tienen fs_dirty) y la fase "preguntas" son 17 us
+ * por lote, de donde salen unos 47 us por cada Get. Lo que cuesta es construir
+ * un `FSConfig` entero -- cientos de bytes con todas las etapas del
+ * combinador, luz, niebla, proctex -- y usarlo como clave de un mapa, o sea
+ * hashearlo y compararlo completo.
+ *
+ * Con una huella de los registros que lo deciden, mantenida al vuelo por el
+ * memo, un lote que vuelve a una configuracion ya vista se ahorra todo eso. Se
+ * quitan los puertos de datos (0x0AF-0x0B7, las tablas del procedural): su
+ * valor suelto no describe un estado, y por eso IsMemoPortReg los cuenta
+ * siempre como cambiados.
+ */
+constexpr std::array<u64, 12> MakeFsKeyMask() {
+    std::array<u64, 12> mask{};
+    for (u32 reg = 0x040; reg < 0x200; reg++) {
+        if ((kFsMemoMask[reg >> 6] & (1ull << (reg & 63))) == 0) {
+            continue;
+        }
+        if (IsMemoPortReg(reg)) {
+            continue;
+        }
+        mask[reg >> 6] |= 1ull << (reg & 63);
+    }
+    return mask;
+}
+
+constexpr std::array<u64, 12> kFsKeyMask = MakeFsKeyMask();
+
+constexpr bool InFsKey(u32 reg) {
+    return (kFsKeyMask[reg >> 6] & (1ull << (reg & 63))) != 0;
+}
+
+/// Una sal por cada combinacion de lit/proj/wbuffer (ver la clave del programa).
+constexpr std::array<u64, 8> kPipeSalt = {
+    0x0000000000000000ull, 0x9E3779B97F4A7C15ull, 0xBF58476D1CE4E5B9ull, 0x94D049BB133111EBull,
+    0x2545F4914F6CDD1Dull, 0xD6E8FEB86659FD93ull, 0xA0761D6478BD642Full, 0xE7037ED1A0B428DBull,
+};
+
 constexpr std::array<u64, 12> RegRangeMask(u32 first, u32 end) {
     std::array<u64, 12> mask{};
     for (u32 reg = first; reg < end; reg++) {
@@ -2719,6 +2950,47 @@ struct RasterizerGXM::BatchMemo {
     const char* pipeline_fail = nullptr;
     u32 pipeline_fail_frame = 0;
     bool vs_valid = false;
+
+    /**
+     * Las ultimas disposiciones vistas, con la huella de lo que las decide
+     * (ver RasterizerGXM::vs_layout_cache y kLayoutKeyMask). Copiar una entrada
+     * cuesta nada al lado de rehacerla (23-97 us por lote en el log del 23-10),
+     * y en el overworld de Zafiro se rehacen 5.279 disposiciones cada 14.943
+     * lotes: 48 entradas (~20 KB, hay un solo BatchMemo) para que el ciclo de
+     * modelos de una zona entera quepa sin expulsarse a si mismo.
+     */
+    static constexpr std::size_t kLayoutCacheSize = 48;
+    struct LayoutCacheEntry {
+        u64 key = 0;
+        bool used = false;
+        VertexLayout layout{};
+    };
+    /**
+     * LAS CLAVES, APARTE (0.3.5.3). En 0.3.5.2 la clave iba dentro de cada
+     * entrada, y como una entrada ocupa medio kilobyte, buscar entre las 48
+     * eran 48 fallos de cache seguidos: la fase "vs" se quedo en 12,7 us por
+     * lote aunque la huella ya fuera gratis. Con las claves en su propio array
+     * la busqueda toca 384 bytes (seis lineas de cache) y solo se visita la
+     * disposicion que de verdad coincide.
+     */
+    std::array<u64, kLayoutCacheSize> layout_cache_key{};
+    std::array<LayoutCacheEntry, kLayoutCacheSize> layout_cache{};
+    u32 layout_cache_next = 0;
+    /// La huella de los registros que deciden la disposicion, mantenida al
+    /// vuelo (ver RegFingerprint). Vale cero con la sombra a ceros.
+    u64 layout_fp = 0;
+    /**
+     * Lo mismo para el pipeline de fragmentos (ver kFsKeyMask). Solo se guardan
+     * entradas USABLES y sin compilacion pendiente: una entrada en ese estado
+     * ya no cambia, asi que servirla de la cache es seguro. Las que fallan o
+     * estan compilandose se dejan pasar por Get, que es quien sabe mirar su
+     * trabajo pendiente y reintentarlas.
+     */
+    static constexpr std::size_t kFsCacheSize = 32;
+    u64 fs_fp = 0;
+    std::array<u64, kFsCacheSize> fs_cache_key{};
+    std::array<const void*, kFsCacheSize> fs_cache_entry{};
+    u32 fs_cache_next = 0;
     VertexLayout layout;
 
     /**
@@ -2902,6 +3174,8 @@ bool RasterizerGXM::EnsureInitialized() {
     // (vita2d y el sistema no la usan). La GPU solo puede escribir ahi.
     fence_address = sceGxmGetNotificationRegion() + 400;
     *fence_address = 0;
+    // Ver gxm_caja_negra.h: lo mandado a la GPU, en el volcado si se cuelga.
+    BlackBox::Start(fence_address);
     if (context == nullptr || patcher == nullptr) {
         status = "sin contexto gxm";
         Common::VitaNote("gxm init", "sin contexto");
@@ -3027,6 +3301,7 @@ void RasterizerGXM::EndScene() {
         done.address = fence_address;
         done.value = fence_sent;
         sceGxmEndScene(context, nullptr, &done);
+        BlackBox::CloseScene(fence_sent);
         open_surface->last_fence = fence_sent;
     }
     if (frame_first_fence == 0) {
@@ -4036,6 +4311,7 @@ bool RasterizerGXM::BlitToCopy(ScreenCopy& copy, Surface& source, u32 first_row,
         NoteOnce(noted, "gxm copia", "beginscene err {:#x}", static_cast<u32>(rc));
         return false;
     }
+    BlackBox::OpenScene(BlackBox::SceneKind::Blit, copy.dst);
     // El estado del contexto es compartido: todo lo que el quad necesita, aqui.
     const float half_width = static_cast<float>(Phys(copy.width, copy.scale)) * 0.5f;
     const float half_height = static_cast<float>(Phys(copy.height, copy.scale)) * 0.5f;
@@ -4057,6 +4333,20 @@ bool RasterizerGXM::BlitToCopy(ScreenCopy& copy, Surface& source, u32 first_row,
     const u8* quad = static_cast<const u8*>(blit->quad.Data());
     sceGxmSetVertexStream(context, 0, quad + (flip ? 4 * kBlitVertexStride : 0));
     sceGxmSetFragmentTexture(context, blit->texture_unit, &texture);
+    BlackBox::NoteTexture(0, &texture);
+    {
+        BlackBox::DrawInfo info;
+        info.kind = BlackBox::DrawKind::Blit;
+        info.primitive = SCE_GXM_PRIMITIVE_TRIANGLE_STRIP;
+        info.streams = 1;
+        info.count = 4;
+        info.indices = quad + 8 * kBlitVertexStride;
+        info.vertex_program = blit->vertex_program;
+        info.fragment_program = blit->fragment_program;
+        info.stream[0] = quad + (flip ? 4 * kBlitVertexStride : 0);
+        info.stream_bytes[0] = 4 * kBlitVertexStride;
+        BlackBox::Record(info);
+    }
     sceGxmDraw(context, SCE_GXM_PRIMITIVE_TRIANGLE_STRIP, SCE_GXM_INDEX_FORMAT_U16,
                quad + 8 * kBlitVertexStride, 4);
     fence_sent++;
@@ -4064,6 +4354,7 @@ bool RasterizerGXM::BlitToCopy(ScreenCopy& copy, Surface& source, u32 first_row,
     done.address = fence_address;
     done.value = fence_sent;
     sceGxmEndScene(context, nullptr, &done);
+    BlackBox::CloseScene(fence_sent);
     copy.fence = fence_sent;
     gpu_pending = true;
     return true;
@@ -4765,6 +5056,20 @@ void RasterizerGXM::DrawClearQuad(Surface& surface) {
                           static_cast<float>(Phys(clear.first_row, surface.scale)) + half_rows,
                           -half_rows, 0.5f, 0.5f);
         sceGxmSetFragmentTexture(context, blit->texture_unit, &texture);
+        BlackBox::NoteTexture(0, &texture);
+        {
+            BlackBox::DrawInfo info;
+            info.kind = BlackBox::DrawKind::Clear;
+            info.primitive = SCE_GXM_PRIMITIVE_TRIANGLE_STRIP;
+            info.streams = 1;
+            info.count = 4;
+            info.indices = quad + 8 * kBlitVertexStride;
+            info.vertex_program = blit->vertex_program;
+            info.fragment_program = blit->fragment_program;
+            info.stream[0] = quad;
+            info.stream_bytes[0] = 4 * kBlitVertexStride;
+            BlackBox::Record(info);
+        }
         sceGxmDraw(context, SCE_GXM_PRIMITIVE_TRIANGLE_STRIP, SCE_GXM_INDEX_FORMAT_U16,
                    quad + 8 * kBlitVertexStride, 4);
     }
@@ -4780,6 +5085,7 @@ void RasterizerGXM::FlushClear(Surface& surface) {
         ApplyClearOnCpu(surface);
         return;
     }
+    BlackBox::OpenScene(BlackBox::SceneKind::Clear, surface.guest_address);
     surface.scene_open = true;
     open_surface = &surface;
     DrawClearQuad(surface);
@@ -5687,6 +5993,51 @@ bool RasterizerGXM::DrawBatchOnGpu() {
     const u32 floats_per_vertex = stride / sizeof(float);
 
     /**
+     * POSICIONES QUE NO SON NUMEROS, FUERA (0.3.7.6). Lo que sale del shader de
+     * la PICA iba tal cual a la GPU. El rasterizador de software tira en el
+     * recorte los triangulos con un vertice NaN o infinito; el SGX no los tira:
+     * con posiciones asi su tiler puede colgarse, y eso es un GPUCRASH. Aqui se
+     * aplasta el triangulo entero a un punto, que no pinta nada, igual que lo
+     * habria quitado el recorte. Tambien los desmesurados (mas de 1e18 en clip
+     * space no es geometria de ningun juego, es basura). Se mira en 'batch',
+     * que tiene cache: el buffer de vertices no, y releerlo costaria mucho.
+     */
+    u32 crushed = 0;
+    {
+        constexpr float kMaxCoordinate = 1e18f;
+        const auto bad = [](const Pica::OutputVertex& v) {
+            // Escrito asi para que NaN tambien sea malo (toda comparacion da falso).
+            return !(std::fabs(v.pos.x.ToFloat32()) < kMaxCoordinate &&
+                     std::fabs(v.pos.y.ToFloat32()) < kMaxCoordinate &&
+                     std::fabs(v.pos.z.ToFloat32()) < kMaxCoordinate &&
+                     std::fabs(v.pos.w.ToFloat32()) < kMaxCoordinate);
+        };
+        for (u32 i = 0; i + 2 < vertex_count; i += 3) {
+            if (!bad(batch[i]) && !bad(batch[i + 1]) && !bad(batch[i + 2])) {
+                continue;
+            }
+            if (crushed == 0) {
+                static bool noted_crushed = false;
+                const auto& first = bad(batch[i]) ? batch[i] : bad(batch[i + 1]) ? batch[i + 1]
+                                                                                   : batch[i + 2];
+                NoteOnce(noted_crushed, "gxm draw",
+                         "posicion no valida en un lote de {} vertices ({} {} {} {}), con luz {}: "
+                         "sus triangulos se aplastan",
+                         vertex_count, first.pos.x.ToFloat32(), first.pos.y.ToFloat32(),
+                         first.pos.z.ToFloat32(), first.pos.w.ToFloat32(), pipeline->lit ? 1 : 0);
+            }
+            for (u32 k = 0; k < 3; k++) {
+                auto& pos = batch[i + k].pos;
+                pos.x = Pica::f24::FromFloat32(0.0f);
+                pos.y = Pica::f24::FromFloat32(0.0f);
+                pos.z = Pica::f24::FromFloat32(0.0f);
+                pos.w = Pica::f24::FromFloat32(1.0f);
+            }
+            crushed++;
+        }
+    }
+
+    /**
      * Las tablas de la iluminacion, ANTES de repartir el buffer de vertices.
      *
      * Reescribirlas puede exigir cerrar la escena (la GPU podria estar leyendo
@@ -5843,6 +6194,21 @@ bool RasterizerGXM::DrawBatchOnGpu() {
         // de dibujar el resto. kMaxVerticesPerDraw es multiplo de 3, asi que
         // ningun triangulo queda partido entre dos trozos.
         sceGxmSetVertexStream(context, 0, vertex_slice + static_cast<std::size_t>(drawn) * stride);
+        {
+            BlackBox::DrawInfo info;
+            info.kind = BlackBox::DrawKind::VertexCpu;
+            info.primitive = SCE_GXM_PRIMITIVE_TRIANGLES;
+            info.streams = 1;
+            info.count = chunk;
+            info.range = chunk;
+            info.indices = indices;
+            info.vertex_program = pipelines->FormatFor(pipeline->lit, pipeline->proj).program;
+            info.fragment_program = pipeline->program;
+            info.stream[0] = vertex_slice + static_cast<std::size_t>(drawn) * stride;
+            info.stream_bytes[0] = chunk * stride;
+            info.bad = drawn == 0 ? crushed : 0;
+            BlackBox::Record(info);
+        }
         const int rc = sceGxmDraw(context, SCE_GXM_PRIMITIVE_TRIANGLES, SCE_GXM_INDEX_FORMAT_U16,
                                   indices, chunk);
         if (rc < 0) {
@@ -5910,6 +6276,7 @@ bool RasterizerGXM::SetupDrawState(Surface* surface, const Entry* pipeline,
         }
         surface->scene_open = true;
         open_surface = surface;
+        BlackBox::OpenScene(BlackBox::SceneKind::Draw, surface->guest_address);
         ForgetDrawState();
         if (surface->clear_pending) {
             DrawClearQuad(*surface);
@@ -6198,6 +6565,7 @@ bool RasterizerGXM::SetupDrawState(Surface* surface, const Entry* pipeline,
             NoteSkip(4, "textura");
             return false;
         }
+        BlackBox::NoteTexture(i, texture);
         const u32 unit = pipeline->sampler_units[i];
         const u32 bit = unit < shadow.textures.size() ? 1u << unit : 0u;
         if (bit == 0 || (shadow.textures_known & bit) == 0 ||
@@ -6378,6 +6746,15 @@ bool RasterizerGXM::SetupDrawState(Surface* surface, const Entry* pipeline,
                                       memo.global_ambient.data());
             }
         }
+    } else {
+        /**
+         * Sin buffer, el dibujado lee lo que haya en el de uniforms (0.3.7.5).
+         * No se rechaza el lote porque no consta si GXM falla aqui tambien con
+         * programas sin uniforms; solo se apunta, para saber si pasa.
+         */
+        static bool noted_fs_uniforms = false;
+        NoteOnce(noted_fs_uniforms, "gxm fs",
+                 "sin buffer de uniformes de fragmentos: el lote se dibuja sin ellos");
     }
 
     return true;
@@ -6692,6 +7069,7 @@ u8* RasterizerGXM::ReserveVertexSpace(u32 bytes) {
                     in_host ? "memoria normal" : "CDRAM");
         }
         vertex_buffer = std::move(buffer);
+        BlackBox::NoteVertexRing(vertex_buffer.Data(), vertex_buffer.Size());
         vertex_used = 0;
         vertex_segment_fence.fill(fence_sent);
         vertex_segments_pending = 0;
@@ -6865,6 +7243,15 @@ bool RasterizerGXM::AccelerateDrawBatch(bool is_indexed) {
                     memo.shadow[reg] = values[reg];
                     changed[i] &= ~(1ull << bit);
                 } else if (IsMemoPortReg(reg) || values[reg] != memo.shadow[reg]) {
+                    if (InLayoutKey(reg)) {
+                        // Quitar el termino viejo y meter el nuevo: ver RegFingerprint.
+                        memo.layout_fp ^= RegFingerprint(reg, memo.shadow[reg]) ^
+                                          RegFingerprint(reg, values[reg]);
+                    }
+                    if (InFsKey(reg)) {
+                        memo.fs_fp ^= RegFingerprint(reg, memo.shadow[reg]) ^
+                                      RegFingerprint(reg, values[reg]);
+                    }
                     memo.shadow[reg] = values[reg];
                 } else if (by_value) {
                     changed[i] &= ~(1ull << bit);
@@ -6950,8 +7337,33 @@ bool RasterizerGXM::AccelerateDrawBatch(bool is_indexed) {
         memo.pipeline_fail_frame == presents_seen) {
         return HwVsReject(memo.pipeline_fail);
     }
+    /**
+     * La cache por huella (0.3.6.1, ver kFsKeyMask): si estos registros ya se
+     * vieron y dieron una entrada usable, se sirve sin construir el FSConfig.
+     */
+    u64 fs_key_fp = 0;
+    bool fs_key_ok = false;
+    if (pipeline == nullptr && cache_pipeline.load(std::memory_order_relaxed) != 0) {
+        fs_key_fp = memo.fs_fp;
+        fs_key_ok = true;
+        for (std::size_t i = 0; i < BatchMemo::kFsCacheSize; i++) {
+            if (memo.fs_cache_key[i] != fs_key_fp || memo.fs_cache_entry[i] == nullptr) {
+                continue;
+            }
+            pipeline = static_cast<const PipelineCache::Entry*>(memo.fs_cache_entry[i]);
+            memo.pipeline = pipeline;
+            g_pipeline_hits.fetch_add(1, std::memory_order_relaxed);
+            break;
+        }
+    }
     if (pipeline == nullptr) {
         pipeline = pipelines->Get(regs, &fs_reason);
+        if (pipeline != nullptr && fs_key_ok && pipeline->usable && pipeline->job == nullptr) {
+            const u32 at = memo.fs_cache_next;
+            memo.fs_cache_next = (at + 1) % BatchMemo::kFsCacheSize;
+            memo.fs_cache_key[at] = fs_key_fp;
+            memo.fs_cache_entry[at] = pipeline;
+        }
         // Su shader de fragmentos se esta compilando: el lote se salta (0.1.9.8).
         if (pipeline == nullptr && fs_reason != nullptr &&
             std::strcmp(fs_reason, "fs compilando") == 0) {
@@ -6984,6 +7396,14 @@ bool RasterizerGXM::AccelerateDrawBatch(bool is_indexed) {
         memo_vs_by_pipeline.fetch_add(1, std::memory_order_relaxed);
     }
     phase(0);
+    unsigned long long vs_mark = profile ? Common::VitaMicros() : 0;
+    const auto vs_lap = [&](unsigned long long& slot) {
+        if (profile) {
+            const unsigned long long now = Common::VitaMicros();
+            slot += now - vs_mark;
+            vs_mark = now;
+        }
+    };
 
     const u32 num_vertices = pipeline_regs.num_vertices;
     if (num_vertices == 0) {
@@ -7018,12 +7438,43 @@ bool RasterizerGXM::AccelerateDrawBatch(bool is_indexed) {
         max_index = min_index + num_vertices - 1;
     }
     const u32 vertex_range = max_index - min_index + 1;
+    vs_lap(g_vs_indices_us);
 
     /**
      * La disposicion de los atributos y el programa de vertices, los del lote
      * anterior si la PICA no ha tocado nada que los decida (BatchMemo).
      */
     BatchMemo::VertexLayout& layout = memo.layout;
+    /**
+     * LA HUELLA DE LA DISPOSICION (0.3.5.2). Ya no se calcula aqui: el memo la
+     * mantiene al vuelo registro a registro (ver RegFingerprint). Lo unico que
+     * queda es mezclarle lo que no son registros -- el codigo y el swizzle del
+     * shader, que el memo tambien sigue por valor, y las tres salidas del
+     * pipeline -- y buscar un entero de 64 bits en la cache.
+     */
+    u64 layout_key_fp = 0;
+    bool layout_key_ok = false;
+    if (!memo.vs_valid && vs_layout_cache.load(std::memory_order_relaxed) != 0) {
+        const u32 pipe = (pipeline->lit ? 1u : 0u) | (pipeline->proj ? 2u : 0u) |
+                         (w_buffer ? 4u : 0u);
+        layout_key_fp = memo.layout_fp ^ memo.vs_code_hash ^
+                        (memo.vs_swizzle_hash * 0x9E3779B97F4A7C15ull) ^ kPipeSalt[pipe];
+        layout_key_ok = true;
+        for (std::size_t i = 0; i < BatchMemo::kLayoutCacheSize; i++) {
+            if (memo.layout_cache_key[i] != layout_key_fp) {
+                continue;
+            }
+            const auto& entry = memo.layout_cache[i];
+            if (!entry.used) {
+                continue;
+            }
+            layout = entry.layout;
+            memo.vs_valid = true;
+            g_layout_hits.fetch_add(1, std::memory_order_relaxed);
+            break;
+        }
+    }
+    vs_lap(g_vs_cache_us);
     if (!memo.vs_valid) {
         /**
          * Donde vive cada atributo, con la misma cuenta que VertexLoader: cada
@@ -7202,6 +7653,7 @@ bool RasterizerGXM::AccelerateDrawBatch(bool is_indexed) {
             NoteSkip(5, reason != nullptr ? reason : "vs");
             return HwVsReject(reason != nullptr ? reason : "vs");
         }
+        vs_lap(g_vs_build_part_us);
         phase(1);
 
         /**
@@ -7349,8 +7801,21 @@ bool RasterizerGXM::AccelerateDrawBatch(bool is_indexed) {
         layout.proj = pipeline->proj;
         layout.wbuffer = w_buffer;
         memo.vs_valid = true;
+        // A la cache, para cuando el juego vuelva a este modelo.
+        if (layout_key_ok) {
+            const u32 at = memo.layout_cache_next;
+            memo.layout_cache_next = (at + 1) % BatchMemo::kLayoutCacheSize;
+            auto& slot = memo.layout_cache[at];
+            slot.key = layout_key_fp;
+            slot.used = true;
+            slot.layout = layout;
+            memo.layout_cache_key[at] = layout_key_fp;
+        }
     } else {
         phase(1);
+    }
+    if (profile) {
+        g_vs_part_samples++;
     }
     phase(2);
     const VSInputs& inputs = layout.inputs;
@@ -7522,6 +7987,23 @@ bool RasterizerGXM::AccelerateDrawBatch(bool is_indexed) {
         space += (converted_stride * vertex_range + 15u) & ~15u;
         stream_count = 1;
     } else {
+        /* Pares con memcpy, impares con NEON: ver g_copy_memcpy_us. */
+        for (u32 stream = 0; stream < stream_count; stream++) {
+            /* Clave direccion + tamano, que es gratis y es exactamente la que
+             * usaria la cache de verdad (ver g_upload_seen). */
+            const u64 key = (static_cast<u64>(reinterpret_cast<uintptr_t>(stream_source[stream]))
+                             << 20) ^
+                            stream_bytes[stream];
+            u64& slot = g_upload_seen[key % kUploadSeenSlots];
+            g_upload_streams++;
+            g_upload_bytes += stream_bytes[stream];
+            if (slot == key) {
+                g_upload_repeats++;
+                g_upload_repeat_bytes += stream_bytes[stream];
+            } else {
+                slot = key;
+            }
+        }
         for (u32 stream = 0; stream < stream_count; stream++) {
             std::memcpy(space, stream_source[stream], stream_bytes[stream]);
             stream_data[stream] = space;
@@ -7555,11 +8037,29 @@ bool RasterizerGXM::AccelerateDrawBatch(bool is_indexed) {
         sceGxmSetVertexStream(context, stream, stream_data[stream]);
     }
 
-    // Los uniforms de la PICA, tal cual: los flotantes son floats de 32 bits
-    // en memoria (f24 guarda un float), y los enteros y booleanos se pasan a
-    // float como espera el traductor (ver GenerateVertexShader).
+    /**
+     * Los uniforms de la PICA, tal cual: los flotantes son floats de 32 bits
+     * en memoria (f24 guarda un float), y los enteros y booleanos se pasan a
+     * float como espera el traductor (ver GenerateVertexShader).
+     *
+     * SI NO HAY BUFFER, NO SE DIBUJA (0.3.7.4). Esta reserva sale del anillo de
+     * uniformes del contexto y puede fallar en una escena cargada. Antes, al
+     * fallar se saltaba el bloque entero y se dibujaba igual: GXM entrega
+     * entonces un buffer INDEFINIDO, y el shader lee de ahi la matriz, los
+     * atributos por defecto y -- lo que de verdad importa -- el tope del bucle
+     * LOOP. Con basura en ese tope la GPU gira hasta que salta el perro
+     * guardian del driver y la consola escribe un GPUCRASH (la intro de Zafiro
+     * Alfa, 24-10). El tope ya va recortado a 255 en el generador, pero dibujar
+     * con uniformes indefinidos no tiene ningun sentido: el lote se rechaza y
+     * lo repite la ruta de la CPU, igual que cuando falla sceGxmDraw.
+     */
     void* vertex_uniforms = nullptr;
-    if (sceGxmReserveVertexDefaultUniformBuffer(context, &vertex_uniforms) == 0) {
+    if (sceGxmReserveVertexDefaultUniformBuffer(context, &vertex_uniforms) != 0) {
+        static bool noted_uniforms = false;
+        NoteOnce(noted_uniforms, "gxm vs", "sin buffer de uniformes de vertices: el lote va a la CPU");
+        return HwVsReject("uniforms vs");
+    }
+    {
         const auto& uniforms = pica.vs_setup.uniforms;
         if (program->uniform_f != nullptr) {
             static_assert(sizeof(uniforms.f) == 96 * 4 * sizeof(float));
@@ -7606,6 +8106,22 @@ bool RasterizerGXM::AccelerateDrawBatch(bool is_indexed) {
         }
     }
 
+    {
+        BlackBox::DrawInfo info;
+        info.kind = BlackBox::DrawKind::VertexGpu;
+        info.primitive = static_cast<u8>(primitive);
+        info.streams = static_cast<u8>(stream_count);
+        info.count = num_vertices;
+        info.range = vertex_range;
+        info.indices = draw_indices;
+        info.vertex_program = vertex_program;
+        info.fragment_program = fragment_program;
+        for (u32 i = 0; i < 3 && i < stream_count; i++) {
+            info.stream[i] = stream_data[i];
+            info.stream_bytes[i] = converted ? converted_stride * vertex_range : stream_bytes[i];
+        }
+        BlackBox::Record(info);
+    }
     const int rc = sceGxmDraw(context, primitive, SCE_GXM_INDEX_FORMAT_U16, draw_indices,
                               num_vertices);
     if (rc < 0) {
@@ -7732,10 +8248,11 @@ std::string RasterizerGXM::TakeBatchProfile() {
         "muestras) | texturas a revisar por: vaciado {} invalidar {} ambos {} relleno {} "
         "copia {} | vs nuevos {} (del indice {}, {} ms, traducir {} ms, el peor {} ms) | memo: "
         "lotes {} fs rehecho {} vs rehecho {} (por registros {} codigo {} salidas {} booleanos {} "
-        "pipeline {}) escrituras iguales {} | copias por partes: "
+        "pipeline {}) escrituras iguales {} disp reusada {} pipeline reusado {} | copias por partes: "
         "{} llamadas, rellenos {:.1f} us, superficies {:.1f} us ({:.1f} de media), copias "
         "{:.1f} us ({:.1f} de media) | datos por partes: reservar {:.1f} us, copiar {:.1f} us, "
-        "indices {:.1f} us, {:.0f} bytes por lote",
+        "indices {:.1f} us, {:.0f} bytes por lote | vs por partes: indices {:.1f} us, "
+        "cache {:.1f} us, rehacer {:.1f} us",
         avg(batch_phase_us[0]), avg(batch_phase_us[1]), avg(batch_phase_us[2]),
         avg(batch_phase_us[3]), avg(batch_phase_us[4]), avg(state_scene_us),
         avg(state_texture_us), avg(g_state_copy_us), avg(batch_phase_us[5]), samples,
@@ -7757,7 +8274,9 @@ std::string RasterizerGXM::TakeBatchProfile() {
         memo_vs_by_fs.exchange(0, std::memory_order_relaxed),
         memo_vs_by_bools.exchange(0, std::memory_order_relaxed),
         memo_vs_by_pipeline.exchange(0, std::memory_order_relaxed),
-        memo_same_writes.exchange(0, std::memory_order_relaxed), g_copy_calls,
+        memo_same_writes.exchange(0, std::memory_order_relaxed),
+        g_layout_hits.exchange(0, std::memory_order_relaxed),
+        g_pipeline_hits.exchange(0, std::memory_order_relaxed), g_copy_calls,
         g_copy_calls == 0 ? 0.0 : static_cast<double>(g_copy_fills_us) / g_copy_calls,
         g_copy_calls == 0 ? 0.0 : static_cast<double>(g_copy_surfaces_us) / g_copy_calls,
         g_copy_calls == 0 ? 0.0 : static_cast<double>(g_copy_surfaces_seen) / g_copy_calls,
@@ -7766,7 +8285,15 @@ std::string RasterizerGXM::TakeBatchProfile() {
         g_data_samples == 0 ? 0.0 : static_cast<double>(g_data_reserve_us) / g_data_samples,
         g_data_samples == 0 ? 0.0 : static_cast<double>(g_data_copy_us) / g_data_samples,
         g_data_samples == 0 ? 0.0 : static_cast<double>(g_data_index_us) / g_data_samples,
-        g_data_samples == 0 ? 0.0 : static_cast<double>(g_data_bytes) / g_data_samples);
+        g_data_samples == 0 ? 0.0 : static_cast<double>(g_data_bytes) / g_data_samples,
+        g_vs_part_samples == 0 ? 0.0
+                               : static_cast<double>(g_vs_indices_us) / g_vs_part_samples,
+        g_vs_part_samples == 0 ? 0.0 : static_cast<double>(g_vs_cache_us) / g_vs_part_samples,
+        g_vs_part_samples == 0
+            ? 0.0
+            : static_cast<double>(g_vs_build_part_us) / g_vs_part_samples);
+    text += fmt::format("\nsubidas: repetidas {} de {} ({} KB de {} KB)", g_upload_repeats,
+                        g_upload_streams, g_upload_repeat_bytes / 1024, g_upload_bytes / 1024);
     g_data_reserve_us = 0;
     g_data_copy_us = 0;
     g_data_index_us = 0;
@@ -7780,6 +8307,17 @@ std::string RasterizerGXM::TakeBatchProfile() {
     g_copy_copies_seen = 0;
     batch_phase_us.fill(0);
     batch_phase_samples = 0;
+    g_upload_seen.fill(0);
+    g_upload_streams = 0;
+    g_upload_repeats = 0;
+    g_upload_bytes = 0;
+    g_upload_repeat_bytes = 0;
+    g_upload_hash_us = 0;
+    g_upload_hash_samples = 0;
+    g_vs_indices_us = 0;
+    g_vs_cache_us = 0;
+    g_vs_build_part_us = 0;
+    g_vs_part_samples = 0;
     state_scene_us = 0;
     state_texture_us = 0;
     g_state_copy_us = 0;

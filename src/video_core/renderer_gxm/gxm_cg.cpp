@@ -773,7 +773,6 @@ struct BadSourceHash {
     }
 };
 std::unordered_set<BadSource, BadSourceHash> g_bad_sources;
-std::unordered_set<BadSource, BadSourceHash> g_no_opt_sources;
 bool g_bad_loaded = false;
 /**
  * UNA SEGUNDA OPORTUNIDAD A LOS DE FRAGMENTOS (0.3.2.1). crash.txt de 0.3.2.0,
@@ -787,10 +786,13 @@ bool g_bad_loaded = false;
  * lista se reintenta UNA vez en O0, apuntado en kRetriedPath ANTES de compilar
  * para que, si colgara el compilador, no se repita en otra sesion. No se
  * reintenta el que consta que tumbo el proceso (kDiedPath, o su cg_murio_*.cg).
+ *
+ * RETIRADO EN 0.3.7.8: el binario O0 de uno de estos colgaba la GPU en la
+ * intro de Zafiro Alfa. La lista se sigue leyendo solo para borrar de la
+ * cache esos binarios (PurgeUnoptimizedPrograms).
  */
 constexpr char kRetriedPath[] = "ux0:/data/azahar/shadercache/cg_reintentado.bin";
 constexpr char kDiedPath[] = "ux0:/data/azahar/shadercache/cg_murio.bin";
-std::unordered_set<BadSource, BadSourceHash> g_retried_sources;
 std::unordered_set<BadSource, BadSourceHash> g_died_sources;
 /**
  * SOSPECHOSO (0.2.3.5). Sin volcado no se culpa al shader que se estaba
@@ -804,6 +806,42 @@ std::unordered_set<BadSource, BadSourceHash> g_died_sources;
 constexpr char kSuspectPath[] = "ux0:/data/azahar/shadercache/cg_sospechoso.bin";
 BadSource g_suspect{};
 bool g_has_suspect = false;
+u32 g_suspect_strikes = 0;
+
+/**
+ * CUANTAS VECES ANTES DE CONDENARLO (0.3.5.1). La regla de arriba ("si la
+ * siguiente sesion vuelve a acabar compilando ESE MISMO, a la lista negra")
+ * daba por muerto a cualquiera que el usuario pillara compilando dos veces. Y
+ * los grandes TARDAN: en el log del 23-10, uno de 26.736 bytes de Zafiro Alfa
+ * compilo bien en 170.136 ms (99.710 ms de CPU), y el siguiente, de 26.868, no
+ * llego a acabar en dos partidas seguidas de unos minutos. Sin volcado de la
+ * consola no hay ninguna prueba de que se haya caido: lo unico que consta es
+ * que la sesion termino antes que el. Asi que a los grandes se les dan cuatro
+ * oportunidades en vez de dos; a los pequenos, que compilan en segundos, las
+ * dos de siempre, porque ahi pillarlo dos veces si significa algo.
+ */
+constexpr u32 kBigSourceBytes = 20000;
+constexpr u32 kSuspectStrikesSmall = 2;
+constexpr u32 kSuspectStrikesBig = 4;
+
+/// El fichero del sospechoso. Los de antes de 0.3.5.1 solo traian la fuente:
+/// se leen como un aviso ya dado.
+struct SuspectRecord {
+    BadSource source;
+    u32 strikes;
+};
+
+void WriteSuspect(const BadSource& source, u32 strikes) {
+    const SceUID fd = sceIoOpen(kSuspectPath, SCE_O_WRONLY | SCE_O_CREAT | SCE_O_TRUNC, 0777);
+    if (fd >= 0) {
+        const SuspectRecord record{source, strikes};
+        sceIoWrite(fd, &record, sizeof(record));
+        sceIoClose(fd);
+    }
+    g_suspect = source;
+    g_has_suspect = true;
+    g_suspect_strikes = strikes;
+}
 
 /// Lo que se apunta en kCompilingPath antes de compilar.
 struct CompilingMarker {
@@ -890,24 +928,45 @@ u64 DateKey(const SceDateTime& t) {
  * de la consola detras, y sin embargo sus shaders fueron a la lista negra (a la
  * CPU para siempre); uno se reintento en O0 y ese binario colgo la GPU. Cuando
  * el compilador se cae de verdad, el sistema escribe un psp2core-* en ux0:data
- * (los de 0.2.0.x estan ahi). Solo cuenta si es posterior a la marca y no es de
- * la GPU. Si no se puede leer la carpeta, se culpa como antes.
+ * (los de 0.2.0.x estan ahi). Si no se puede leer la carpeta, se culpa como
+ * antes.
+ *
+ * EL GPUCRASH EXCULPA (0.3.7.5). En 0.3.7.4 un psp2core-*-GPUCRASH paso a contar
+ * como prueba contra el shader que se compilaba (tope corto, dos sesiones y a
+ * la lista negra), porque en la intro de Zafiro Alfa (24-10) la sesion acababa
+ * siempre con un GPUCRASH y el mismo shader de 26.754 bytes a medio compilar.
+ * Fue un error: el 25-10 la GPU se siguio colgando en esa escena con ese shader
+ * ya compilado, con el compilando OTRO, y con los de 26 KB fuera de la GPU
+ * (vs_tope_kb=16). Que la GPU se cuelgue no dice nada del compilador; al
+ * contrario, EXPLICA la muerte, asi que el shader a medio compilar no se lleva
+ * aviso. Contarlo acababa mandando a la CPU, una sesion tras otra, los shaders
+ * que esa escena estuviera compilando cuando se colgaba la GPU por otra cosa.
  */
-bool CompilerCrashDumpSince(const SceIoStat& marker) {
+enum class DumpSince {
+    None,     ///< Nada en ux0:data posterior a la marca.
+    Gpu,      ///< Un psp2core-*-GPUCRASH: murio la consola, no el compilador.
+    Compiler, ///< Un psp2core-* normal: se cayo el proceso compilando.
+};
+
+DumpSince CrashDumpSince(const SceIoStat& marker) {
     const SceUID dir = sceIoDopen("ux0:data");
     if (dir < 0) {
-        return true;
+        return DumpSince::Compiler;
     }
     const u64 since = DateKey(marker.st_mtime);
-    bool found = false;
+    DumpSince found = DumpSince::None;
     SceIoDirent entry{};
+    // Sin cortar al primero: uno del compilador manda sobre uno de la GPU.
     while (sceIoDread(dir, &entry) > 0) {
-        if (std::strncmp(entry.d_name, "psp2core-", 9) == 0 &&
-            std::strstr(entry.d_name, "GPUCRASH") == nullptr &&
-            DateKey(entry.d_stat.st_mtime) >= since) {
-            found = true;
+        if (std::strncmp(entry.d_name, "psp2core-", 9) != 0 ||
+            DateKey(entry.d_stat.st_mtime) < since) {
+            continue;
+        }
+        if (std::strstr(entry.d_name, "GPUCRASH") == nullptr) {
+            found = DumpSince::Compiler;
             break;
         }
+        found = DumpSince::Gpu;
     }
     sceIoDclose(dir);
     return found;
@@ -919,8 +978,6 @@ void LoadBadSources() {
     }
     g_bad_loaded = true;
     ReadRecords(kBadListPath, g_bad_sources);
-    ReadRecords(kNoOptListPath, g_no_opt_sources);
-    ReadRecords(kRetriedPath, g_retried_sources);
     ReadRecords(kDiedPath, g_died_sources);
     SceIoStat marker_stat{};
     const bool marker_dated = sceIoGetstat(kCompilingPath, &marker_stat) >= 0;
@@ -940,17 +997,41 @@ void LoadBadSources() {
     {
         const SceUID suspect_fd = sceIoOpen(kSuspectPath, SCE_O_RDONLY, 0);
         if (suspect_fd >= 0) {
-            g_has_suspect = sceIoRead(suspect_fd, &g_suspect, sizeof(g_suspect)) ==
-                            static_cast<int>(sizeof(g_suspect));
+            SuspectRecord record{};
+            const int got = sceIoRead(suspect_fd, &record, sizeof(record));
             sceIoClose(suspect_fd);
+            if (got == static_cast<int>(sizeof(record))) {
+                g_suspect = record.source;
+                g_suspect_strikes = record.strikes;
+                g_has_suspect = true;
+            } else if (got == static_cast<int>(sizeof(BadSource))) {
+                g_suspect = record.source;
+                g_suspect_strikes = 1;
+                g_has_suspect = true;
+            }
         }
     }
-    if (crashed_fd >= 0 && marker_dated && !CompilerCrashDumpSince(marker_stat)) {
+    const DumpSince dump = marker_dated ? CrashDumpSince(marker_stat) : DumpSince::Compiler;
+    if (crashed_fd >= 0 && dump != DumpSince::Compiler) {
         CompilingMarker interrupted{{}, SCE_SHACCCG_PROFILE_VP, 1, 0, 0};
         sceIoRead(crashed_fd, &interrupted, sizeof(interrupted));
         sceIoClose(crashed_fd);
         sceIoRemove(kCompilingPath);
-        if (g_has_suspect && g_suspect == interrupted.source) {
+        const u32 strikes =
+            (g_has_suspect && g_suspect == interrupted.source) ? g_suspect_strikes + 1 : 1;
+        const u32 allowed = interrupted.source_size >= kBigSourceBytes ? kSuspectStrikesBig
+                                                                       : kSuspectStrikesSmall;
+        const char* const evidence = "sin volcado de la consola";
+        if (dump == DumpSince::Gpu) {
+            // Ver CrashDumpSince: murio la GPU, no el compilador. Sin aviso.
+            sceIoRemove(kCompilingSourcePath);
+            Common::VitaNote("gxm shader",
+                             fmt::format("la sesion anterior acabo con la GPU colgada (volcado "
+                                         "GPUCRASH) mientras se compilaba un shader de {} "
+                                         "bytes: no se le culpa",
+                                         interrupted.source_size)
+                                 .c_str());
+        } else if (strikes >= allowed) {
             StoreBadSource(interrupted.source);
             if (g_died_sources.insert(interrupted.source).second) {
                 AppendRecord(kDiedPath, interrupted.source);
@@ -961,27 +1042,21 @@ void LoadBadSources() {
                         fmt::format("{}/cg_murio_{:016x}.cg", kCacheDir,
                                     interrupted.source.hash_city)
                             .c_str());
+            g_suspect_strikes = 0;
             Common::VitaNote("gxm shader",
                              fmt::format("la sesion anterior acabo compilando un shader de {} "
-                                         "bytes por SEGUNDA vez seguida, sin volcado: a la "
-                                         "lista negra (sus lotes, por la CPU)",
-                                         interrupted.source_size)
+                                         "bytes por {}a vez seguida, {}: a la lista "
+                                         "negra (sus lotes, por la CPU)",
+                                         interrupted.source_size, strikes, evidence)
                                  .c_str());
         } else {
             sceIoRemove(kCompilingSourcePath);
-            const SceUID suspect_fd =
-                sceIoOpen(kSuspectPath, SCE_O_WRONLY | SCE_O_CREAT | SCE_O_TRUNC, 0777);
-            if (suspect_fd >= 0) {
-                sceIoWrite(suspect_fd, &interrupted.source, sizeof(interrupted.source));
-                sceIoClose(suspect_fd);
-            }
-            g_suspect = interrupted.source;
-            g_has_suspect = true;
+            WriteSuspect(interrupted.source, strikes);
             Common::VitaNote("gxm shader",
                              fmt::format("la sesion anterior acabo compilando un shader de {} "
-                                         "bytes, sin volcado de la consola: se compilara otra "
-                                         "vez; si vuelve a pasar con el, a la lista negra",
-                                         interrupted.source_size)
+                                         "bytes ({}a vez, {}): se "
+                                         "compilara otra vez, a la lista negra a la {}a",
+                                         interrupted.source_size, strikes, evidence, allowed)
                                  .c_str());
         }
     } else if (crashed_fd >= 0) {
@@ -994,17 +1069,10 @@ void LoadBadSources() {
         sceIoClose(crashed_fd);
         sceIoRemove(kCompilingPath);
         if (read_ok) {
-            // Los de vertices, nunca sin optimizar (0.2.1.4): en 0.2.1.3 uno de
-            // Pokemon Sol tardo 106 s en O0 y su programa colgo la GPU de la
-            // Vita ("GPU crash" del sistema). Van a la CPU.
-            const bool retry = crashed.optimization != 0 &&
-                               crashed.profile != SCE_SHACCCG_PROFILE_VP &&
-                               g_no_opt_sources.insert(crashed.source).second;
-            if (retry) {
-                AppendRecord(kNoOptListPath, crashed.source);
-            } else {
-                StoreBadSource(crashed.source);
-            }
+            // Nunca sin optimizar, ni los de vertices (0.2.1.4: uno de Pokemon Sol
+            // colgo la GPU en O0) ni, desde 0.3.7.8, los de fragmentos (ver
+            // PurgeUnoptimizedPrograms). A la lista negra: sus lotes, por la CPU.
+            StoreBadSource(crashed.source);
             if (g_died_sources.insert(crashed.source).second) {
                 AppendRecord(kDiedPath, crashed.source);
             }
@@ -1018,7 +1086,7 @@ void LoadBadSources() {
                             "({} bytes, O{}, heap libre {} KB): {}",
                             crashed.profile == SCE_SHACCCG_PROFILE_VP ? "vertices" : "fragmentos",
                             crashed.source_size, crashed.optimization, crashed.free_kb,
-                            retry ? "se reintenta sin optimizar" : "a la lista negra")
+                            "a la lista negra")
                     .c_str());
         }
     }
@@ -1045,17 +1113,6 @@ void StoreBadSource(const BadSource& bad) {
     }
     sceIoWrite(fd, &bad, sizeof(bad));
     sceIoClose(fd);
-}
-
-/// Ver g_retried_sources. Con g_cg_mutex cogido.
-bool FragmentRetryAllowed(const BadSource& source) {
-    if (g_retried_sources.count(source) != 0 || g_died_sources.count(source) != 0) {
-        return false;
-    }
-    SceIoStat stat{};
-    const std::string died_source =
-        fmt::format("{}/cg_murio_{:016x}.cg", kCacheDir, source.hash_city);
-    return sceIoGetstat(died_source.c_str(), &stat) < 0;
 }
 
 /// Ver g_tracking: descarga el compilador roto y devuelve lo que perdio.
@@ -1175,28 +1232,49 @@ bool CgHeapLow() {
  * GPU: se borran y van a la lista negra antes de precargar nada (0.2.1.4).
  * Despues de la primera vez no queda fichero que borrar y no hace nada.
  */
-void PurgeUnoptimizedVertexPrograms() {
+/*
+ * Y LOS DE FRAGMENTOS TAMBIEN (0.3.7.8). Un shader de fragmentos que daba error
+ * interno al optimizar se recompilaba en O0 (por la lista de sin optimizar o
+ * por el reintento de la lista negra, kRetriedPath) y el binario se guardaba
+ * en la cache con el nombre de siempre. En la intro de Zafiro Alfa (la bici)
+ * uno de esos colgaba la GPU en cada partida: la caja negra (gxm_caja_negra.h)
+ * dio la escena y el programa de fragmentos, que salia de la cache, y al quitar
+ * a mano los tres binarios O0 de fragmentos de la tarjeta (25-10) la escena
+ * paso. Ya no se compila ninguno en O0, y aqui se borran los que queden de
+ * cualquier juego; sus lotes van por la CPU, como antes del reintento.
+ */
+void PurgeUnoptimizedPrograms() {
     std::unordered_set<BadSource, BadSourceHash> no_opt;
     ReadRecords(kNoOptListPath, no_opt);
-    u32 purged = 0;
+    std::unordered_set<BadSource, BadSourceHash> retried;
+    ReadRecords(kRetriedPath, retried);
+    u32 purged_vs = 0;
+    u32 purged_fs = 0;
     const std::lock_guard lock{g_cg_mutex};
     for (const BadSource& source : no_opt) {
         if (sceIoRemove(CachePath(source.hash_city, SCE_SHACCCG_PROFILE_VP).c_str()) >= 0) {
             StoreBadSource(source);
-            purged++;
+            purged_vs++;
         }
     }
-    if (purged != 0) {
+    no_opt.insert(retried.begin(), retried.end());
+    for (const BadSource& source : no_opt) {
+        if (sceIoRemove(CachePath(source.hash_city, SCE_SHACCCG_PROFILE_FP).c_str()) >= 0) {
+            StoreBadSource(source);
+            purged_fs++;
+        }
+    }
+    if (purged_vs + purged_fs != 0) {
         Common::VitaNote("gxm cache",
-                         fmt::format("{} shaders de vertices sin optimizar borrados de la cache "
-                                     "(colgaban la GPU): a la CPU",
-                                     purged)
+                         fmt::format("{} shaders de vertices y {} de fragmentos sin optimizar "
+                                     "borrados de la cache (colgaban la GPU): a la CPU",
+                                     purged_vs, purged_fs)
                              .c_str());
     }
 }
 
 u32 PreloadCgCache(u64 program_id, const std::function<void(u32, u32)>& progress) {
-    PurgeUnoptimizedVertexPrograms();
+    PurgeUnoptimizedPrograms();
     g_start_notes.store(0, std::memory_order_relaxed);
     g_time_notes.store(0, std::memory_order_relaxed);
     g_cache_notes = 0;
@@ -1419,20 +1497,16 @@ const SceShaccCgCompileOutput* CompileCg(SceShaccCgTargetProfile profile, const 
     const std::lock_guard lock{g_cg_mutex};
     LoadBadSources();
     const BadSource this_source{key.hash_city, key.hash_fnv};
-    bool blacklist_retry = false;
     if (g_bad_sources.count(this_source) != 0) {
-        if (profile == SCE_SHACCCG_PROFILE_VP || !FragmentRetryAllowed(this_source)) {
-            static u32 blacklisted_notes = 0;
-            if (blacklisted_notes < 8) {
-                blacklisted_notes++;
-                Common::VitaNote("gxm shader",
-                                 fmt::format("{}: en la lista negra, no se compila ({} bytes)",
-                                             name, source_size)
-                                     .c_str());
-            }
-            return nullptr;
+        static u32 blacklisted_notes = 0;
+        if (blacklisted_notes < 8) {
+            blacklisted_notes++;
+            Common::VitaNote("gxm shader",
+                             fmt::format("{}: en la lista negra, no se compila ({} bytes)", name,
+                                         source_size)
+                                 .c_str());
         }
-        blacklist_retry = true;
+        return nullptr;
     }
     /**
      * NO EMPEZAR SIN MEMORIA DE SOBRA (0.1.8.1). Una compilacion puede pedir
@@ -1456,17 +1530,6 @@ const SceShaccCgCompileOutput* CompileCg(SceShaccCgTargetProfile profile, const 
     }
     if (!EnsureCgReady()) {
         return nullptr;
-    }
-    if (blacklist_retry) {
-        // Apuntado justo antes de compilar: si no se llega a intentar (sin
-        // heap, sin compilador), la oportunidad sigue ahi.
-        g_retried_sources.insert(this_source);
-        AppendRecord(kRetriedPath, this_source);
-        Common::VitaNote("gxm shader",
-                         fmt::format("{}: en la lista negra; se reintenta una vez sin optimizar "
-                                     "({} bytes)",
-                                     name, source_size)
-                             .c_str());
     }
     const unsigned long long compile_begin_us = Common::VitaMicros();
     /**
@@ -1502,12 +1565,8 @@ const SceShaccCgCompileOutput* CompileCg(SceShaccCgTargetProfile profile, const 
     if (profile == SCE_SHACCCG_PROFILE_VP) {
         options.optimizationLevel = 1;
     }
-    // Los de vertices nunca en O0 (0.2.1.6), aunque esten en la lista de antes:
-    // uno de ellos colgo la GPU en 0.2.1.3.
-    if (profile != SCE_SHACCCG_PROFILE_VP &&
-        (blacklist_retry || g_no_opt_sources.count(this_source) != 0)) {
-        options.optimizationLevel = 0;
-    }
+    // Nada en O0: los de vertices desde 0.2.1.6 (uno colgo la GPU en 0.2.1.3),
+    // los de fragmentos desde 0.3.7.8 (ver PurgeUnoptimizedPrograms).
 
     const std::size_t heap_before = HeapInUse();
     g_compile_budget = FreeHeap() - kEmulatorReserve;
@@ -1629,16 +1688,12 @@ const SceShaccCgCompileOutput* CompileCg(SceShaccCgTargetProfile profile, const 
         if (internal) {
             /**
              * Ese codigo no se vuelve a mandar (ni en otra sesion) y el
-             * compilador se recarga limpio para el siguiente. Uno de fragmentos
-             * optimizado, en cambio, se reintenta sin optimizar (0.3.2.1): el
-             * error interno es del optimizador, y en la lista negra todos sus
-             * lotes iban por software para siempre.
+             * compilador se recarga limpio para el siguiente. De 0.3.2.1 a
+             * 0.3.7.7 uno de fragmentos se reintentaba sin optimizar, y ese
+             * binario O0 colgaba la GPU (ver PurgeUnoptimizedPrograms): ahora va
+             * a la lista negra como los demas.
              */
-            if (profile != SCE_SHACCCG_PROFILE_VP && options.optimizationLevel != 0) {
-                if (g_no_opt_sources.insert(this_source).second && fresh_compiler) {
-                    AppendRecord(kNoOptListPath, this_source);
-                }
-            } else if (fresh_compiler) {
+            if (fresh_compiler) {
                 StoreBadSource(this_source);
             } else {
                 g_bad_sources.insert(this_source);
@@ -1686,6 +1741,7 @@ const SceShaccCgCompileOutput* CompileCg(SceShaccCgTargetProfile profile, const 
     if (g_has_suspect && g_suspect == BadSource{key.hash_city, key.hash_fnv}) {
         sceIoRemove(kSuspectPath);
         g_has_suspect = false;
+        g_suspect_strikes = 0;
     }
     // 0.1.7.9: la salida pasa a un bloque nuestro y el compilador suelta todo
     // lo suyo. Si no hay memoria ni para la copia, se devuelve la original

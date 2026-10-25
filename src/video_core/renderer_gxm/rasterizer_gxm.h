@@ -226,6 +226,24 @@ public:
      * ajustes.txt; a 0, como antes (cualquier escritura invalida).
      */
     static std::atomic<u32> memo_by_value;
+
+    /**
+     * CACHE DE DISPOSICIONES DE VERTICES (0.3.5.0). El memo guarda solo LA
+     * ULTIMA, y en el log de Zafiro del 23-10 las 1.345 reconstrucciones de un
+     * intervalo eran TODAS "por registros": el juego alterna modelos (A, B, A,
+     * B) y cada cambio tira la disposicion del otro, que estaba perfecta. Aqui
+     * se guardan las ultimas ocho, con una huella de exactamente lo que las
+     * decide, de modo que volver a un modelo ya visto no rehace nada.
+     * Clave "vs_cache_disp=" de ajustes.txt.
+     */
+    static std::atomic<u32> vs_layout_cache;
+    /**
+     * Servir el pipeline de fragmentos por huella de registros, sin construir
+     * el FSConfig (0.3.6.1, ver kFsKeyMask). Si la geometria sale bien pero
+     * los COLORES o la mezcla salen mal, es esto: clave "cache_pipeline=" de
+     * ajustes.txt, a 0 lo apaga.
+     */
+    static std::atomic<u32> cache_pipeline;
     /**
      * Tamano maximo, en KB de Cg, de un shader de vertices que se compila en
      * partida (0.3.4.9). Estaba fijo en 23: un programa de mas (26 KB, la piel
