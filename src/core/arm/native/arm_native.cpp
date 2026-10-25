@@ -480,7 +480,47 @@ bool TryRun(ARMul_State& state, u64 max_instructions, u32& ticks) {
 
     g_native_slices++;
     const u32 pc_antes = state.Reg[15];
+    const u32 lr_antes = state.Reg[14];
     CtxToState(ctx, state);
+    /**
+     * EL SALTO FUERA DEL CODIGO (0.3.8.9, diagnostico). En Smash Bros. con el
+     * motor nativo el segundo nucleo acaba ejecutando ceros por debajo de
+     * 0x00100000 (donde empieza el codigo de cualquier juego) y la emulacion
+     * se arrastra pagina a pagina. Para saber de donde salta: las ultimas
+     * rodajas de cada nucleo en un anillo, y la primera vez que una sale (o
+     * entra) por debajo de esa direccion, el anillo y los registros al log.
+     */
+    {
+        struct SliceTrace {
+            const void* core;
+            u32 in_pc, in_lr, out_pc, out_lr, reason;
+        };
+        static SliceTrace ring[16];
+        static u32 ring_at = 0;
+        static u32 wild_notes = 0;
+        ring[ring_at++ & 15u] = {&state, pc_antes, lr_antes, ctx.r[15], ctx.r[14], ctx.reason};
+        const bool wild = ctx.r[15] < 0x00100000u && pc_antes >= 0x00100000u;
+        if (wild && wild_notes < 3) {
+            wild_notes++;
+            Note("salto fuera del codigo: nucleo {} rodaja {} entra pc {:#010x} lr {:#010x} sale "
+                 "pc {:#010x} motivo {} | r0 {:08x} r1 {:08x} r2 {:08x} r3 {:08x} r4 {:08x} r5 "
+                 "{:08x} r6 {:08x} r7 {:08x} r8 {:08x} r9 {:08x} r10 {:08x} r11 {:08x} r12 {:08x} "
+                 "sp {:08x} lr {:08x} cpsr {:08x}",
+                 fmt::ptr(&state), g_native_slices, pc_antes, lr_antes, ctx.r[15],
+                 ReasonName(ctx.reason), ctx.r[0], ctx.r[1], ctx.r[2], ctx.r[3], ctx.r[4],
+                 ctx.r[5], ctx.r[6], ctx.r[7], ctx.r[8], ctx.r[9], ctx.r[10], ctx.r[11],
+                 ctx.r[12], ctx.r[13], ctx.r[14], ctx.cpsr);
+            for (u32 i = 0; i < 16; i++) {
+                const SliceTrace& t = ring[(ring_at + i) & 15u];
+                if (t.core == nullptr) {
+                    continue;
+                }
+                Note("  antes: nucleo {} entra pc {:#010x} lr {:#010x} -> sale pc {:#010x} lr "
+                     "{:#010x} motivo {}",
+                     t.core, t.in_pc, t.in_lr, t.out_pc, t.out_lr, ReasonName(t.reason));
+            }
+        }
+    }
     /* El peaje de cada entrada y salida no es trabajo del invitado: ver
      * kSwitchUs. El suelo evita cobrar cero, que dejaria el reloj clavado. */
     const u32 peaje = info.entries * kSwitchUs;
