@@ -218,8 +218,16 @@ public:
                    "fog_factor);\n";
         }
 
-        // El redondeo final: la PICA escribe siempre 8 bits por canal.
-        out += "    combiner_output = byteround(combiner_output);\n";
+        /**
+         * El redondeo final: la PICA escribe siempre 8 bits por canal. Desde
+         * 0.3.8.8 solo con niebla: cada etapa TEV ya deja su salida redondeada
+         * a 8 bits y dentro de [0, 1] (tambien con multiplicador 2 o 4, que
+         * sobre k/255 da 2k/255 o 4k/255 exactos), asi que sin la mezcla de la
+         * niebla redondear otra vez da el mismo valor y es trabajo por pixel.
+         */
+        if (config.texture.fog_mode == TexturingRegs::FogMode::Fog) {
+            out += "    combiner_output = byteround(combiner_output);\n";
+        }
         out += "    gl_FragColor = combiner_output;\n";
         // Despues de la prueba de alfa, que sigue usando el alfa calculado.
         if (alpha_from_blend_const) {
@@ -240,6 +248,12 @@ private:
         // porque round de Cg no garantiza el empate hacia arriba, y los
         // valores aqui son siempre no negativos.
         out += "float4 byteround(float4 x) {\n";
+        out += "    return floor(x * 255.0 + 0.5) / 255.0;\n";
+        out += "}\n\n";
+        // El mismo para un solo canal (0.3.8.8): el alfa de cada etapa iba en
+        // un float4 con tres ceros, y nada obliga al compilador a ver que tres
+        // de los cuatro carriles sobran.
+        out += "float byteround1(float x) {\n";
         out += "    return floor(x * 255.0 + 0.5) / 255.0;\n";
         out += "}\n\n";
         if (config.lighting.enable) {
@@ -1069,8 +1083,39 @@ private:
         write("b", lighting.lut_rb, LightingRegs::LightingSampler::ReflectBlue, "refl_value.r");
     }
 
+    /**
+     * ETAPA DE PASO (0.3.8.8): sustituir por la salida anterior, color y alfa
+     * tal cual y sin multiplicador. Los juegos dejan asi las etapas que no
+     * usan -- en el titulo de Smash Bros. tres de las seis de cada shader, y
+     * su escena principal pasaba 15 ms en el chip --, y el generador las
+     * calculaba enteras en cada pixel: clamp y redondeo del color y del alfa
+     * de un valor que ya esta redondeado a 8 bits y dentro de [0, 1], que es
+     * como queda combiner_output despues de cualquier etapa (ver el redondeo
+     * final en Generate). El resultado es el mismo valor, bit a bit. Lo del
+     * buffer de combinacion se hace igual que en una etapa normal.
+     */
+    static bool IsPassThroughStage(const TexturingRegs::TevStageConfig& stage) {
+        return stage.color_op == Operation::Replace && stage.alpha_op == Operation::Replace &&
+               stage.color_source1 == Source::Previous &&
+               stage.alpha_source1 == Source::Previous &&
+               stage.color_modifier1 == ColorModifier::SourceColor &&
+               stage.alpha_modifier1 == AlphaModifier::SourceAlpha &&
+               stage.GetColorMultiplier() == 1 && stage.GetAlphaMultiplier() == 1;
+    }
+
     void WriteTevStage(u32 index) {
         const TexturingRegs::TevStageConfig stage = config.texture.tev_stages[index];
+
+        if (IsPassThroughStage(stage)) {
+            out += "    combiner_buffer = next_combiner_buffer;\n";
+            if (config.TevStageUpdatesCombinerBufferColor(index)) {
+                out += "    next_combiner_buffer.rgb = combiner_output.rgb;\n";
+            }
+            if (config.TevStageUpdatesCombinerBufferAlpha(index)) {
+                out += "    next_combiner_buffer.a = combiner_output.a;\n";
+            }
+            return;
+        }
 
         out += "    color_results_1 = ";
         AppendColorModifier(stage.color_modifier1, stage.color_source1, index);
@@ -1092,9 +1137,9 @@ private:
             AppendAlphaModifier(stage.alpha_modifier2, stage.alpha_source2, index);
             out += ";\n    alpha_results_3 = ";
             AppendAlphaModifier(stage.alpha_modifier3, stage.alpha_source3, index);
-            out += fmt::format(";\n    float alpha_output_{} = byteround(float4(", index);
+            out += fmt::format(";\n    float alpha_output_{} = byteround1(", index);
             AppendAlphaCombiner(stage.alpha_op);
-            out += ", 0.0, 0.0, 0.0)).r;\n";
+            out += ");\n";
         }
 
         /**

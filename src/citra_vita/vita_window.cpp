@@ -1103,6 +1103,7 @@ void EmuWindow_Vita::DrawStatsOverlay() {
                             .c_str());
                 }
             }
+            stats_gx_frames = n;
             Common::FrameStats::Reset();
         }
 
@@ -1342,6 +1343,9 @@ void EmuWindow_Vita::DrawStatsOverlay() {
         stats_raster_share_percent =
             cmdlist > 0.0 ? tri_total_us * 1000.0 / cmdlist * 100.0 : 0.0;
 
+        stats_gx_cmdlist_ms = cmdlist / stats_gx_frames / 1e6;
+        stats_gx_fill_ms = fill / stats_gx_frames / 1e6;
+        stats_gx_transfer_ms = transfer / stats_gx_frames / 1e6;
         const double gx_total = cmdlist + fill + transfer + dma;
         if (gx_total > 0.0) {
             stats_gx_cmdlist = cmdlist / gx_total * 100.0;
@@ -1400,7 +1404,8 @@ void EmuWindow_Vita::DrawStatsOverlay() {
                 Common::VitaNote(
                     "gpu",
                     fmt::format("tri/fot {:.0f} | tg {} ts {} lot {} vsg {} no {} ({}) vsh {} "
-                                "esc {} vol {} | gx tri {:.0f}% rell {:.0f}% tran {:.0f}% | "
+                                "esc {} vol {} | gx tri {:.0f}% rell {:.0f}% tran {:.0f}% "
+                                "(ms/fot {:.1f} {:.1f} {:.1f}) | "
                                 "par {:.0f} ins {:.0f} rap {:.0f}% | copia gpu {} de verdad {} | relleno gpu {} "
                                 "sinc soft {} | saltados por compilar {}",
                                 stats_triangles_per_frame, stats_tri_gpu, stats_tri_sw,
@@ -1408,6 +1413,7 @@ void EmuWindow_Vita::DrawStatsOverlay() {
                                 Gxm::RasterizerGXM::TakeRejectSummary(),
                                 stats_vertices_shaded, stats_gpu_scenes, stats_gpu_writebacks,
                                 stats_gx_cmdlist, stats_gx_fill, stats_gx_transfer,
+                                stats_gx_cmdlist_ms, stats_gx_fill_ms, stats_gx_transfer_ms,
                                 stats_shade_occupancy, stats_instrs_per_vertex, stats_fast_percent,
                                 Gxm::RasterizerGXM::gpu_transfers.exchange(
                                     0, std::memory_order_relaxed),

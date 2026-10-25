@@ -259,6 +259,12 @@ private:
     double stats_gx_cmdlist = 0.0;
     double stats_gx_fill = 0.0;
     double stats_gx_transfer = 0.0;
+    /// Lo mismo en ms por fotograma (0.3.8.8): con el hilo de la GPU, el
+    /// reparto no dice cuanto pesa cada cosa en ese hilo.
+    double stats_gx_cmdlist_ms = 0.0;
+    double stats_gx_fill_ms = 0.0;
+    double stats_gx_transfer_ms = 0.0;
+    double stats_gx_frames = 1.0;
     double stats_covered = 0.0;
     double stats_zkill_percent = 0.0;
     /// De los pixeles cubiertos, cuantos mueren en la prueba de alfa y cuantos

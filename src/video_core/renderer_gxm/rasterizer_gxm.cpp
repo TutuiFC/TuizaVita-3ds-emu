@@ -434,18 +434,21 @@ constexpr const char* kDumpVsFlagPath = "ux0:/data/azahar/volcar_vs.txt";
 constexpr const char* kDumpVsDir = "ux0:/data/azahar/vs_fuentes";
 bool g_dump_vs = false;
 
-void DumpVsSource(const std::string& source) {
-    static std::unordered_set<u64> dumped;
+/// Lo mismo para los de fragmentos (0.3.8.8), en fs_fuentes/<hash>.cg: el
+/// nombre es el de su .gxp de la cache (<hash>_1.gxp).
+constexpr const char* kDumpFsDir = "ux0:/data/azahar/fs_fuentes";
+
+void DumpSource(const char* dir, std::unordered_set<u64>& dumped, bool& dir_ready,
+                const std::string& source) {
     const u64 hash = Common::ComputeHash64(source.data(), source.size());
     if (!dumped.insert(hash).second) {
         return;
     }
-    static bool dir_ready = false;
     if (!dir_ready) {
-        sceIoMkdir(kDumpVsDir, 0777);
+        sceIoMkdir(dir, 0777);
         dir_ready = true;
     }
-    const std::string path = fmt::format("{}/{:016x}.cg", kDumpVsDir, hash);
+    const std::string path = fmt::format("{}/{:016x}.cg", dir, hash);
     SceIoStat stat{};
     if (sceIoGetstat(path.c_str(), &stat) >= 0) {
         return;
@@ -455,6 +458,18 @@ void DumpVsSource(const std::string& source) {
         sceIoWrite(fd, source.data(), static_cast<SceSize>(source.size()));
         sceIoClose(fd);
     }
+}
+
+void DumpVsSource(const std::string& source) {
+    static std::unordered_set<u64> dumped;
+    static bool dir_ready = false;
+    DumpSource(kDumpVsDir, dumped, dir_ready, source);
+}
+
+void DumpFsSource(const std::string& source) {
+    static std::unordered_set<u64> dumped;
+    static bool dir_ready = false;
+    DumpSource(kDumpFsDir, dumped, dir_ready, source);
 }
 
 SceGxmDepthFunc MapDepthFunc(FramebufferRegs::CompareFunc func) {
@@ -1711,6 +1726,9 @@ struct RasterizerGXM::PipelineCache {
             config, &generator_reason, alpha_carrier, entry->color_carrier != 0);
         if (!source.has_value()) {
             return fail(generator_reason != nullptr ? generator_reason : "shader");
+        }
+        if (g_dump_vs) {
+            DumpFsSource(*source);
         }
         /**
          * Con iluminacion hace falta el formato de vertice largo, y ese shader

@@ -471,6 +471,15 @@ u32 TextureCache::InvalidateRange(PAddr addr, u32 size) {
      */
     for (auto& entry : entries) {
         if (entry.valid && entry.address < end && addr < entry.address + entry.span) {
+            static u32 noted = 0;
+            if ((entry.fill_tag != 0 || entry.pending_fill_tag != 0) && noted < 6) {
+                noted++;
+                Common::VitaNote("gxm textura",
+                                 fmt::format("vaciado {:#010x}+{:#x} quita la etiqueta de relleno "
+                                             "de {:#010x}+{:#x}",
+                                             addr, size, entry.address, entry.span)
+                                     .c_str());
+            }
             marked += MarkStale(entry, addr, end) ? 1u : 0u;
             entry.fill_tag = 0;
             entry.pending_fill_tag = 0;
@@ -495,6 +504,18 @@ u32 TextureCache::InvalidateFill(PAddr addr, u32 size, u32 texel, u32 bpp) {
         if (covered && !entry.stale && entry.fill_tag == tag) {
             fill_skips.fetch_add(1, std::memory_order_relaxed);
             continue;
+        }
+        // Por que no se ahorra la revision (0.3.8.8, diagnostico): unas pocas.
+        static u32 noted = 0;
+        if (noted < 12) {
+            noted++;
+            Common::VitaNote(
+                "gxm textura",
+                fmt::format("relleno {:#010x}+{:#x} texel {:#010x} bpp {} marca {:#010x}+{:#x} "
+                            "cubierta {} vieja {} etiqueta {:#x} (esta {:#x})",
+                            addr, size, texel, bpp, entry.address, entry.span, covered ? 1 : 0,
+                            entry.stale ? 1 : 0, entry.fill_tag, tag)
+                    .c_str());
         }
         marked += MarkStale(entry, addr, end) ? 1u : 0u;
         entry.fill_tag = 0;

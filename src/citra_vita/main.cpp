@@ -319,6 +319,11 @@ void ConfigureSettings() {
  */
 void WriteCrashLog(const char* title, const char* detail); // definida mas abajo
 
+/// Hay una partida del piloto automatico en marcha (ver RunPilotIfAny).
+std::atomic<bool> g_pilot_running{false};
+/// Hay un juego cargando o en marcha (ver StartKeepAwake).
+std::atomic<bool> g_in_game{false};
+
 constexpr char kSettingsFile[] = "ux0:/data/azahar/ajustes.txt";
 constexpr SceUInt64 kSettingsHoldUs = 2'000'000;
 /// Mantener SELECT en el menu de inicio abre el selector de idioma (0.3.3.9).
@@ -1491,6 +1496,13 @@ void DrawFatalError(vita2d_pgf* font, const char* title, const std::string& deta
 
 /// Carga y ejecuta un juego hasta que el usuario sale o falla.
 void RunGame(vita2d_pgf* font, const std::string& path) {
+    // Ver StartKeepAwake: sin tocar la consola, el sistema no la suspende.
+    g_in_game.store(true, std::memory_order_relaxed);
+    struct InGameEnd {
+        ~InGameEnd() {
+            g_in_game.store(false, std::memory_order_relaxed);
+        }
+    } in_game_end;
     DrawMessage(font, T(I18n::kLoading), path.c_str());
     LOG_INFO(Frontend, "Cargando {} (memoria libre: {} KB)", path, FreeMemoryKB());
 
@@ -1577,12 +1589,74 @@ void RunGame(vita2d_pgf* font, const std::string& path) {
      */
     std::atomic<unsigned int> heartbeat{0};
     std::atomic<bool> watchdog_stop{false};
-    std::thread watchdog([&heartbeat, &watchdog_stop, &system] {
+    /**
+     * 0.3.8.8: con prioridad alta. A la de por defecto (160, la del hilo de
+     * emulacion) no llego a escribir nada cuando Smash Bros. se quedo parado
+     * en el arranque con el JIT: el log se corto sin "congelado". Duerme casi
+     * siempre, asi que no le quita nada a nadie. Ademas anota las palabras del
+     * juego alrededor de cada PC (para desensamblarlas fuera) y, solo con el
+     * piloto automatico, a los 20 s provoca un fallo a proposito: el volcado
+     * de la consola trae los registros de TODOS los hilos, que es lo que dice
+     * donde esta atascado cada uno.
+     */
+    std::thread watchdog([&heartbeat, &watchdog_stop, &system, &window] {
+        sceKernelChangeThreadPriority(sceKernelGetThreadId(), 64);
+        const auto words_at = [&system](u32 pc) {
+            std::string out;
+            const u32 begin = (pc & ~3u) - 16;
+            for (u32 at = begin; at < begin + 40; at += 4) {
+                const u8* p = system.Memory().GetPointer(at);
+                u32 word = 0;
+                if (p != nullptr) {
+                    std::memcpy(&word, p, 4);
+                }
+                out += fmt::format(" {:08x}", word);
+            }
+            return fmt::format("{:#010x}:{}", begin, out);
+        };
         unsigned int last = ~0u;
         unsigned int still = 0;
+        /**
+         * SIN FOTOGRAMAS PERO SIN PARAR (0.3.8.8). Smash Bros. con el JIT se
+         * quedaba en el arranque sin "congelado": el bucle seguia dando vueltas,
+         * pero tan despacio que no llegaba a la siguiente marca de avance. Cada
+         * 10 s sin ningun fotograma nuevo se anota cuanto ha avanzado y en que
+         * se va el ARM (las cuentas del JIT, que sin fotogramas no lee nadie).
+         */
+        unsigned int tick = 0;
+        unsigned int beat_loops = 0;
+        u64 beat_frames = 0;
+        unsigned int beats = 0;
         while (!watchdog_stop.load(std::memory_order_relaxed)) {
             sceKernelDelayThread(1000 * 1000);
             const unsigned int now = heartbeat.load(std::memory_order_relaxed);
+            if (++tick % 10 == 0) {
+                const u64 frames = window->FramesPresented();
+                if (frames == beat_frames && now != beat_loops && beats < 40) {
+                    beats++;
+                    Core::ArmJit::Stats jit;
+                    Core::ArmJit::TakeStats(jit);
+                    u32 code_bytes = 0;
+                    u32 code_blocks = 0;
+                    Core::ArmJit::CodeUsage(code_bytes, code_blocks);
+                    const u32 pc0 = system.GetCore(0).GetPC();
+                    const std::string text = fmt::format(
+                        "10 s sin fotogramas: {} ciclos (van {}), en '{}', gpu en '{}', pc0 "
+                        "{:#010x} pc1 {:#010x} | arm: {} instr ({} jit), {} rodajas, {} ms "
+                        "(svc {}, compilar {}), {} bloques en {} KB",
+                        now - beat_loops, now, Common::vita_stage.load(std::memory_order_relaxed),
+                        Common::vita_gpu_stage.load(std::memory_order_relaxed), pc0,
+                        system.GetCore(1).GetPC(), jit.instructions, jit.jit_instructions,
+                        jit.slices, jit.arm_us / 1000, jit.svc_us / 1000, jit.compile_us / 1000,
+                        code_blocks, code_bytes / 1024);
+                    WriteCrashLog("latido", text.c_str());
+                    if (beats <= 3) {
+                        WriteCrashLog("latido: codigo pc0", words_at(pc0).c_str());
+                    }
+                }
+                beat_frames = frames;
+                beat_loops = now;
+            }
             if (now != last) {
                 last = now;
                 still = 0;
@@ -1590,13 +1664,24 @@ void RunGame(vita2d_pgf* font, const std::string& path) {
             }
             still++;
             if (still == 6 || still == 30) {
+                const u32 pc0 = system.GetCore(0).GetPC();
+                const u32 pc1 = system.GetCore(1).GetPC();
                 const std::string text = fmt::format(
                     "{} s sin avanzar, en '{}' (ciclo {}), pc0 {:#010x} pc1 {:#010x}, hilo de "
                     "la gpu en '{}'",
-                    still, Common::vita_stage.load(std::memory_order_relaxed), now,
-                    system.GetCore(0).GetPC(), system.GetCore(1).GetPC(),
+                    still, Common::vita_stage.load(std::memory_order_relaxed), now, pc0, pc1,
                     Common::vita_gpu_stage.load(std::memory_order_relaxed));
                 WriteCrashLog("congelado", text.c_str());
+                WriteCrashLog("congelado: codigo pc0", words_at(pc0).c_str());
+                if (pc1 != 0) {
+                    WriteCrashLog("congelado: codigo pc1", words_at(pc1).c_str());
+                }
+            }
+            if (still == 20 && g_pilot_running.load(std::memory_order_relaxed)) {
+                WriteCrashLog("congelado", "piloto: 20 s parado, fallo a proposito para tener "
+                                           "el volcado con los registros de todos los hilos");
+                sceKernelDelayThread(200 * 1000);
+                *reinterpret_cast<volatile unsigned int*>(0x00000C00) = still;
             }
         }
     });
@@ -1996,7 +2081,9 @@ void RunPilotIfAny(vita2d_pgf* font, const std::vector<RomEntry>& roms) {
                                    .c_str());
     pthread_t thread{};
     const bool started = pthread_create(&thread, nullptr, &PilotMain, &pilot) == 0;
+    g_pilot_running.store(true, std::memory_order_relaxed);
     RunGame(font, rom->path);
+    g_pilot_running.store(false, std::memory_order_relaxed);
     pilot.stop.store(true, std::memory_order_relaxed);
     if (started) {
         pthread_join(thread, nullptr);
@@ -2015,6 +2102,63 @@ void RunPilotIfAny(vita2d_pgf* font, const std::vector<RomEntry>& roms) {
         sceKernelDelayThread(1500 * 1000);
         sceKernelExitProcess(0);
     }
+}
+
+/**
+ * LA CONSOLA DESPIERTA MIENTRAS HAY JUEGO (0.3.8.8). Azahar no llamaba nunca a
+ * sceKernelPowerTick, y la Vita solo sabe que se esta usando por los botones:
+ * sin tocarla, al cumplirse el tiempo de suspension automatica el sistema
+ * dejaba el proceso entero parado. Lo destapo el piloto automatico con la
+ * consola sola (25-10: cualquier juego se paraba a los 13 s de abrirse), pero
+ * le pasa igual a quien mira una escena larga sin pulsar nada. Mientras hay un
+ * juego cargando o en marcha (g_in_game, ver RunGame), cada segundo se anula
+ * el temporizador de suspension; los de oscurecer y apagar la pantalla siguen
+ * como el usuario los tenga.
+ *
+ * SIGUE VIVO? Con el piloto automatico, ademas, cada 2 s se reescribe
+ * ux0:/data/azahar/vivo.txt con un contador y la etapa de cada hilo: si
+ * crash.txt deja de crecer y vivo.txt sigue contando, el proceso esta vivo y
+ * algo bloquea solo a unos hilos. Solo con piloto.txt, para no escribir de mas
+ * en la tarjeta en una partida normal.
+ */
+bool g_write_alive = false;
+
+void* AliveMain(void*) {
+    sceKernelChangeThreadPriority(sceKernelGetThreadId(), 64);
+    unsigned int count = 0;
+    while (true) {
+        if (g_in_game.load(std::memory_order_relaxed)) {
+            sceKernelPowerTick(SCE_KERNEL_POWER_TICK_DISABLE_AUTO_SUSPEND);
+        }
+        if (g_write_alive && (++count & 1) == 0) {
+            const std::string text = fmt::format(
+                "{} {} s etapa '{}' gpu '{}'\n", count / 2,
+                static_cast<unsigned int>(sceKernelGetProcessTimeWide() / 1000000),
+                Common::vita_stage.load(std::memory_order_relaxed),
+                Common::vita_gpu_stage.load(std::memory_order_relaxed));
+            const SceUID fd = sceIoOpen("ux0:/data/azahar/vivo.txt",
+                                        SCE_O_WRONLY | SCE_O_CREAT | SCE_O_TRUNC, 0777);
+            if (fd >= 0) {
+                sceIoWrite(fd, text.data(), static_cast<SceSize>(text.size()));
+                sceIoClose(fd);
+            }
+        }
+        sceKernelDelayThread(1000 * 1000);
+    }
+    return nullptr;
+}
+
+void StartKeepAwake() {
+    SceIoStat stat{};
+    g_write_alive = sceIoGetstat(kPilotPath, &stat) >= 0;
+    pthread_attr_t attr;
+    pthread_attr_init(&attr);
+    pthread_attr_setstacksize(&attr, 32 * 1024);
+    pthread_t thread;
+    if (pthread_create(&thread, &attr, &AliveMain, nullptr) == 0) {
+        pthread_detach(thread);
+    }
+    pthread_attr_destroy(&attr);
 }
 
 /// Los argumentos de main(), para Core::Native::LoadModuleIfMissing.
@@ -2212,6 +2356,7 @@ int main(int argc, char** argv) {
     // nuevo y el de la sesion anterior queda en crash_anterior.txt.
     sceIoMkdir("ux0:/data", 0777);
     sceIoMkdir("ux0:/data/azahar", 0777);
+    StartKeepAwake();
     sceIoRemove("ux0:/data/azahar/crash_anterior.txt");
     sceIoRename(kCrashLog, "ux0:/data/azahar/crash_anterior.txt");
     // Lo mismo con los shaders que no compilan: solo los de esta sesion.

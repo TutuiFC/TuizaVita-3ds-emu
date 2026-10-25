@@ -464,7 +464,12 @@ bool TryRun(ARMul_State& state, u64 max_instructions, u32& ticks) {
 
     AzRunInfo info;
     std::memset(&info, 0, sizeof(info));
+    // El monitor exclusivo real, limpio a la entrada y a la salida: un STREX
+    // nativo cuyo LDREX fue en otra rodaja (de este o del otro nucleo) falla.
+    // Ver ARM_DynCom::ExecuteInstructions (0.3.8.7).
+    __asm__ volatile("clrex" ::: "memory");
     const int rc = AzNativeRun(&ctx, AZ_RUN_WORLD | AZ_RUN_IRQ | AZ_RUN_VFP, budget_us, &info);
+    __asm__ volatile("clrex" ::: "memory");
     if (rc < 0) {
         // La llamada en si fallo: no se ha ejecutado nada, el estado sigue como
         // estaba y el interprete no se entera.
@@ -591,6 +596,26 @@ void CodeChanged() {
     g_code_changes++;
 }
 
+void CodeChangedRange(Memory::MemorySystem& memory, u32 va, u32 bytes) {
+    if (!enabled || g_state != State::Present) {
+        return;
+    }
+    // Pagina a pagina: la memoria del invitado no es contigua en el emulador.
+    // AzNativeCleanRange limpia por la direccion del que llama (L1 y L2).
+    const u32 end = va + bytes;
+    u32 at = va;
+    while (at < end) {
+        const u32 page_end = (at | (Memory::CITRA_PAGE_SIZE - 1)) + 1;
+        const u32 chunk = (end < page_end ? end : page_end) - at;
+        if (u8* const host = memory.GetPointer(at)) {
+            AzNativeCleanRange(host, chunk);
+        }
+        at += chunk;
+    }
+    AzNativeIcacheAll();
+    g_code_changes++;
+}
+
 
 /**
  * AL CERRAR CADA SESION, todo fuera (0.3.8.3). Hasta ahora no la llamaba nadie,
@@ -655,6 +680,7 @@ bool TryRun(ARMul_State&, u64, u32& ticks) {
 }
 void MirrorRange(u8* const*, u32, u32) {}
 void CodeChanged() {}
+void CodeChangedRange(Memory::MemorySystem&, u32, u32) {}
 void LogStats() {}
 void Release() {}
 } // namespace Core::Native

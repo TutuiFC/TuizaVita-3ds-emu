@@ -110,6 +110,16 @@ void MirrorRange(u8* const* raw, u32 first_page, u32 pages);
 void CodeChanged();
 
 /**
+ * Lo mismo para un rango conocido, LIMPIANDO ANTES LA CACHE DE DATOS (0.3.8.6).
+ * AzNativeIcacheAll solo invalida la de instrucciones; lo que el emulador acaba
+ * de escribir (las reubicaciones de un CRO, codigo cargado a mano) puede seguir
+ * en la L1 de datos sin llegar a la L2, de donde la de instrucciones vuelve a
+ * leer: el invitado ejecutaria lo de antes. Smash Bros. carga y reubica CROs sin
+ * parar, y con el motor nativo acababa con el segundo nucleo en 0x5000-0xc000.
+ */
+void CodeChangedRange(Memory::MemorySystem& memory, u32 va, u32 bytes);
+
+/**
  * EL NUMERO DE SVC DE LA INSTRUCCION QUE ACABA DE SALTAR.
  *
  * El modulo devuelve el contexto con pc apuntando a la instruccion SIGUIENTE a

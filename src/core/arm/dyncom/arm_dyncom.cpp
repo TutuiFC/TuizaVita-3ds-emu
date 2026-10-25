@@ -72,8 +72,9 @@ void ARM_DynCom::InvalidateCacheRange(u32 start_address, std::size_t length) {
     ResetTransCacheFromRange(start_address, length);
 #ifdef __PSVITA__
     // El codigo del invitado cambio: la cache de instrucciones del chip tambien
-    // hay que tirarla, no solo la de traduccion. Ver Core::Native::CodeChanged.
-    Core::Native::CodeChanged();
+    // hay que tirarla, no solo la de traduccion, y antes limpiar la de datos.
+    // Ver Core::Native::CodeChangedRange.
+    Core::Native::CodeChangedRange(system.Memory(), start_address, static_cast<u32>(length));
 #endif
 }
 
@@ -183,6 +184,15 @@ void ARM_DynCom::ExecuteInstructions(u64 num_instructions) {
     // traducciones nuevas. Ver TRANS_CACHE_MARGIN.
     FlushTransCacheIfNeeded();
 
+    /**
+     * NINGUNA RESERVA EXCLUSIVA CRUZA UNA RODAJA (0.3.8.7). Entre dos rodajas
+     * de este nucleo ha corrido el otro, que pudo escribir la direccion
+     * reservada: un STREX cuyo LDREX quedo en la rodaja anterior tiene que
+     * fallar (el juego reintenta, y la arquitectura lo permite). Sin esto, y
+     * con el motor nativo usando el monitor real, Smash Bros. (dos nucleos)
+     * rompia sus cerrojos y acababa con el segundo nucleo en 0x6000.
+     */
+    state->UnsetExclusiveMemoryAddress();
     state->NumInstrsToExecute = num_instructions;
 #ifdef __PSVITA__
     // Una rodaja de cada cuatro con reloj, por cuatro (0.3.2.1): son miles por
@@ -230,6 +240,12 @@ void ARM_DynCom::ExecuteInstructions(u64 num_instructions) {
         timer->AddTicks(ticks_executed);
     }
     state->ServeBreak();
+}
+
+void ARM_DynCom::ClearExclusiveState() {
+    // Lo pide el kernel al cambiar de hilo. Estaba vacia: la reserva de un hilo
+    // sobrevivia al cambio y la podia consumir el STREX de otro.
+    state->UnsetExclusiveMemoryAddress();
 }
 
 void ARM_DynCom::SaveContext(ThreadContext& ctx) {
