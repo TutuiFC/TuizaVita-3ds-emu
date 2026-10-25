@@ -1838,6 +1838,10 @@ void DrawStep(vita2d_pgf* font, const char* step, I18n::Str shown) {
     vita2d_swap_buffers();
 }
 
+/// Los argumentos de main(), para Core::Native::LoadModuleIfMissing.
+int g_argc = 0;
+char** g_argv = nullptr;
+
 /// Cuerpo real del programa. main() lo envuelve para poder enseñar por pantalla
 /// cualquier excepcion en vez de morir con un abort() mudo.
 void Run(vita2d_pgf* font) {
@@ -1865,6 +1869,10 @@ void Run(vita2d_pgf* font) {
     LoadUserSettings();
     ApplyUserSettings();
     NoteUserSettings();
+    if (g_user.jit_nativo) {
+        // Si el modulo de kernel no esta, lo carga y RELANZA la app (0.3.7.9).
+        Core::Native::LoadModuleIfMissing(g_argc, g_argv);
+    }
 
     DrawStep(font, "4/7 configurando mandos", I18n::kStep4);
     VitaFrontend::Input::Init();
@@ -1995,6 +2003,8 @@ void Run(vita2d_pgf* font) {
 } // Anonymous namespace
 
 int main(int argc, char** argv) {
+    g_argc = argc;
+    g_argv = argv;
     // El Cortex-A9 de la Vita va a 333 MHz por defecto. Emular un ARM11 con un
     // interprete es lo mas caro que puede hacer esta consola, asi que se sube
     // todo al maximo que permite el sistema.

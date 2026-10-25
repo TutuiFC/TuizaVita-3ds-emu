@@ -51,6 +51,13 @@ namespace Core::Native {
 /// sin resolver no.
 bool Available();
 
+/**
+ * Si el modulo de kernel no esta cargado, lo carga y relanza la app (0.3.7.9).
+ * Solo hace algo la primera vez de cada encendido; ver arm_native.cpp. Antes
+ * de que nada pregunte por Available(), y solo con jit_nativo=1.
+ */
+void LoadModuleIfMissing(int argc, char** argv);
+
 /// Lo que dice la version del modulo cargado, 0 si no hay ninguno. Para el log.
 u32 ModuleVersion();
 

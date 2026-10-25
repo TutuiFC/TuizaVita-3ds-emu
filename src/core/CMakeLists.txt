@@ -558,6 +558,18 @@ if(VITA)
     target_compile_options(aznative_stub PRIVATE "-Wa,--defsym,GEN_WEAK_EXPORTS=1")
     target_link_libraries(citra_core PRIVATE aznative_stub)
   endif()
+  # taiHEN, para que Azahar cargue el modulo el solo (0.3.7.9, ver
+  # Core::Native::LoadModuleIfMissing). DEBIL por lo mismo que los stubs de
+  # arriba: sin taiHEN el ejecutable arranca igual y no se llama.
+  set(TAIHEN_DIR "C:/Users/guira/azdeps/taihen-0.11" CACHE PATH "taiHEN: include y lib")
+  if(EXISTS "${TAIHEN_DIR}/include/taihen.h")
+    # Solo para arm_native.cpp: puesto en todo citra_core, cambiarlo obligaba a
+    # recompilar el nucleo entero.
+    set_source_files_properties(arm/native/arm_native.cpp PROPERTIES
+      COMPILE_DEFINITIONS AZAHAR_TAIHEN
+      INCLUDE_DIRECTORIES "${TAIHEN_DIR}/include")
+    target_link_libraries(citra_core PRIVATE "${TAIHEN_DIR}/lib/libtaihen_stub_weak.a")
+  endif()
 endif()
 
 target_link_libraries(citra_core PUBLIC citra_common PRIVATE audio_core network video_core)

@@ -4,6 +4,7 @@
 
 #include "video_core/renderer_gxm/gxm_caja_negra.h"
 
+#include <algorithm>
 #include <atomic>
 #include <cstdint>
 #include <cstdio>
@@ -11,6 +12,7 @@
 #include <pthread.h>
 #include <psp2/gxm.h>
 #include <psp2/io/fcntl.h>
+#include <psp2/io/stat.h>
 #include <psp2/kernel/threadmgr.h>
 #include "common/vita_diag.h"
 
@@ -206,6 +208,229 @@ void WriteReport(const Box& box) {
     Common::VitaNote("gxm caja negra", "la GPU no avanza: escrito gpu_colgada.txt");
 }
 
+/*
+ * EL CRONOMETRO DEL CHIP (0.3.7.9). En Zafiro el hilo de la GPU espera ~10 ms
+ * por vblank a la valla de HACE DOS FOTOGRAMAS: el SGX va saturado y es el
+ * muro. Antes de adelgazar shaders hay que saber que se lleva el tiempo del
+ * chip, y eso no lo mide nadie. Esto si: el hilo que dibuja apunta cada escena
+ * al cerrarla (valla, hora, cuanto trabajo de vertices lleva) y un hilo propio
+ * mira la valla cada ~250 us. El tiempo de chip de una escena va desde que se
+ * pudo empezar (cerrada y la anterior ya hecha) hasta que se vio hecha. Las de
+ * vita2d (la presentacion) no llevan valla: su tiempo cae en la escena
+ * siguiente. Cada 10 s, una linea "gpu chip" en crash.txt con un ajuste lineal
+ * del tiempo de las escenas de superficie frente a su trabajo de vertices
+ * (indices x bytes del programa): si explica casi todo, el chip va atado a los
+ * shaders de vertices. Y las ultimas 2048 escenas, a gpu_escenas.csv.
+ * Se apaga con ux0:/data/azahar/sin_cronometro_gpu.txt.
+ */
+struct Work {
+    u32 draws = 0;
+    u32 vgpu_indices = 0;
+    u32 vcpu_vertices = 0;
+    unsigned long long vs_work = 0; ///< Suma de indices x bytes del programa de vertices.
+    u32 fs_bytes = 0;               ///< Suma de los bytes de programa de fragmentos.
+};
+struct Submitted {
+    u32 fence;
+    u32 kind;
+    Work work;
+    unsigned long long submit_us;
+};
+struct Sample {
+    u32 seq;
+    u32 kind;
+    u32 draws;
+    u32 vgpu_indices;
+    u32 vcpu_vertices;
+    u32 vs_work_kb;
+    u32 fs_bytes;
+    u32 chip_us;
+    u32 latency_us;
+};
+constexpr u32 kTimed = 1024;
+constexpr u32 kSamples = 2048;
+/// Por encima de los hilos de trabajo: tiene que despertar a tiempo, y en
+/// cada vuelta solo lee la valla y unos contadores.
+constexpr int kTimerPriority = 128;
+constexpr const char* kTimerOffPath = "ux0:/data/azahar/sin_cronometro_gpu.txt";
+constexpr const char* kCsvPath = "ux0:/data/azahar/gpu_escenas.csv";
+
+bool g_timer_on = false;
+Work g_work{}; ///< La escena abierta; solo la toca el hilo que dibuja.
+Submitted g_timed[kTimed];
+std::atomic<u32> g_timed_head{0};
+/// Dos buffers de muestras: el cronometro llena uno y la caja escribe el otro.
+Sample g_samples[2][kSamples];
+std::atomic<int> g_samples_ready{-1}; ///< El lleno que espera a escribirse, o -1.
+
+u32 ProgramBytes(const void* program, bool vertex) {
+    if (program == nullptr) {
+        return 0;
+    }
+    const SceGxmProgram* gxp =
+        vertex ? sceGxmVertexProgramGetProgram(static_cast<const SceGxmVertexProgram*>(program))
+               : sceGxmFragmentProgramGetProgram(
+                     static_cast<const SceGxmFragmentProgram*>(program));
+    return gxp != nullptr ? sceGxmProgramGetSize(gxp) : 0;
+}
+
+/// Por tipo de escena, en una ventana.
+struct KindStats {
+    u32 scenes = 0;
+    unsigned long long chip_us = 0;
+    u32 max_us = 0;
+};
+struct Window {
+    KindStats kind[4];
+    u32 lost = 0;
+    // Superficies: lo que llevan y el ajuste lineal tiempo ~ trabajo de vertices.
+    unsigned long long vgpu_indices = 0;
+    unsigned long long vcpu_vertices = 0;
+    unsigned long long vs_work_kb = 0;
+    unsigned long long fs_bytes = 0;
+    double n = 0, sx = 0, sy = 0, sxx = 0, sxy = 0, syy = 0;
+};
+
+void NoteWindow(const Window& w, double seconds) {
+    unsigned long long busy = 0;
+    u32 scenes = 0;
+    for (const KindStats& k : w.kind) {
+        busy += k.chip_us;
+        scenes += k.scenes;
+    }
+    const auto avg = [](const KindStats& k) {
+        return k.scenes != 0 ? static_cast<double>(k.chip_us) / k.scenes : 0.0;
+    };
+    const KindStats& draw = w.kind[static_cast<u32>(SceneKind::Draw)];
+    const KindStats& blit = w.kind[static_cast<u32>(SceneKind::Blit)];
+    const KindStats& clear = w.kind[static_cast<u32>(SceneKind::Clear)];
+    // Ajuste lineal de las de superficie: chip_us = a + b * kb_de_trabajo_vs.
+    double slope = 0, intercept = 0, r2 = 0;
+    const double den = w.n * w.sxx - w.sx * w.sx;
+    if (w.n >= 3 && den > 0) {
+        const double cov = w.n * w.sxy - w.sx * w.sy;
+        slope = cov / den;
+        intercept = (w.sy - slope * w.sx) / w.n;
+        const double vy = w.n * w.syy - w.sy * w.sy;
+        r2 = vy > 0 ? cov * cov / (den * vy) : 0;
+    }
+    const double per = draw.scenes != 0 ? static_cast<double>(draw.scenes) : 1.0;
+    char line[512];
+    std::snprintf(line, sizeof(line),
+                  "ocupado %.0f ms/s (%.0f %%), %.0f escenas/s (%u perdidas) | superficie "
+                  "%.0f/s media %.0f us max %u | copia %.0f/s media %.0f us | borrado %.0f/s "
+                  "media %.0f us | por superficie: %.0f indices vs-gpu, %.0f KB de trabajo vs, "
+                  "%.0f vertices vs-cpu, %.1f KB de fs | ajuste: %.0f us + %.2f us por KB vs, "
+                  "r2 %.2f",
+                  busy / 1000.0 / seconds, busy / 10000.0 / seconds, scenes / seconds, w.lost,
+                  draw.scenes / seconds, avg(draw), draw.max_us, blit.scenes / seconds,
+                  avg(blit), clear.scenes / seconds, avg(clear), w.vgpu_indices / per,
+                  w.vs_work_kb / per, w.vcpu_vertices / per, w.fs_bytes / per / 1024.0,
+                  intercept, slope, r2);
+    Common::VitaNote("gpu chip", line);
+}
+
+void* TimerMain(void*) {
+    sceKernelChangeThreadPriority(sceKernelGetThreadId(), kTimerPriority);
+    u32 tail = 0;
+    u32 seq = 0;
+    unsigned long long last_done_us = 0;
+    unsigned long long window_start = Common::VitaMicros();
+    Window w{};
+    int fill = 0;
+    u32 filled = 0;
+    while (true) {
+        sceKernelDelayThread(250);
+        const u32 done = g_fence != nullptr ? *g_fence : 0;
+        const unsigned long long now = Common::VitaMicros();
+        const u32 head = g_timed_head.load(std::memory_order_acquire);
+        if (head - tail > kTimed) {
+            w.lost += head - tail - kTimed / 2;
+            tail = head - kTimed / 2;
+        }
+        while (tail != head) {
+            const Submitted& sub = g_timed[tail % kTimed];
+            if (static_cast<s32>(sub.fence - done) > 0) {
+                break;
+            }
+            const unsigned long long start = std::max(sub.submit_us, last_done_us);
+            const u32 chip = now > start ? static_cast<u32>(now - start) : 0;
+            last_done_us = now;
+            KindStats& k = w.kind[sub.kind & 3u];
+            k.scenes++;
+            k.chip_us += chip;
+            k.max_us = std::max(k.max_us, chip);
+            const u32 vs_kb = static_cast<u32>(sub.work.vs_work / 1024);
+            if (sub.kind == static_cast<u32>(SceneKind::Draw)) {
+                w.vgpu_indices += sub.work.vgpu_indices;
+                w.vcpu_vertices += sub.work.vcpu_vertices;
+                w.vs_work_kb += vs_kb;
+                w.fs_bytes += sub.work.fs_bytes;
+                const double x = vs_kb;
+                const double y = chip;
+                w.n += 1;
+                w.sx += x;
+                w.sy += y;
+                w.sxx += x * x;
+                w.sxy += x * y;
+                w.syy += y * y;
+            }
+            Sample& out = g_samples[fill][filled];
+            out.seq = seq++;
+            out.kind = sub.kind;
+            out.draws = sub.work.draws;
+            out.vgpu_indices = sub.work.vgpu_indices;
+            out.vcpu_vertices = sub.work.vcpu_vertices;
+            out.vs_work_kb = vs_kb;
+            out.fs_bytes = sub.work.fs_bytes;
+            out.chip_us = chip;
+            out.latency_us = now > sub.submit_us ? static_cast<u32>(now - sub.submit_us) : 0;
+            if (++filled == kSamples) {
+                // Lleno: a escribir, si el anterior ya se escribio.
+                if (g_samples_ready.load(std::memory_order_acquire) < 0) {
+                    g_samples_ready.store(fill, std::memory_order_release);
+                    fill ^= 1;
+                }
+                filled = 0;
+            }
+            tail++;
+        }
+        if (now - window_start >= 10'000'000ull) {
+            NoteWindow(w, static_cast<double>(now - window_start) / 1e6);
+            w = Window{};
+            window_start = now;
+        }
+    }
+    return nullptr;
+}
+
+/// Desde el hilo de la caja (cada 100 ms): si hay un buffer lleno, a la tarjeta.
+void WriteSamplesIfReady() {
+    const int ready = g_samples_ready.load(std::memory_order_acquire);
+    if (ready < 0) {
+        return;
+    }
+    static char text[kSamples * 64 + 128];
+    std::size_t n = static_cast<std::size_t>(std::snprintf(
+        text, sizeof(text),
+        "seq,tipo,dibujados,indices_vs_gpu,vertices_vs_cpu,kb_trabajo_vs,bytes_fs,chip_us,"
+        "latencia_us\n"));
+    for (u32 i = 0; i < kSamples && n + 96 < sizeof(text); i++) {
+        const Sample& s = g_samples[ready][i];
+        n += static_cast<std::size_t>(std::snprintf(text + n, sizeof(text) - n,
+                                                    "%u,%u,%u,%u,%u,%u,%u,%u,%u\n", s.seq,
+                                                    s.kind, s.draws, s.vgpu_indices,
+                                                    s.vcpu_vertices, s.vs_work_kb, s.fs_bytes,
+                                                    s.chip_us, s.latency_us));
+    }
+    const SceUID fd = sceIoOpen(kCsvPath, SCE_O_WRONLY | SCE_O_CREAT | SCE_O_TRUNC, 0777);
+    if (fd >= 0) {
+        sceIoWrite(fd, text, static_cast<SceSize>(n));
+        sceIoClose(fd);
+    }
+    g_samples_ready.store(-1, std::memory_order_release);
+}
+
 void* BoxMain(void*) {
     // Por encima del compilador de shaders, que comparte nucleo y pasa minutos
     // sin soltarlo: si la GPU se cuelga, esto tiene que poder mirar la valla.
@@ -224,6 +449,7 @@ void* BoxMain(void*) {
     u32 last_done = 0;
     while (true) {
         sceKernelDelayThread(100 * 1000);
+        WriteSamplesIfReady();
         const u32 now = NowMs();
         const u32 done = g_fence != nullptr ? *g_fence : 0;
         box.now_ms = now;
@@ -264,6 +490,21 @@ void Start(const volatile unsigned int* fence) {
         }
     }
     pthread_attr_destroy(&attr);
+    SceIoStat off{};
+    if (sceIoGetstat(kTimerOffPath, &off) < 0) {
+        pthread_attr_t timer_attr;
+        pthread_attr_init(&timer_attr);
+        pthread_attr_setstacksize(&timer_attr, 64 * 1024);
+        pthread_t timer;
+        if (pthread_create(&timer, &timer_attr, &TimerMain, nullptr) == 0) {
+            pthread_detach(timer);
+            g_timer_on = true;
+        }
+        pthread_attr_destroy(&timer_attr);
+    }
+    Common::VitaNote("gpu chip", g_timer_on
+                                       ? "cronometro del chip en marcha (lineas cada 10 s)"
+                                       : "cronometro del chip apagado");
     Common::VitaNote("gxm caja negra", g_box.load(std::memory_order_acquire) != nullptr
                                            ? "lista (ultimas 16 escenas en la pila de su hilo)"
                                            : "no se pudo crear su hilo");
@@ -295,6 +536,7 @@ void OpenScene(SceneKind kind, u32 color) {
     box->current = index;
     box->scene_seq++;
     g_scene_open = true;
+    g_work = Work{};
 }
 
 void CloseScene(u32 fence) {
@@ -308,6 +550,15 @@ void CloseScene(u32 fence) {
         s.close_ms = NowMs();
     }
     box->fence_sent = fence;
+    if (g_timer_on) {
+        const u32 head = g_timed_head.load(std::memory_order_relaxed);
+        Submitted& sub = g_timed[head % kTimed];
+        sub.fence = fence;
+        sub.kind = g_scene_open ? CurrentScene(*box)->kind : 0u;
+        sub.work = g_work;
+        sub.submit_us = Common::VitaMicros();
+        g_timed_head.store(head + 1, std::memory_order_release);
+    }
     g_scene_open = false;
 }
 
@@ -350,6 +601,17 @@ void Record(const DrawInfo& info) {
     }
     d.bad = info.bad;
     s.draws++;
+    if (g_timer_on) {
+        g_work.draws++;
+        if (info.kind == DrawKind::VertexGpu) {
+            g_work.vgpu_indices += info.count;
+            g_work.vs_work += static_cast<unsigned long long>(info.count) *
+                              ProgramBytes(info.vertex_program, true);
+        } else if (info.kind == DrawKind::VertexCpu) {
+            g_work.vcpu_vertices += info.count;
+        }
+        g_work.fs_bytes += ProgramBytes(info.fragment_program, false);
+    }
     g_pending = Draw{};
 }
 

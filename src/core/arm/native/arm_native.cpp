@@ -7,6 +7,11 @@
 
 #include <cstring>
 #include <fmt/format.h>
+#include <psp2/appmgr.h>
+#include <psp2/io/stat.h>
+#ifdef AZAHAR_TAIHEN
+#include <taihen.h>
+#endif
 #include "common/vita_diag.h"
 
 namespace {
@@ -114,6 +119,69 @@ bool Available() {
     g_state = State::Present;
     Note("modulo de kernel 0x{:08x} presente", g_version);
     return true;
+}
+
+/**
+ * CARGAR EL MODULO SIN LA APP DE PRUEBA (0.3.7.9). Un modulo de kernel se queda
+ * cargado hasta que la consola se apaga del todo, y hasta ahora solo lo cargaba
+ * la app de prueba (AZNT00001): tras cualquier apagado -- y un GPUCRASH apaga --
+ * Azahar arrancaba sin el y todo iba por el JIT sin que nadie lo notara (el
+ * 25-10, todas las partidas). Ahora lo carga Azahar, igual que la app de
+ * prueba: taiLoadStartKernelModule y relanzarse, porque las importaciones
+ * debiles del modulo solo las resuelve el cargador al arrancar el ejecutable.
+ * El argumento kRelaunchArg evita el bucle: si tras relanzar sigue sin estar,
+ * se avisa y se sigue con el JIT.
+ */
+void LoadModuleIfMissing(int argc, char** argv) {
+    if (StubResolved(reinterpret_cast<const void*>(&AzNativeVersion))) {
+        return;
+    }
+    constexpr const char* kRelaunchArg = "--aznative-relanzada";
+    for (int i = 0; i < argc; i++) {
+        if (argv[i] != nullptr && std::strcmp(argv[i], kRelaunchArg) == 0) {
+            Note("relanzada y el modulo sigue sin cargarse: todo por el JIT");
+            return;
+        }
+    }
+#ifdef AZAHAR_TAIHEN
+    if (!StubResolved(reinterpret_cast<const void*>(&taiLoadStartKernelModuleForUser))) {
+        Note("sin taiHEN: el modulo no se puede cargar desde aqui");
+        return;
+    }
+    // El de la carpeta de Azahar primero (se puede subir ahi por FTP), y si no,
+    // el de la app de prueba, que es donde ha estado siempre.
+    const char* path = nullptr;
+    for (const char* candidate :
+         {"ux0:app/AZHR00001/aznative.skprx", "ux0:app/AZNT00001/aznative.skprx"}) {
+        SceIoStat stat{};
+        if (sceIoGetstat(candidate, &stat) >= 0) {
+            path = candidate;
+            break;
+        }
+    }
+    if (path == nullptr) {
+        Note("no hay aznative.skprx ni en AZHR00001 ni en AZNT00001: todo por el JIT");
+        return;
+    }
+    const SceUID id = taiLoadStartKernelModule(path, 0, nullptr, 0);
+    // 0x8002d013: ya estaba cargado, pero despues de que arrancara este proceso
+    // (sus importaciones no lo ven). Relanzar lo arregla igual.
+    if (id < 0 && static_cast<u32>(id) != 0x8002d013u) {
+        Note("taiLoadStartKernelModule({}) = 0x{:08x}: todo por el JIT (otro 0x8002xxxx o "
+             "0x9001xxxx: activa 'Enable unsafe homebrew' en los ajustes de HENkaku)",
+             path, static_cast<u32>(id));
+        return;
+    }
+    Note("modulo cargado desde {} (0x{:08x}): se relanza Azahar para usarlo", path,
+         static_cast<u32>(id));
+    char arg[] = "--aznative-relanzada";
+    char* const args[] = {arg, nullptr};
+    const int exec = sceAppMgrLoadExec("app0:eboot.bin", args, nullptr);
+    Note("no se pudo relanzar (0x{:08x}): todo por el JIT hasta el proximo arranque",
+         static_cast<u32>(exec));
+#else
+    Note("compilado sin taiHEN: el modulo no se puede cargar desde aqui");
+#endif
 }
 
 bool EnsureWorld() {
@@ -542,6 +610,7 @@ namespace Core::Native {
 bool Available() {
     return false;
 }
+void LoadModuleIfMissing(int, char**) {}
 u32 ModuleVersion() {
     return 0;
 }
