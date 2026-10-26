@@ -18,6 +18,7 @@
 #include "common/assert.h"
 #include "common/logging/log.h"
 #include "common/vita_diag.h"
+#include <psp2/kernel/threadmgr.h>
 #include "core/memory.h"
 
 namespace {
@@ -547,7 +548,7 @@ void Source::GenerateFrame() {
     //
     // current_sample_number is maintained below from the exact amount of input
     // removed by AudioInterp, so the memory offset and current_buffer stay in sync.
-    const bool timing = Stats::phase_timing;
+    const bool timing = Stats::phase_timing && sceKernelGetThreadId() == Stats::phase_tid;
     unsigned long long phase_at = timing ? Common::VitaMicros() : 0;
     const auto phase = [&](unsigned long long& slot) {
         if (timing) {

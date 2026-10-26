@@ -36,7 +36,11 @@ inline std::atomic<unsigned long long> wait_us{0};
  * cada 32 (cada lectura del reloj es una llamada al kernel) y se reparte
  * entre las fases; RunMix lo anota cada 10 s.
  */
+/// Solo cronometra el hilo cuyo id es phase_tid (0.3.9.5: el de la mezcla, no su
+/// ayudante). NO thread_local: en la Vita eso es TLS emulado (__emutls), con
+/// mutex de pthread por dentro, y colgo la mezcla.
 inline bool phase_timing = false;
+inline int phase_tid = -1;
 inline unsigned long long phase_refresh_us = 0;
 inline unsigned long long phase_decode_us = 0;
 inline unsigned long long phase_interp_us = 0;
@@ -47,5 +51,8 @@ inline unsigned long long phase_samples_in = 0;
 inline std::atomic<unsigned int> interp_fast{0};
 inline std::atomic<unsigned int> interp_slow{0};
 inline std::atomic<unsigned int> interp_max_rate{0};
+/// Fuentes que ha mezclado el ayudante (0.3.9.5, ver DspHle::Impl::HelperMain).
+inline std::atomic<unsigned long long> helper_sources{0};
+inline std::atomic<unsigned long long> mixed_sources{0};
 
 } // namespace AudioCore::HLE::Stats

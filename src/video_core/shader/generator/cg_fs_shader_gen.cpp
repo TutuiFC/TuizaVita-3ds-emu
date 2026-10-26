@@ -695,8 +695,24 @@ private:
                operation == Operation::Lerp || operation == Operation::AddThenMultiply;
     }
 
+    /**
+     * LA FUENTE DE VERDAD (0.3.9.4). En la etapa 0, "Previous" no es la salida
+     * anterior (no la hay): AppendColorModifier y AppendAlphaModifier toman en
+     * su lugar la fuente 3 de esa etapa. Los atajos de 0.3.8.8 (etapa de paso) y
+     * 0.3.9.1 (clamp) miraban la fuente tal cual, y con una etapa 0 que
+     * "sustituye por Previous" y tiene la fuente 3 en una textura o en el color
+     * del vertice, el color salia mal. Todo lo que razona sobre fuentes pasa
+     * por aqui.
+     */
+    static Source EffectiveSource(Source source, Source source3, u32 index) {
+        return index == 0 && source == Source::Previous ? source3 : source;
+    }
+
     /// Las fuentes que usa la operacion, todas dentro de [0, 1] (ver ClampFree).
-    static bool SourcesBounded(Operation operation, Source s1, Source s2, Source s3) {
+    static bool SourcesBounded(Operation operation, Source s1, Source s2, Source s3, u32 index) {
+        s1 = EffectiveSource(s1, s3, index);
+        s2 = EffectiveSource(s2, s3, index);
+        s3 = EffectiveSource(s3, s3, index);
         const auto ok = [](Source source) { return source != Source::PrimaryColor; };
         switch (operation) {
         case Operation::Replace:
@@ -709,6 +725,33 @@ private:
         default:
             return false;
         }
+    }
+
+    /**
+     * EL REDONDEO DE ALGO YA REDONDEADO (0.3.9.3). Sustituir por la salida de
+     * la etapa anterior o por el color primario ya redondeado deja un valor
+     * que salio de byteround en ESTE shader, y byteround sobre su propia
+     * salida hace la misma cuenta y da los mismos bits (floor recupera el
+     * mismo entero; el clamp, si lo hay, deja 0, 1 o el mismo valor, que
+     * tambien estan en la rejilla). En 370 shaders, el 29 % de las etapas de
+     * alfa y el 11 % de las de color. Solo con los modificadores que eligen
+     * canales: "1 - x" podria quedar a un ulp de la rejilla y ahi si cuenta.
+     * Las constantes no entran: las calcula la CPU, no este byteround. La
+     * fuente es la de verdad (EffectiveSource): en la etapa 0, "Previous" es
+     * la fuente 3.
+     */
+    static bool OnGridReplace(Operation operation, Source source) {
+        return operation == Operation::Replace &&
+               (source == Source::Previous || source == Source::PrimaryColor);
+    }
+    static bool ColorModifierKeepsGrid(ColorModifier modifier) {
+        return modifier == ColorModifier::SourceColor || modifier == ColorModifier::SourceAlpha ||
+               modifier == ColorModifier::SourceRed || modifier == ColorModifier::SourceGreen ||
+               modifier == ColorModifier::SourceBlue;
+    }
+    static bool AlphaModifierKeepsGrid(AlphaModifier modifier) {
+        return modifier == AlphaModifier::SourceAlpha || modifier == AlphaModifier::SourceRed ||
+               modifier == AlphaModifier::SourceGreen || modifier == AlphaModifier::SourceBlue;
     }
 
     void AppendColorCombiner(Operation operation, bool bounded) {
@@ -1135,10 +1178,12 @@ private:
      * final en Generate). El resultado es el mismo valor, bit a bit. Lo del
      * buffer de combinacion se hace igual que en una etapa normal.
      */
-    static bool IsPassThroughStage(const TexturingRegs::TevStageConfig& stage) {
+    static bool IsPassThroughStage(const TexturingRegs::TevStageConfig& stage, u32 index) {
         return stage.color_op == Operation::Replace && stage.alpha_op == Operation::Replace &&
-               stage.color_source1 == Source::Previous &&
-               stage.alpha_source1 == Source::Previous &&
+               EffectiveSource(stage.color_source1, stage.color_source3, index) ==
+                   Source::Previous &&
+               EffectiveSource(stage.alpha_source1, stage.alpha_source3, index) ==
+                   Source::Previous &&
                stage.color_modifier1 == ColorModifier::SourceColor &&
                stage.alpha_modifier1 == AlphaModifier::SourceAlpha &&
                stage.GetColorMultiplier() == 1 && stage.GetAlphaMultiplier() == 1;
@@ -1147,7 +1192,7 @@ private:
     void WriteTevStage(u32 index) {
         const TexturingRegs::TevStageConfig stage = config.texture.tev_stages[index];
 
-        if (IsPassThroughStage(stage)) {
+        if (IsPassThroughStage(stage, index)) {
             out += "    combiner_buffer = next_combiner_buffer;\n";
             if (config.TevStageUpdatesCombinerBufferColor(index)) {
                 out += "    next_combiner_buffer.rgb = combiner_output.rgb;\n";
@@ -1165,11 +1210,19 @@ private:
         out += ";\n    color_results_3 = ";
         AppendColorModifier(stage.color_modifier3, stage.color_source3, index);
 
-        out += fmt::format(";\n    float3 color_output_{} = byteround(float4(", index);
-        AppendColorCombiner(stage.color_op,
-                            SourcesBounded(stage.color_op, stage.color_source1,
-                                           stage.color_source2, stage.color_source3));
-        out += ", 1.0)).rgb;\n";
+        const bool color_bounded = SourcesBounded(stage.color_op, stage.color_source1,
+                                                  stage.color_source2, stage.color_source3, index);
+        if (OnGridReplace(stage.color_op,
+                          EffectiveSource(stage.color_source1, stage.color_source3, index)) &&
+            ColorModifierKeepsGrid(stage.color_modifier1)) {
+            out += fmt::format(";\n    float3 color_output_{} = ", index);
+            AppendColorCombiner(stage.color_op, color_bounded);
+            out += ";\n";
+        } else {
+            out += fmt::format(";\n    float3 color_output_{} = byteround(float4(", index);
+            AppendColorCombiner(stage.color_op, color_bounded);
+            out += ", 1.0)).rgb;\n";
+        }
 
         if (stage.color_op == Operation::Dot3_RGBA) {
             out += fmt::format("    float alpha_output_{0} = color_output_{0}.r;\n", index);
@@ -1180,11 +1233,20 @@ private:
             AppendAlphaModifier(stage.alpha_modifier2, stage.alpha_source2, index);
             out += ";\n    alpha_results_3 = ";
             AppendAlphaModifier(stage.alpha_modifier3, stage.alpha_source3, index);
-            out += fmt::format(";\n    float alpha_output_{} = byteround1(", index);
-            AppendAlphaCombiner(stage.alpha_op,
-                                SourcesBounded(stage.alpha_op, stage.alpha_source1,
-                                               stage.alpha_source2, stage.alpha_source3));
-            out += ");\n";
+            const bool alpha_bounded = SourcesBounded(stage.alpha_op, stage.alpha_source1,
+                                                      stage.alpha_source2, stage.alpha_source3,
+                                                      index);
+            if (OnGridReplace(stage.alpha_op,
+                              EffectiveSource(stage.alpha_source1, stage.alpha_source3, index)) &&
+                AlphaModifierKeepsGrid(stage.alpha_modifier1)) {
+                out += fmt::format(";\n    float alpha_output_{} = ", index);
+                AppendAlphaCombiner(stage.alpha_op, alpha_bounded);
+                out += ";\n";
+            } else {
+                out += fmt::format(";\n    float alpha_output_{} = byteround1(", index);
+                AppendAlphaCombiner(stage.alpha_op, alpha_bounded);
+                out += ");\n";
+            }
         }
 
         /**

@@ -283,6 +283,26 @@ void EmuWindow_Vita::UpdateFrameSkipControl(unsigned int buttons) {
 }
 
 void EmuWindow_Vita::UpdateTouch() {
+    // El toque del piloto automatico (0.3.9.3), en coordenadas de la
+    // pantalla de abajo del 3DS: a pixeles de la Vita con la disposicion
+    // que haya en ese momento.
+    {
+        int pilot_x = 0;
+        int pilot_y = 0;
+        if (VitaFrontend::Input::PilotTouch(pilot_x, pilot_y)) {
+            const auto& layout = GetFramebufferLayout();
+            const u32 px = layout.bottom_screen.left +
+                           static_cast<u32>(pilot_x) * layout.bottom_screen.GetWidth() / 320;
+            const u32 py = layout.bottom_screen.top +
+                           static_cast<u32>(pilot_y) * layout.bottom_screen.GetHeight() / 240;
+            if (is_touching) {
+                TouchMoved(px, py);
+            } else if (TouchPressed(px, py)) {
+                is_touching = true;
+            }
+            return;
+        }
+    }
     SceTouchData touch{};
     if (sceTouchPeek(SCE_TOUCH_PORT_FRONT, &touch, 1) < 0 || touch.reportNum == 0) {
         if (is_touching) {
@@ -1385,7 +1405,8 @@ void EmuWindow_Vita::DrawStatsOverlay() {
              * Por ventana desde 0.2.1.8: como static valian para toda la
              * sesion, y el segundo juego sin reiniciar no anotaba nada.
              */
-            if (++frame_ticks % 10 == 0 && frame_notes < 30) {
+            if (++frame_ticks % 10 == 0 &&
+                (frame_notes < 30 || VitaFrontend::Input::PilotActive())) {
                 frame_notes++;
                 Common::VitaNote(
                     "fotograma",

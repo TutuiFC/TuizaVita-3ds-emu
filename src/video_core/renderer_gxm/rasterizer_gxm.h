@@ -786,7 +786,7 @@ private:
     u32 frame_first_fence = 0;
     /// Las primeras vallas de los dos fotogramas anteriores (0.2.2.0): [0] el
     /// ultimo, [1] el de antes. 0 = no hubo escena en ese fotograma.
-    std::array<u32, 2> present_fences{};
+    std::array<u32, 3> present_fences{};
     u32 presents_seen = 0;
     /// La del fotograma que se esta presentando: acabada, la presentacion
     /// anterior tambien (WaitPreviousPresentation).
@@ -874,6 +874,22 @@ private:
     std::array<u32, kLutTables> lighting_lut_gen{};
     std::array<std::array<u32, kLutTables>, kLutVersions> lighting_lut_version_gen{};
     u32 lighting_lut_gen_counter = 0;
+    /**
+     * LAS VERSIONES POR CONTENIDO (0.3.9.6). El hash de cada tabla tal como
+     * esta en lighting_lut_shadow, y el de lo que tiene escrito cada version.
+     * Una version con las 24 tablas iguales a las pedidas se reutiliza sin
+     * copiar ni esperar, aunque la GPU la este leyendo. Super Mario 3D Land
+     * (26-10, jugando): "esperas gpu: tablas de luz" 35-38 ms por fotograma
+     * con las versiones en rueda, porque cambia de tablas en cada material y
+     * daba la vuelta a las 32 dentro del mismo fotograma.
+     */
+    std::array<u64, kLutTables> lighting_lut_hash{};
+    std::array<std::array<u64, kLutTables>, kLutVersions> lighting_lut_version_hash{};
+    /// Las versiones que tiene atadas la escena abierta (bit por version).
+    u64 lut_scene_mask = 0;
+    /// Ultimo uso de cada version (reloj logico), para elegir la que se pisa.
+    std::array<u32, kLutVersions> lut_last_use{};
+    u32 lut_clock = 0;
     Allocation lighting_lut_buffer;
     /// Las 24 tablas ya convertidas, en memoria normal (0.2.1.1): ver
     /// UpdateLightingLut.

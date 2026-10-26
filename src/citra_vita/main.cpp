@@ -23,6 +23,7 @@
 #include <vector>
 
 #include <psp2/ctrl.h>
+#include <psp2/display.h>
 #include <psp2/io/dirent.h>
 #include <psp2/io/fcntl.h>
 #include <psp2/io/stat.h>
@@ -1951,6 +1952,8 @@ struct PilotStep {
     double at_s = 0;
     unsigned int buttons = 0;
     unsigned int hold_ms = 0;
+    int touch_x = -1; ///< "toque:X:Y" (0.3.9.3), pantalla de abajo del 3DS
+    int touch_y = -1;
 };
 struct Pilot {
     std::string rom;
@@ -1959,12 +1962,75 @@ struct Pilot {
     std::atomic<bool> stop{false};
 };
 
+/**
+ * "captura" (0.3.9.3): no es un boton. El piloto guarda la pantalla entera
+ * (960x544 reducida a 480x272, RGB de 24 bits sin cabecera de formato) en
+ * ux0:/data/azahar/piloto_capturas/NN.rgb, para ver desde fuera de la consola
+ * donde esta el juego cuando nadie lo mira.
+ */
+constexpr unsigned int kPilotShot = 0x80000000u;
+constexpr char kPilotShotDir[] = "ux0:/data/azahar/piloto_capturas";
+
+void ClearPilotShots() {
+    const SceUID dir = sceIoDopen(kPilotShotDir);
+    if (dir < 0) {
+        sceIoMkdir(kPilotShotDir, 0777);
+        return;
+    }
+    SceIoDirent entry{};
+    std::vector<std::string> names;
+    while (sceIoDread(dir, &entry) > 0) {
+        names.emplace_back(entry.d_name);
+    }
+    sceIoDclose(dir);
+    for (const std::string& name : names) {
+        sceIoRemove((std::string(kPilotShotDir) + "/" + name).c_str());
+    }
+}
+
+void SavePilotShot(unsigned int index) {
+    SceDisplayFrameBuf frame{};
+    frame.size = sizeof(frame);
+    if (sceDisplayGetFrameBuf(&frame, SCE_DISPLAY_SETBUF_NEXTFRAME) < 0 || frame.base == nullptr ||
+        frame.pixelformat != SCE_DISPLAY_PIXELFORMAT_A8B8G8R8 || frame.width < 960 ||
+        frame.height < 544) {
+        Common::VitaNote("piloto", "captura: no hay framebuffer que leer");
+        return;
+    }
+    constexpr int kW = 480;
+    constexpr int kH = 272;
+    std::vector<u8> image(static_cast<std::size_t>(kW * kH * 3));
+    const auto* pixels = static_cast<const u32*>(frame.base);
+    for (int y = 0; y < kH; y++) {
+        const u32* line = pixels + static_cast<std::size_t>(y * 2) * frame.pitch;
+        u8* out = image.data() + static_cast<std::size_t>(y * kW * 3);
+        for (int x = 0; x < kW; x++) {
+            const u32 c = line[x * 2];
+            out[x * 3 + 0] = static_cast<u8>(c & 0xFF);
+            out[x * 3 + 1] = static_cast<u8>((c >> 8) & 0xFF);
+            out[x * 3 + 2] = static_cast<u8>((c >> 16) & 0xFF);
+        }
+    }
+    const std::string path = fmt::format("{}/{:02}.rgb", kPilotShotDir, index);
+    const SceUID fd = sceIoOpen(path.c_str(), SCE_O_WRONLY | SCE_O_CREAT | SCE_O_TRUNC, 0777);
+    if (fd >= 0) {
+        sceIoWrite(fd, image.data(), static_cast<SceSize>(image.size()));
+        sceIoClose(fd);
+    }
+    Common::VitaNote("piloto", fmt::format("captura {:02}", index).c_str());
+}
+
 unsigned int PilotButtonMask(const std::string& names) {
     static const std::pair<const char*, unsigned int> kNames[] = {
         {"a", SCE_CTRL_CIRCLE},       {"b", SCE_CTRL_CROSS},        {"x", SCE_CTRL_TRIANGLE},
         {"y", SCE_CTRL_SQUARE},       {"l", SCE_CTRL_LTRIGGER},     {"r", SCE_CTRL_RTRIGGER},
         {"start", SCE_CTRL_START},    {"select", SCE_CTRL_SELECT},  {"arriba", SCE_CTRL_UP},
         {"abajo", SCE_CTRL_DOWN},     {"izquierda", SCE_CTRL_LEFT}, {"derecha", SCE_CTRL_RIGHT},
+        {"captura", kPilotShot},
+        {"stick_derecha", VitaFrontend::Input::kPilotStickRight},
+        {"stick_izquierda", VitaFrontend::Input::kPilotStickLeft},
+        {"stick_arriba", VitaFrontend::Input::kPilotStickUp},
+        {"stick_abajo", VitaFrontend::Input::kPilotStickDown},
     };
     unsigned int mask = 0;
     std::size_t begin = 0;
@@ -2022,7 +2088,11 @@ bool LoadPilot(Pilot& pilot) {
             double at = 0;
             unsigned int hold = 0;
             if (std::sscanf(line.c_str(), "%lf %127s %u", &at, names, &hold) == 3) {
-                pilot.steps.push_back({at, PilotButtonMask(names), hold});
+                PilotStep step{at, PilotButtonMask(names), hold};
+                if (const char* touch = std::strstr(names, "toque:")) {
+                    std::sscanf(touch, "toque:%d:%d", &step.touch_x, &step.touch_y);
+                }
+                pilot.steps.push_back(step);
             }
         }
     }
@@ -2046,13 +2116,23 @@ bool PilotSleepUntil(const Pilot& pilot, SceUInt64 until_us) {
 void* PilotMain(void* arg) {
     Pilot& pilot = *static_cast<Pilot*>(arg);
     const SceUInt64 start = sceKernelGetProcessTimeWide();
+    ClearPilotShots();
+    unsigned int shots = 0;
     for (const PilotStep& step : pilot.steps) {
         if (!PilotSleepUntil(pilot, start + static_cast<SceUInt64>(step.at_s * 1e6))) {
             return nullptr;
         }
-        VitaFrontend::Input::SetPilotButtons(step.buttons);
+        if ((step.buttons & kPilotShot) != 0) {
+            SavePilotShot(++shots);
+            if ((step.buttons & ~kPilotShot) == 0) {
+                continue;
+            }
+        }
+        VitaFrontend::Input::SetPilotButtons(step.buttons & ~kPilotShot);
+        VitaFrontend::Input::SetPilotTouch(step.touch_x, step.touch_y);
         PilotSleepUntil(pilot, sceKernelGetProcessTimeWide() + step.hold_ms * 1000ull);
         VitaFrontend::Input::SetPilotButtons(0);
+        VitaFrontend::Input::SetPilotTouch(-1, -1);
     }
     if (pilot.exit_s > 0 &&
         PilotSleepUntil(pilot, start + static_cast<SceUInt64>(pilot.exit_s * 1e6))) {
@@ -2082,7 +2162,9 @@ void RunPilotIfAny(vita2d_pgf* font, const std::vector<RomEntry>& roms) {
     pthread_t thread{};
     const bool started = pthread_create(&thread, nullptr, &PilotMain, &pilot) == 0;
     g_pilot_running.store(true, std::memory_order_relaxed);
+    VitaFrontend::Input::SetPilotActive(true);
     RunGame(font, rom->path);
+    VitaFrontend::Input::SetPilotActive(false);
     g_pilot_running.store(false, std::memory_order_relaxed);
     pilot.stop.store(true, std::memory_order_relaxed);
     if (started) {

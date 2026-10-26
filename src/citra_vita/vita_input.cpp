@@ -57,7 +57,13 @@ SceCtrlData ReadPad() {
         cached_at = now;
     }
     SceCtrlData pad = cached;
-    pad.buttons |= g_pilot_buttons.load(std::memory_order_relaxed);
+    const unsigned int pilot = g_pilot_buttons.load(std::memory_order_relaxed);
+    pad.buttons |= pilot & ~kPilotStickMask;
+    // El stick del piloto (0.3.9.3): al tope en la direccion pedida.
+    if ((pilot & kPilotStickMask) != 0) {
+        pad.lx = (pilot & kPilotStickRight) ? 255 : (pilot & kPilotStickLeft) ? 0 : 128;
+        pad.ly = (pilot & kPilotStickDown) ? 255 : (pilot & kPilotStickUp) ? 0 : 128;
+    }
     return pad;
 }
 
@@ -171,6 +177,34 @@ void Shutdown() {
 
 void SetPilotButtons(unsigned int buttons) {
     g_pilot_buttons.store(buttons, std::memory_order_relaxed);
+}
+
+/// Ver SetPilotTouch: x en los 16 bits altos, y en los bajos; -1 = sin toque.
+std::atomic<int> g_pilot_touch{-1};
+
+void SetPilotTouch(int x, int y) {
+    g_pilot_touch.store(x < 0 || y < 0 ? -1 : ((x & 0xFFFF) << 16) | (y & 0xFFFF),
+                        std::memory_order_relaxed);
+}
+
+bool PilotTouch(int& x, int& y) {
+    const int packed = g_pilot_touch.load(std::memory_order_relaxed);
+    if (packed < 0) {
+        return false;
+    }
+    x = (packed >> 16) & 0xFFFF;
+    y = packed & 0xFFFF;
+    return true;
+}
+
+std::atomic<bool> g_pilot_active{false};
+
+void SetPilotActive(bool active) {
+    g_pilot_active.store(active, std::memory_order_relaxed);
+}
+
+bool PilotActive() {
+    return g_pilot_active.load(std::memory_order_relaxed);
 }
 
 unsigned int PilotButtons() {

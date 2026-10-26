@@ -1606,7 +1606,142 @@ struct RasterizerGXM::PipelineCache {
      * son una busqueda en una tabla hash. Es el mismo criterio que ya seguia el
      * cargador de libshacccg cuando le paso esto mismo (ver gxm_cg.cpp).
      */
+    /**
+     * LOS SHADERS DE FRAGMENTOS DEL JUEGO, PREPARADOS ANTES DE QUE HAGAN FALTA
+     * (0.3.9.4). Cada configuracion nueva que se construye se apunta en
+     * juego_<id>.fsc (la configuracion de la PICA tal cual y los dos portadores
+     * de la mezcla, que es todo lo que cambia la fuente). Al primer dibujado de
+     * la partida se regeneran todas con el generador actual y las que no esten
+     * en la cache van a la cola del compilador, detras de las que pide el juego:
+     * tras una actualizacion que cambia los shaders (o con la cache borrada) se
+     * compilan durante el titulo y los menus en vez de faltar en pantalla
+     * cuando se llega a la escena.
+     */
+    struct FsRecordHeader {
+        u32 magic;
+        u32 record_size;
+        u64 struct_hash;
+    };
+    static constexpr u32 kFsRecordMagic = 0x43535A41u; // "AZSC"
+    struct FsRecord {
+        /// La configuracion en bruto: FSConfig no tiene constructor por defecto,
+        /// pero es una estructura plana (se compara y se hashea con memcmp).
+        alignas(Pica::Shader::FSConfig) u8 config_bytes[sizeof(Pica::Shader::FSConfig)];
+        u8 alpha_carrier;
+        u8 color_carrier;
+        u8 pad[2];
+        const Pica::Shader::FSConfig& Config() const {
+            return *reinterpret_cast<const Pica::Shader::FSConfig*>(config_bytes);
+        }
+    };
+    std::unordered_set<u64> recorded_configs;
+    std::string records_path;
+    bool prewarm_done = false;
+
+    static u64 RecordKey(const FsRecord& record) {
+        return Common::HashCombine(record.Config().Hash(),
+                                   (static_cast<u64>(record.alpha_carrier) << 8) |
+                                       record.color_carrier);
+    }
+
+    void RecordConfig(const Pica::Shader::FSConfig& config, bool alpha_carrier, u8 color_carrier) {
+        if (records_path.empty()) {
+            return;
+        }
+        FsRecord record{};
+        std::memcpy(record.config_bytes, &config, sizeof(config));
+        record.alpha_carrier = static_cast<u8>(alpha_carrier ? 1 : 0);
+        record.color_carrier = color_carrier;
+        if (!recorded_configs.insert(RecordKey(record)).second) {
+            return;
+        }
+        SceIoStat stat{};
+        const bool exists = sceIoGetstat(records_path.c_str(), &stat) >= 0;
+        const SceUID fd = sceIoOpen(records_path.c_str(), SCE_O_WRONLY | SCE_O_CREAT | SCE_O_APPEND,
+                                    0777);
+        if (fd < 0) {
+            return;
+        }
+        if (!exists || stat.st_size == 0) {
+            const FsRecordHeader header{kFsRecordMagic, static_cast<u32>(sizeof(FsRecord)),
+                                        Pica::Shader::FSConfig::StructHash()};
+            sceIoWrite(fd, &header, sizeof(header));
+        }
+        sceIoWrite(fd, &record, sizeof(record));
+        sceIoClose(fd);
+    }
+
+    /// Una vez por partida, desde el primer Get.
+    void Prewarm() {
+        prewarm_done = true;
+        const std::string prefix = CurrentGameCachePrefix();
+        if (prefix.empty()) {
+            return;
+        }
+        records_path = prefix + ".fsc";
+        std::vector<u8> data;
+        {
+            const SceUID fd = sceIoOpen(records_path.c_str(), SCE_O_RDONLY, 0);
+            if (fd >= 0) {
+                const SceOff size = sceIoLseek(fd, 0, SCE_SEEK_END);
+                sceIoLseek(fd, 0, SCE_SEEK_SET);
+                if (size > 0 && size < 16 * 1024 * 1024) {
+                    data.resize(static_cast<std::size_t>(size));
+                    if (sceIoRead(fd, data.data(), static_cast<SceSize>(data.size())) !=
+                        static_cast<int>(data.size())) {
+                        data.clear();
+                    }
+                }
+                sceIoClose(fd);
+            }
+        }
+        FsRecordHeader header{};
+        if (data.size() < sizeof(header)) {
+            return;
+        }
+        std::memcpy(&header, data.data(), sizeof(header));
+        if (header.magic != kFsRecordMagic || header.record_size != sizeof(FsRecord) ||
+            header.struct_hash != Pica::Shader::FSConfig::StructHash()) {
+            // De otra version de la estructura: se empieza de cero.
+            sceIoRemove(records_path.c_str());
+            return;
+        }
+        const unsigned long long begin = Common::VitaMicros();
+        u32 known = 0;
+        u32 queued = 0;
+        for (std::size_t at = sizeof(header); at + sizeof(FsRecord) <= data.size();
+             at += sizeof(FsRecord)) {
+            FsRecord record{};
+            std::memcpy(&record, data.data() + at, sizeof(record));
+            if (!recorded_configs.insert(RecordKey(record)).second) {
+                continue;
+            }
+            known++;
+            const char* reason = nullptr;
+            auto source = Pica::Shader::Generator::GXM::GenerateFragmentShader(
+                record.Config(), &reason, record.alpha_carrier != 0, record.color_carrier != 0);
+            if (!source.has_value() || CgCacheContains(SCE_SHACCCG_PROFILE_FP, *source)) {
+                continue;
+            }
+            auto job = std::make_shared<CgJob>();
+            job->profile = SCE_SHACCCG_PROFILE_FP;
+            job->name = "azahar_gxm_f.cg";
+            job->sources.push_back(std::move(*source));
+            job->variants.push_back(0);
+            CgSubmit(std::move(job), false);
+            queued++;
+        }
+        Common::VitaNote("gxm compila",
+                         fmt::format("calentar: {} configuraciones de fragmentos conocidas, {} a "
+                                     "compilar en segundo plano ({} ms)",
+                                     known, queued, (Common::VitaMicros() - begin) / 1000)
+                             .c_str());
+    }
+
     const Entry* Get(const Pica::RegsInternal& regs, const char** out_reason = nullptr) {
+        if (!prewarm_done) {
+            Prewarm();
+        }
         const auto fail = [out_reason](const char* reason) -> const Entry* {
             if (out_reason != nullptr) {
                 *out_reason = reason;
@@ -1690,6 +1825,7 @@ struct RasterizerGXM::PipelineCache {
         entry->retries = retries;
         const char* reason = nullptr;
         entry->color_carrier = color_carrier;
+        RecordConfig(config, alpha_carrier, color_carrier);
         if (!Build(entry.get(), config, blend, alpha_carrier, &reason)) {
             entry->usable = false;
             entry->reason = reason != nullptr ? reason : "shader";
@@ -3385,12 +3521,11 @@ void RasterizerGXM::EndScene() {
         }
     }
     vertex_segments_pending = 0;
-    // Las versiones de las tablas de luz que ha atado esta escena: la actual
-    // si la ha usado, y las retiradas a mitad de escena.
-    for (u32 back = lighting_lut_in_scene ? 0 : 1; back <= lighting_lut_retired_in_scene;
-         back++) {
-        lut_fence[(lighting_lut_version + kLutVersions - back) % kLutVersions] = fence_sent;
+    // Las versiones de las tablas de luz que ha atado esta escena (0.3.9.6).
+    for (u64 mask = lut_scene_mask; mask != 0; mask &= mask - 1) {
+        lut_fence[static_cast<u32>(std::countr_zero(mask))] = fence_sent;
     }
+    lut_scene_mask = 0;
     lighting_lut_in_scene = false;
     lighting_lut_retired_in_scene = 0;
     gpu_scenes.fetch_add(1, std::memory_order_relaxed);
@@ -5253,6 +5388,11 @@ bool RasterizerGXM::UpdateLightingLut() {
         for (auto& held : lighting_lut_version_gen) {
             held.fill(0);
         }
+        for (auto& held : lighting_lut_version_hash) {
+            held.fill(0);
+        }
+        lighting_lut_hash.fill(0);
+        lut_scene_mask = 0;
         // Recien creada no tiene nada dentro: se suben las 24.
         pica.lighting.lut_dirty = Pica::PicaCore::Lighting::LutAllDirty;
     }
@@ -5282,74 +5422,86 @@ bool RasterizerGXM::UpdateLightingLut() {
                 row[i * 2 + 1] = source[i].DiffToFloat();
             }
             lighting_lut_gen[index] = ++lighting_lut_gen_counter;
+            // Nunca 0: 0 es "no se sabe que tiene" en lighting_lut_version_hash.
+            lighting_lut_hash[index] =
+                Common::ComputeHash64(row, kLutEntries * 2 * sizeof(f32)) | 1ull;
         }
         pica.lighting.lut_dirty = 0;
     }
     constexpr std::size_t kRowBytes = static_cast<std::size_t>(kLutEntries) * 2 * sizeof(f32);
-    // Una version al dia: las tablas que han cambiado desde que se escribio.
+    // Una version al dia: las tablas cuyo contenido no tiene ya (0.3.9.6, por hash).
     const auto sync = [&](u32 version) {
         u8* const base = static_cast<u8*>(lighting_lut_buffer.Data()) +
                          static_cast<std::size_t>(version) * kLutBytes;
-        auto& held = lighting_lut_version_gen[version];
+        auto& held = lighting_lut_version_hash[version];
         for (u32 index = 0; index < kLutCount; index++) {
-            if (held[index] != lighting_lut_gen[index]) {
+            if (held[index] != lighting_lut_hash[index]) {
                 std::memcpy(base + index * kRowBytes,
                             reinterpret_cast<const u8*>(lighting_lut_shadow.data()) +
                                 index * kRowBytes,
                             kRowBytes);
-                held[index] = lighting_lut_gen[index];
+                held[index] = lighting_lut_hash[index];
             }
         }
     };
+    const auto holds_current = [&](u32 version) {
+        return lighting_lut_version_hash[version] == lighting_lut_hash;
+    };
 
     /**
-     * La escena abierta ya lee la version actual: NO se puede reescribir.
+     * LA VERSION POR CONTENIDO (0.3.9.6). Hasta aqui cada cambio estrenaba la
+     * version siguiente de la rueda, aunque el juego volviera a unas tablas que
+     * ya estaban escritas en otra, y al dar la vuelta esperaba a la GPU.
      *
-     * Hasta 0.1.0.41 esto cerraba la escena -- sceGxmFinish, esperar a que la
-     * GPU acabara todo lo apuntado -- y reescribia la unica textura que habia.
-     * Pokemon y compania cambian tablas al cambiar de material, varias veces
-     * por fotograma, y cada una era una parada completa de la CPU.
-     *
-     * Ahora se pasa a la SIGUIENTE version y se pone al dia (desde 0.3.2.5
-     * solo las tablas que no tenga ya, ver lighting_lut_gen). La anterior se
-     * queda como estaba para los dibujados que ya la tienen atada. Solo si la
-     * escena ya tiene atadas TODAS las versiones se cierra, como antes: el
-     * resultado es el mismo, solo que casi nunca hace falta esperar.
-     *
-     * Por que la siguiente esta libre: se avanza siempre de una en una, asi
-     * que las que lee la escena son la actual y las 'retired' anteriores. Con
-     * retired + 1 < kLutVersions, la siguiente no es ninguna de ellas.
+     * 1. Una version que ya tenga exactamente estas tablas: se ata esa. Leerla
+     *    a la vez que la GPU no molesta a nadie.
+     * 2. Si no, la menos usada que ni ata la escena abierta ni lee ninguna
+     *    escena enviada: se pone al dia (solo las tablas que le falten).
+     * 3. Si todas las libres estan en vuelo, se espera a la menos usada. Y si
+     *    la escena abierta las tiene atadas todas, se cierra, como antes.
      */
-    if (lighting_lut_in_scene) {
-        if (lighting_lut_retired_in_scene + 1 < kLutVersions) {
-            lighting_lut_retired_in_scene++;
-            lighting_lut_version = (lighting_lut_version + 1) % kLutVersions;
-            // Una escena ya enviada puede seguir leyendo esa version.
-            WaitFence(lut_fence[lighting_lut_version], GpuWait::Lut);
-            sync(lighting_lut_version);
-            // La version nueva todavia no la ha atado nadie.
-            lighting_lut_in_scene = false;
+    if (holds_current(lighting_lut_version)) {
+        return true;
+    }
+    for (u32 version = 0; version < kLutVersions; version++) {
+        if (holds_current(version)) {
+            lighting_lut_version = version;
             return true;
         }
-        scene_close_lut.fetch_add(1, std::memory_order_relaxed);
-        EndScene();
     }
-
-    /**
-     * La escena abierta no la lee, pero una ya enviada puede que si (0.1.9.4):
-     * si su valla no ha pasado, se estrena la siguiente version (si esa esta
-     * libre) en vez de esperar.
-     */
-    if (!FenceDone(lut_fence[lighting_lut_version])) {
-        const u32 next = (lighting_lut_version + 1) % kLutVersions;
-        if (FenceDone(lut_fence[next])) {
-            lighting_lut_version = next;
-            sync(lighting_lut_version);
-            return true;
+    const auto pick = [&](bool need_done) -> s32 {
+        s32 best = -1;
+        for (u32 version = 0; version < kLutVersions; version++) {
+            if ((lut_scene_mask >> version) & 1ull) {
+                continue;
+            }
+            if (need_done && !FenceDone(lut_fence[version])) {
+                continue;
+            }
+            if (best < 0 || lut_last_use[version] < lut_last_use[best]) {
+                best = static_cast<s32>(version);
+            }
         }
-        WaitFence(lut_fence[lighting_lut_version], GpuWait::Lut);
+        return best;
+    };
+    s32 victim = pick(true);
+    if (victim < 0) {
+        victim = pick(false);
+        if (victim < 0) {
+            // La escena abierta las tiene atadas todas: se cierra.
+            scene_close_lut.fetch_add(1, std::memory_order_relaxed);
+            EndScene();
+            victim = pick(true);
+            if (victim < 0) {
+                victim = pick(false);
+            }
+        }
+        if (victim < 0) {
+            return false;
+        }
+        WaitFence(lut_fence[victim], GpuWait::Lut);
     }
-    // Nadie lee la version actual: se reescriben las tablas cambiadas.
+    lighting_lut_version = static_cast<u32>(victim);
     sync(lighting_lut_version);
     return true;
 }
@@ -5448,8 +5600,15 @@ void RasterizerGXM::FlushForPresent() {
      * presentacion anterior, pero solo cuando se suben (WaitPreviousPresentation).
      * Sin escena en ese fotograma no hay valla que mirar: a todo, como antes.
      */
-    const u32 older = present_fences[1];
-    if (presents_seen >= 2) {
+    /**
+     * DE HACE TRES (0.3.9.6). Con cuatro juegos de vertices y texel en el
+     * presentador (kPresentSlots) basta con que haya acabado la primera escena
+     * de hace TRES fotogramas. Super Mario 3D Land jugando (26-10): 15-25 ms por
+     * fotograma esperando a la de hace dos, con escenas de 21 ms de chip; un
+     * fotograma mas de margen deja solapar la CPU con la GPU.
+     */
+    const u32 older = present_fences[2];
+    if (presents_seen >= 3) {
         if (older != 0) {
             WaitFence(older, GpuWait::Frame);
         } else if (context != nullptr) {
@@ -5457,6 +5616,7 @@ void RasterizerGXM::FlushForPresent() {
             WaitGpu(GpuWait::Frame);
         }
     }
+    present_fences[2] = present_fences[1];
     present_fences[1] = present_fences[0];
     present_fences[0] = frame_first_fence;
     present_fence_now = frame_first_fence;
@@ -6655,6 +6815,8 @@ bool RasterizerGXM::SetupDrawState(Surface* surface, const Entry* pipeline,
         // La version vigente: ver UpdateLightingLut.
         sceGxmSetFragmentTexture(context, pipeline->lighting_lut_unit,
                                  &lighting_lut_textures[lighting_lut_version]);
+        lut_scene_mask |= 1ull << lighting_lut_version;
+        lut_last_use[lighting_lut_version] = ++lut_clock;
         // La unidad de la tabla de luz no pasa por la sombra: se olvida.
         if (pipeline->lighting_lut_unit < shadow.textures.size()) {
             shadow.textures_known &= ~(1u << pipeline->lighting_lut_unit);

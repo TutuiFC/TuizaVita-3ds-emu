@@ -1288,6 +1288,126 @@ void PurgeUnoptimizedPrograms() {
     }
 }
 
+/**
+ * EL PAQUETE DEL JUEGO (0.3.9.4). La precarga leia cada programa de su propio
+ * fichero en una carpeta de ~2.700: unos 90 ms por sceIoOpen en esta tarjeta, y
+ * con 300-450 programas por juego, 30-40 s de "Loading shaders..." en cada
+ * arranque (Super Mario 3D Land, 26-10). Ahora todos los programas del juego
+ * van tambien en un solo fichero, juego_<id>.pak, que se lee de una vez. Lo que
+ * falte en el paquete se lee suelto, como antes, y el paquete se reescribe.
+ * Cada entrada se valida igual que un fichero suelto (FromPreloaded compara la
+ * cabecera con la fuente), y las que ya no estan en la carpeta (programas
+ * borrados a proposito, ver PurgeUnoptimizedPrograms) se descartan.
+ */
+constexpr u32 kPackMagic = 0x4B505A41u; // "AZPK"
+constexpr u32 kPackVersion = 1;
+
+std::string PackPath(u64 program_id) {
+    return fmt::format("{}/juego_{:016x}.pak", kCacheDir, program_id);
+}
+
+void ReadPack(const std::string& path, std::unordered_map<std::string, std::vector<u8>>& out) {
+    const SceUID fd = sceIoOpen(path.c_str(), SCE_O_RDONLY, 0);
+    if (fd < 0) {
+        return;
+    }
+    const SceOff size = sceIoLseek(fd, 0, SCE_SEEK_END);
+    sceIoLseek(fd, 0, SCE_SEEK_SET);
+    std::vector<u8> data;
+    if (size > 12 && size < 64 * 1024 * 1024) {
+        data.resize(static_cast<std::size_t>(size));
+        if (sceIoRead(fd, data.data(), static_cast<SceSize>(data.size())) !=
+            static_cast<int>(data.size())) {
+            data.clear();
+        }
+    }
+    sceIoClose(fd);
+    if (data.size() < 12) {
+        return;
+    }
+    u32 header[3];
+    std::memcpy(header, data.data(), sizeof(header));
+    if (header[0] != kPackMagic || header[1] != kPackVersion) {
+        return;
+    }
+    std::size_t at = sizeof(header);
+    for (u32 i = 0; i < header[2]; i++) {
+        u16 path_len = 0;
+        u32 file_len = 0;
+        if (at + sizeof(path_len) > data.size()) {
+            break;
+        }
+        std::memcpy(&path_len, data.data() + at, sizeof(path_len));
+        at += sizeof(path_len);
+        if (at + path_len + sizeof(file_len) > data.size()) {
+            break;
+        }
+        std::string entry(reinterpret_cast<const char*>(data.data() + at), path_len);
+        at += path_len;
+        std::memcpy(&file_len, data.data() + at, sizeof(file_len));
+        at += sizeof(file_len);
+        if (at + file_len > data.size()) {
+            break;
+        }
+        out.emplace(std::move(entry),
+                    std::vector<u8>(data.begin() + static_cast<std::ptrdiff_t>(at),
+                                    data.begin() + static_cast<std::ptrdiff_t>(at + file_len)));
+        at += file_len;
+    }
+}
+
+/// Con g_preload_mutex cogido: todo lo precargado, a un fichero temporal y
+/// despues en su sitio (si se corta a medias, el paquete viejo sigue valiendo).
+void WritePackLocked(const std::string& path) {
+    std::vector<u8> data(12);
+    u32 count = 0;
+    for (const auto& [entry, file] : g_preloaded) {
+        if (entry.size() > 0xFFFF) {
+            continue;
+        }
+        const u16 path_len = static_cast<u16>(entry.size());
+        const u32 file_len = static_cast<u32>(file.size());
+        const std::size_t at = data.size();
+        data.resize(at + sizeof(path_len) + path_len + sizeof(file_len) + file_len);
+        std::memcpy(data.data() + at, &path_len, sizeof(path_len));
+        std::memcpy(data.data() + at + sizeof(path_len), entry.data(), path_len);
+        std::memcpy(data.data() + at + sizeof(path_len) + path_len, &file_len, sizeof(file_len));
+        std::memcpy(data.data() + at + sizeof(path_len) + path_len + sizeof(file_len),
+                    file.data(), file_len);
+        count++;
+    }
+    const u32 header[3] = {kPackMagic, kPackVersion, count};
+    std::memcpy(data.data(), header, sizeof(header));
+    const std::string temp = path + ".tmp";
+    const SceUID fd = sceIoOpen(temp.c_str(), SCE_O_WRONLY | SCE_O_CREAT | SCE_O_TRUNC, 0777);
+    if (fd < 0) {
+        return;
+    }
+    const bool ok = sceIoWrite(fd, data.data(), static_cast<SceSize>(data.size())) ==
+                    static_cast<int>(data.size());
+    sceIoClose(fd);
+    if (!ok) {
+        sceIoRemove(temp.c_str());
+        return;
+    }
+    sceIoRemove(path.c_str());
+    sceIoRename(temp.c_str(), path.c_str());
+}
+
+std::string g_game_prefix;
+
+std::string CurrentGameCachePrefix() {
+    const std::lock_guard lock{g_preload_mutex};
+    return g_game_prefix;
+}
+
+bool CgCacheContains(SceShaccCgTargetProfile profile, const std::string& source) {
+    const std::string path =
+        CachePath(Common::ComputeHash64(source.data(), source.size()), profile);
+    const std::lock_guard lock{g_preload_mutex};
+    return g_preloaded.count(path) != 0 || g_card_files.count(path) != 0;
+}
+
 u32 PreloadCgCache(u64 program_id, const std::function<void(u32, u32)>& progress) {
     PurgeUnoptimizedPrograms();
     g_start_notes.store(0, std::memory_order_relaxed);
@@ -1301,6 +1421,7 @@ u32 PreloadCgCache(u64 program_id, const std::function<void(u32, u32)>& progress
         g_preloaded.clear();
         g_game_list.clear();
         g_game_list_path = fmt::format("{}/juego_{:016x}.lst", kCacheDir, program_id);
+        g_game_prefix = fmt::format("{}/juego_{:016x}", kCacheDir, program_id);
     }
     sceIoMkdir(kCacheDir, 0777);
     const SceUID list_fd = sceIoOpen(g_game_list_path.c_str(), SCE_O_RDONLY, 0);
@@ -1333,11 +1454,30 @@ u32 PreloadCgCache(u64 program_id, const std::function<void(u32, u32)>& progress
     std::size_t total_bytes = 0;
     u32 loaded = 0;
     const u32 total = static_cast<u32>(paths.size());
+    const unsigned long long preload_begin = Common::VitaMicros();
+    const std::string pack_path = PackPath(program_id);
+    std::unordered_map<std::string, std::vector<u8>> pack;
+    ReadPack(pack_path, pack);
+    u32 from_pack = 0;
+    u32 loose = 0;
     for (u32 i = 0; i < total; i++) {
         if (progress && (i % 8) == 0) {
             progress(i, total);
         }
         const std::string& path = paths[i];
+        if (auto packed = pack.find(path); packed != pack.end()) {
+            if (total_bytes + packed->second.size() > kMaxPreloadBytes) {
+                continue;
+            }
+            total_bytes += packed->second.size();
+            loaded++;
+            from_pack++;
+            const std::lock_guard lock{g_preload_mutex};
+            g_game_list.insert(path);
+            g_preloaded.emplace(path, std::move(packed->second));
+            continue;
+        }
+        loose++;
         const SceUID fd = sceIoOpen(path.c_str(), SCE_O_RDONLY, 0);
         if (fd < 0) {
             continue;
@@ -1366,9 +1506,12 @@ u32 PreloadCgCache(u64 program_id, const std::function<void(u32, u32)>& progress
     if (progress) {
         progress(total, total);
     }
-    Common::VitaNote("gxm cache", fmt::format("precarga: {} de {} shaders, {} KB", loaded, total,
-                                              total_bytes / 1024)
-                                      .c_str());
+    Common::VitaNote("gxm cache",
+                     fmt::format("precarga: {} de {} shaders, {} KB en {} ms ({} del paquete, "
+                                 "{} sueltos)",
+                                 loaded, total, total_bytes / 1024,
+                                 (Common::VitaMicros() - preload_begin) / 1000, from_pack, loose)
+                         .c_str());
     LoadVsIndex(program_id);
     {
         const unsigned long long list_begin = Common::VitaMicros();
@@ -1382,10 +1525,31 @@ u32 PreloadCgCache(u64 program_id, const std::function<void(u32, u32)>& progress
             sceIoDclose(dir);
         }
         const std::size_t count = files.size();
+        u32 dropped = 0;
         {
             const std::lock_guard lock{g_preload_mutex};
             g_card_files = std::move(files);
             g_card_index_ready = dir >= 0;
+            if (g_card_index_ready) {
+                for (auto it = g_preloaded.begin(); it != g_preloaded.end();) {
+                    if (g_card_files.count(it->first) == 0) {
+                        it = g_preloaded.erase(it);
+                        dropped++;
+                    } else {
+                        ++it;
+                    }
+                }
+            }
+            // El paquete, al dia: si algo se leyo suelto o se ha descartado.
+            if (loose != 0 || dropped != 0 || from_pack != pack.size()) {
+                WritePackLocked(pack_path);
+            }
+        }
+        if (dropped != 0) {
+            Common::VitaNote("gxm cache", fmt::format("paquete: {} programas que ya no estan "
+                                                      "en la carpeta, fuera",
+                                                      dropped)
+                                              .c_str());
         }
         Common::VitaNote("gxm cache", fmt::format("carpeta: {} ficheros en {} ms", count,
                                                   (Common::VitaMicros() - list_begin) / 1000)
@@ -1842,6 +2006,78 @@ constexpr unsigned long long kHeavyCalmUs = 3000000;
 /// Justo por encima de los ayudantes y del hilo de la GPU (159).
 constexpr int kCgBoostedPriority = Common::kVitaPriorityHelper - 1;
 
+/**
+ * EL COMPILADOR, AL NUCLEO QUE ESTE LIBRE (0.3.9.4). Atado al 2 desde 0.2.3.8
+ * porque suelto la consola no lo movia al que quedaba libre; pero el 2 es
+ * tambien el del sonido, el DSP y la lectura de ficheros, y con la prioridad
+ * mas baja le quedaba poco: en New Super Mario Bros. 2 un shader de fragmentos
+ * de 2,3 s de reloj tuvo 0,37 s de CPU, con los nucleos 0 y 1 al 50-60 %. Este
+ * hilo mira cada 250 ms cuanto ha estado libre cada nucleo y, mientras haya
+ * algo compilandose, lleva el compilador al que mas tiempo libre ha tenido si
+ * le saca al actual un 15 % o mas. La prioridad no se toca: en cualquier
+ * nucleo sigue usando solo lo que le dejan los demas.
+ */
+std::atomic<int> g_worker_core{2};
+
+void* CgBalancerMain(void*) {
+    sceKernelChangeThreadPriority(sceKernelGetThreadId(), 64);
+    unsigned long long last_idle[3] = {};
+    unsigned long long last_wall = 0;
+    u32 moves = 0;
+    while (true) {
+        sceKernelDelayThread(250 * 1000);
+        SceKernelSystemInfo system{};
+        system.size = sizeof(system);
+        if (sceKernelGetSystemInfo(&system) < 0) {
+            continue;
+        }
+        const unsigned long long now = Common::VitaMicros();
+        double free_share[3] = {};
+        if (last_wall != 0) {
+            const double wall = static_cast<double>(now - last_wall);
+            for (int core = 0; core < 3; core++) {
+                free_share[core] =
+                    static_cast<double>(system.cpuInfo[core].idleClock - last_idle[core]) / wall;
+            }
+        }
+        for (int core = 0; core < 3; core++) {
+            last_idle[core] = system.cpuInfo[core].idleClock;
+        }
+        const bool first = last_wall == 0;
+        last_wall = now;
+        const SceUID worker = g_worker_uid.load(std::memory_order_acquire);
+        if (first || worker < 0 || g_worker_busy_since.load(std::memory_order_relaxed) == 0) {
+            continue;
+        }
+        const int current = g_worker_core.load(std::memory_order_relaxed);
+        int best = current;
+        for (int core = 0; core < 3; core++) {
+            if (free_share[core] > free_share[best]) {
+                best = core;
+            }
+        }
+        // El tiempo libre del nucleo actual cuenta tambien el que ya usa el
+        // compilador como ocupado: un 15 % de diferencia evita ir y venir.
+        if (best == current || free_share[best] < free_share[current] + 0.15) {
+            continue;
+        }
+        static const int kMasks[3] = {SCE_KERNEL_CPU_MASK_USER_0, SCE_KERNEL_CPU_MASK_USER_1,
+                                      SCE_KERNEL_CPU_MASK_USER_2};
+        if (sceKernelChangeThreadCpuAffinityMask(worker, kMasks[best]) >= 0) {
+            g_worker_core.store(best, std::memory_order_relaxed);
+            if (++moves <= 6) {
+                Common::VitaNote("gxm compila",
+                                 fmt::format("compilador: nucleo {} -> {} (libres {:.0f}% / "
+                                             "{:.0f}% / {:.0f}%)",
+                                             current, best, free_share[0] * 100,
+                                             free_share[1] * 100, free_share[2] * 100)
+                                     .c_str());
+            }
+        }
+    }
+    return nullptr;
+}
+
 void* CgWorkerMain(void*) {
     /**
      * EL NUCLEO 2 PARA EL (0.2.3.8). Suelto en cualquier nucleo (0.2.0.5) la
@@ -1864,6 +2100,16 @@ void* CgWorkerMain(void*) {
     // la GPU en cada lote. Ver kVitaPriorityBackground.
     Common::VitaSetThreadPriority(Common::kVitaPriorityBackground, "compilador de shaders");
     g_worker_uid.store(sceKernelGetThreadId(), std::memory_order_release);
+    {
+        pthread_attr_t attr;
+        pthread_attr_init(&attr);
+        pthread_attr_setstacksize(&attr, 16 * 1024);
+        pthread_t balancer;
+        if (pthread_create(&balancer, &attr, &CgBalancerMain, nullptr) == 0) {
+            pthread_detach(balancer);
+        }
+        pthread_attr_destroy(&attr);
+    }
     while (true) {
         std::shared_ptr<CgJob> job;
         {

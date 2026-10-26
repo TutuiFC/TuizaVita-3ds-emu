@@ -196,7 +196,8 @@ private:
      * (0.2.2.0): la GPU puede seguir leyendo los de las dos anteriores
      * mientras se escriben los de esta. Ver RasterizerGXM::FlushForPresent.
      */
-    static constexpr u32 kPresentSlots = 3;
+    /// Cuatro desde 0.3.9.6 (ver RasterizerGXM::FlushForPresent).
+    static constexpr u32 kPresentSlots = 4;
     Allocation fill_texel;
     std::array<SceGxmTexture, kPresentSlots> fill_textures{};
     u32 present_slot = 0;

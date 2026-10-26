@@ -105,6 +105,14 @@ void CgForgetInterruptedCompile();
  */
 u32 PreloadCgCache(u64 program_id, const std::function<void(u32, u32)>& progress);
 
+/// El prefijo de los ficheros de la cache del juego que corre
+/// (".../shadercache/juego_<id>"), vacio si no se ha precargado ninguno (0.3.9.4).
+std::string CurrentGameCachePrefix();
+
+/// El programa de esa fuente ya esta en la cache (precargado o en la carpeta),
+/// sin leerlo (0.3.9.4).
+bool CgCacheContains(SceShaccCgTargetProfile profile, const std::string& source);
+
 /**
  * COMPILACION EN SEGUNDO PLANO (0.1.9.6).
  *

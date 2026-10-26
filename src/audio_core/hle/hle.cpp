@@ -173,6 +173,27 @@ private:
     u32 mixer_misses = 0;
     u32 mixer_misses_in_row = 0;
     std::atomic<int> mixer_tid{-1};
+    /**
+     * LA EMULACION AYUDA A MEZCLAR EN VEZ DE ESPERAR (0.3.9.5). Con 20-24
+     * fuentes la mezcla son 2-3 ms por trama en el nucleo 2 y el hilo de
+     * emulacion la espera (Zelda Ocarina of Time 3D: ~12 ms por fotograma).
+     * Cuando va a esperarla (WaitMixer), primero coge fuentes del mismo
+     * contador que el hilo de la mezcla y las mezcla en sus propios buffers; el
+     * de la mezcla las suma al final. Las sumas son de enteros: el resultado es
+     * el mismo en cualquier orden. Un hilo ayudante aparte (primera version) se
+     * quedaba sin CPU en el nucleo del hilo de la GPU y la mezcla le esperaba.
+     *
+     * mix_claim lleva la trama en los 16 bits altos y la siguiente fuente en
+     * los bajos, para que quien coge una fuente sepa SIEMPRE de que trama es.
+     */
+    std::atomic<u32> mix_claim{0x8000u};
+    u32 mix_gen_counter = 0;
+    std::atomic<bool> helper_working{false};
+    std::atomic<u32> helper_contrib_gen{0};
+    std::array<QuadFrame32, 3> helper_mixes{};
+    u32 helper_active = 0;
+    void HelpMix();
+    void MixSource(std::size_t index, std::array<QuadFrame32, 3>& mixes, u32& active);
 
 public:
     template <class Archive>
@@ -586,6 +607,8 @@ void DspHle::Impl::WaitMixer() {
     if (!mixer_started) {
         return;
     }
+    // Antes de esperar, las fuentes que queden (ver HelpMix).
+    HelpMix();
     std::unique_lock lock{mixer_mutex};
 #ifdef __PSVITA__
     if (!mixer_busy) {
@@ -660,6 +683,43 @@ void DspHle::Impl::WaitMixer() {
 #endif
 }
 
+void DspHle::Impl::MixSource(std::size_t index, std::array<QuadFrame32, 3>& mixes,
+                             u32& active) {
+    mixer_statuses[index] = sources[index].Generate();
+    active += mixer_statuses[index].is_enabled ? 1u : 0u;
+    for (std::size_t mix = 0; mix < 3; mix++) {
+        sources[index].MixInto(mixes[mix], mix);
+    }
+}
+
+void DspHle::Impl::HelpMix() {
+    helper_working.store(true, std::memory_order_seq_cst);
+    bool joined = false;
+    u32 active = 0;
+    u64 count = 0;
+    while (true) {
+        const u32 claim = mix_claim.fetch_add(1, std::memory_order_seq_cst);
+        const u32 index = claim & 0xFFFFu;
+        if (index >= HLE::num_sources) {
+            break;
+        }
+        if (!joined) {
+            for (auto& mix : helper_mixes) {
+                mix.fill({});
+            }
+            helper_contrib_gen.store(claim >> 16, std::memory_order_release);
+            joined = true;
+        }
+        MixSource(index, helper_mixes, active);
+        count++;
+    }
+    if (joined) {
+        helper_active = active;
+        HLE::Stats::helper_sources.fetch_add(count, std::memory_order_relaxed);
+    }
+    helper_working.store(false, std::memory_order_seq_cst);
+}
+
 void DspHle::Impl::RunMix() {
 #ifdef __PSVITA__
     const unsigned long long begin = Common::VitaMicros();
@@ -674,6 +734,9 @@ void DspHle::Impl::RunMix() {
     static unsigned long long gen_us = 0, mix_us = 0, final_us = 0, out_us = 0;
     static u32 phase_notes = 0;
     const bool timed = (++phase_ticks & 31u) == 0;
+    if (timed) {
+        HLE::Stats::phase_tid = sceKernelGetThreadId();
+    }
     HLE::Stats::phase_timing = timed;
     unsigned long long at = timed ? Common::VitaMicros() : 0;
     const auto lap = [&](unsigned long long& slot) {
@@ -684,7 +747,11 @@ void DspHle::Impl::RunMix() {
         }
     };
 #endif
-    for (std::size_t i = 0; i < HLE::num_sources; i++) {
+    // Ver HelpMix: las fuentes salen de un contador que comparte con la emulacion.
+    const u32 gen = (++mix_gen_counter) & 0xFFFFu;
+    mix_claim.store(gen << 16, std::memory_order_seq_cst);
+    for (u32 i = 0; (i = mix_claim.fetch_add(1, std::memory_order_seq_cst) & 0xFFFFu) <
+                    HLE::num_sources;) {
         mixer_source.store(static_cast<int>(i), std::memory_order_relaxed);
         mixer_statuses[i] = sources[i].Generate();
 #ifdef __PSVITA__
@@ -697,6 +764,22 @@ void DspHle::Impl::RunMix() {
 #ifdef __PSVITA__
         lap(mix_us);
 #endif
+    }
+    // Lo que la emulacion tenga a medias, y su parte.
+    while (helper_working.load(std::memory_order_seq_cst)) {
+#ifdef __PSVITA__
+        sceKernelDelayThread(20);
+#endif
+    }
+    if (helper_contrib_gen.load(std::memory_order_acquire) == gen) {
+        for (std::size_t mix = 0; mix < 3; mix++) {
+            for (std::size_t s = 0; s < helper_mixes[mix].size(); s++) {
+                for (std::size_t c = 0; c < 4; c++) {
+                    intermediate_mixes[mix][s][c] += helper_mixes[mix][s][c];
+                }
+            }
+        }
+        active += helper_active;
     }
     HLE::Stats::ticks.fetch_add(1, std::memory_order_relaxed);
     HLE::Stats::active.fetch_add(active, std::memory_order_relaxed);
@@ -721,12 +804,14 @@ void DspHle::Impl::RunMix() {
             "dsp fases",
             fmt::format("us por trama: fuentes {:.0f} (refresco {:.0f} decodificar {:.0f} "
                         "interpolar {:.0f} filtros {:.0f}, {:.0f} muestras de entrada) "
-                        "mezclar {:.0f} final {:.0f} salida {:.0f} | interpolar: {} rapidas "
+                        "mezclar {:.0f} final {:.0f} salida {:.0f} | ayudante {} fuentes | "
+                        "interpolar: {} rapidas "
                         "{} lentas, ritmo max {:.3f}",
                         gen_us / n, HLE::Stats::phase_refresh_us / n,
                         HLE::Stats::phase_decode_us / n, HLE::Stats::phase_interp_us / n,
                         HLE::Stats::phase_filter_us / n, HLE::Stats::phase_samples_in / n,
                         mix_us / n, final_us / n, out_us / n,
+                        HLE::Stats::helper_sources.exchange(0, std::memory_order_relaxed),
                         HLE::Stats::interp_fast.exchange(0, std::memory_order_relaxed),
                         HLE::Stats::interp_slow.exchange(0, std::memory_order_relaxed),
                         HLE::Stats::interp_max_rate.exchange(0, std::memory_order_relaxed) /
@@ -898,7 +983,16 @@ void DspHle::Impl::AudioTickCallback(s64 cycles_late) {
     s64 adjusted_ticks = static_cast<s64>(audio_frame_ticks / time_scale - cycles_late);
     core_timing.ScheduleEvent(adjusted_ticks, tick_event);
     if (mixer_publish) {
-        core_timing.ScheduleEvent(std::max<s64>(adjusted_ticks / 2, 0), publish_event);
+        /**
+         * A LOS TRES CUARTOS (0.3.9.5; era a la mitad desde 0.3.1.7). La mezcla
+         * del otro nucleo tiene ese tiempo emulado para acabar antes de que el
+         * juego la espere, y cuando la CPU emulada va sobrada medio intervalo
+         * pasa en nada: Zelda Ocarina of Time 3D esperaba ~12 ms por fotograma.
+         * Sigue siendo DENTRO del intervalo -- cada interrupcion lleva lo de su
+         * propio tick, que es lo que necesita Pokemon Sol (con la publicacion en
+         * el tick siguiente se congelaba al arrancar) --, solo que mas tarde.
+         */
+        core_timing.ScheduleEvent(std::max<s64>(adjusted_ticks * 3 / 4, 0), publish_event);
     }
 }
 
