@@ -664,6 +664,10 @@ void EmuWindow_Vita::PresentScreens() {
         Common::FrameStats::Add(Common::FrameStats::overlay_us, overlay_begin);
     }
     vita2d_end_drawing();
+    if (gxm_api) {
+        // Su marca, para la espera de FlushForPresent (0.4.0.6).
+        Gxm::RasterizerGXM::NotePresentSubmitted();
+    }
     Common::FrameStats::Add(Common::FrameStats::draw_us, draw_begin);
 
     // vita2d_swap_buffers espera a que la GPU acabe y al barrido de pantalla.

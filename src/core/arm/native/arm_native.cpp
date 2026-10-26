@@ -225,10 +225,14 @@ bool EnsureWorld() {
     return true;
 }
 
+/// La tabla del 3DS reflejada por ultima vez (0.4.0.1): ver ReflectOnFault.
+u8* const* g_raw = nullptr;
+
 void MirrorPageTable(u8* const* raw) {
     if (raw == nullptr || !EnsureWorld()) {
         return;
     }
+    g_raw = raw;
     /**
      * TABLAS LIMPIAS AL EMPEZAR, y es importante: el modulo sigue cargado entre
      * arranques de Azahar, asi que las tablas de segundo nivel de la sesion
@@ -336,8 +340,20 @@ constexpr u32 kInstrPerUs = 883;
  * POR DEBAJO DE ESTO NO VALE LA PENA: cada salida del mundo nativo cuesta 4,9
  * us medidos, asi que una rodaja de 10 us seria medio tiempo de peaje. Esas se
  * las queda el interprete.
+ *
+ * DE 20 A 2 us (0.4.0.2), porque esa cuenta comparaba mal. La alternativa a
+ * una rodaja nativa corta no es "no pagar el peaje": es el JIT, a ~25
+ * millones de instrucciones por segundo frente a 883 en nativo. 10 us de
+ * invitado son ~8.800 instrucciones: 10 + 4,9 us en nativo y ~350 us en el
+ * JIT. Con 20 us, las rodajas que el reloj corta pronto (un evento a menos
+ * de 17.660 instrucciones, y en un juego son la mayoria) se iban enteras al
+ * JIT: en las partidas de 26-10 el JIT seguia ejecutando el 98-99 % del
+ * codigo con jit_nativo=1 (Mario 3D Land: ~35 rodajas nativas por segundo).
+ * Y el presupuesto no acota la rodaja nativa por debajo de la interrupcion
+ * siguiente de la Vita (AzNativeRun solo lo mira al volver de una), asi que
+ * bajarlo no hace que el invitado se pase mas del evento que ya se pasaba.
  */
-constexpr u32 kMinSliceUs = 20;
+constexpr u32 kMinSliceUs = 2;
 
 /**
  * QUE SE LE COBRA AL RELOJ DEL INVITADO. Un tick del reloj emulado es UNA
@@ -414,7 +430,72 @@ bool enabled = false;
 bool both_cores = false;
 
 /// El resumen, sin reiniciar los contadores (lo llama tambien TryRun).
+/**
+ * DONDE FALLA EL INVITADO EN NATIVO (0.4.0.1). Mario Kart 7 con el motor
+ * nativo se quedaba en el logo a ~2 millones de instrucciones por segundo
+ * (sin el, sigue hasta su dialogo de Mii): abandonos "por fallo de datos"
+ * sin parar, cada uno una salida del mundo y una instruccion en el
+ * interprete. Las paginas que mas fallan, con el tipo de fallo (DFSR), a la
+ * linea de resumen; y si la pagina TIENE memoria en la tabla del 3DS, se
+ * refleja en ese momento (ver ReflectOnFault).
+ */
+struct FaultPage {
+    u32 page = 0;
+    u32 count = 0;
+    u32 dfsr = 0;
+    u32 pc = 0;
+    u32 reflected = 0;
+};
+std::array<FaultPage, 8> g_fault_pages{};
+u32 g_reflect_on_fault = 0;
+
+void NoteFault(u32 dfar, u32 dfsr, u32 pc) {
+    const u32 page = dfar >> 12;
+    FaultPage* slot = nullptr;
+    for (auto& entry : g_fault_pages) {
+        if (entry.count != 0 && entry.page == page) {
+            slot = &entry;
+            break;
+        }
+    }
+    if (slot == nullptr) {
+        slot = &g_fault_pages[0];
+        for (auto& entry : g_fault_pages) {
+            if (entry.count < slot->count) {
+                slot = &entry;
+            }
+        }
+        *slot = FaultPage{page, 0, dfsr, pc, 0};
+    }
+    slot->count++;
+    /**
+     * REFLEJAR AL FALLAR. Si la tabla del 3DS tiene memoria en esa pagina y el
+     * mundo nativo no, el reflejo se perdio (o no paso por MapPages). Se
+     * refleja esa pagina; un par de intentos por pagina, por si el fallo es
+     * de otra cosa (permisos) y reflejar no lo arregla.
+     */
+    constexpr u32 kMaxPage = 0x40000000u >> 12;
+    if (g_raw != nullptr && page < kMaxPage && g_raw[page] != nullptr && slot->reflected < 2) {
+        slot->reflected++;
+        g_reflect_on_fault++;
+        MirrorRange(g_raw, page, 1);
+    }
+}
+
 void LogStatsNow() {
+    std::string faults;
+    for (const auto& entry : g_fault_pages) {
+        if (entry.count != 0) {
+            faults += fmt::format(" {:#010x}x{} (dfsr {:#x} pc {:#010x}{})", entry.page << 12,
+                                  entry.count, entry.dfsr, entry.pc,
+                                  entry.reflected != 0 ? " reflejada" : "");
+        }
+    }
+    if (!faults.empty()) {
+        Note("fallos de datos por pagina:{} | reflejos al fallar {}", faults,
+             g_reflect_on_fault);
+        g_fault_pages = {};
+    }
     Note("rodajas {} | svc despachadas {} | abandonos {} (el ultimo por: {}) | tramos {} "
          "({} paginas puestas, {} quitadas) | {} instr cobradas ({} por rodaja) | codigo cambiado {}",
          g_native_slices, g_native_svcs, g_native_bails,
@@ -628,6 +709,7 @@ bool TryRun(ARMul_State& state, u64 max_instructions, u32& ticks, bool& then_int
         u32 back = 0;
         if (ctx.reason == AZ_REASON_DABT) {
             back = 8;
+            NoteFault(ctx.dfar, ctx.dfsr, ctx.r[15] - 8);
         } else if (ctx.reason == AZ_REASON_PABT) {
             back = 4;
         } else if (ctx.reason == AZ_REASON_UNDEF) {

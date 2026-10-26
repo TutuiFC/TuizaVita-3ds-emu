@@ -201,6 +201,12 @@ public:
      * 0.3.1.7. Clave "volcado_cada=" de ajustes.txt.
      */
     static std::atomic<u32> present_writeback_every;
+    /// La espera de FlushForPresent por las marcas de cada presentacion
+    /// (0.4.0.6). Clave "valla_exacta=" de ajustes.txt.
+    static std::atomic<u32> present_marks_on;
+    /// Solo los uniformes de coma flotante que lee el programa (0.4.0.6, ver
+    /// UsedFloatUniforms). Clave "uniformes_justos=" de ajustes.txt.
+    static std::atomic<u32> exact_vs_uniforms;
     /// Copias de textura que son una superficie entera, como copia de mosaico a
     /// mosaico en la GPU (0.3.1.8, ver AccelerateTextureCopy). Apagado desde
     /// 0.3.1.9. Clave "copia_textura_gpu=" de ajustes.txt.
@@ -250,6 +256,9 @@ public:
      * "uniformes_directos=" de ajustes.txt, a 0 lo apaga.
      */
     static std::atomic<u32> direct_uniforms;
+    /// Cache de subidas de vertices (0.4.0.4, ver CachedVertexUpload). Clave
+    /// "cache_subidas=" de ajustes.txt, a 0 la apaga.
+    static std::atomic<u32> vertex_upload_cache;
     /**
      * Tamano maximo, en KB de Cg, de un shader de vertices que se compila en
      * partida (0.3.4.9). Estaba fijo en 23: un programa de mas (26 KB, la piel
@@ -534,6 +543,11 @@ public:
     /// (las texturas de pantalla que se suben). Ver FlushForPresent.
     static void WaitPreviousPresentation();
 
+    /// La presentacion acaba de mandarse a la GPU (0.4.0.6): apunta su marca
+    /// (ver present_marks). Desde el hilo que presenta, despues de cerrar su
+    /// escena.
+    static void NotePresentSubmitted();
+
     static void ResetCounters() {
         gpu_triangles.store(0, std::memory_order_relaxed);
         software_triangles.store(0, std::memory_order_relaxed);
@@ -788,6 +802,9 @@ private:
      */
     volatile unsigned int* fence_address = nullptr;
     u32 fence_sent = 0;
+    /// Cuando se envio cada valla (las ultimas 64), para medir la cola de la
+    /// GPU al presentar (0.4.0.5, ver FlushForPresent).
+    std::array<unsigned long long, 64> fence_sent_us{};
     /// La primera valla del fotograma en curso (ver FlushForPresent).
     u32 frame_first_fence = 0;
     /// Las primeras vallas de los dos fotogramas anteriores (0.2.2.0): [0] el
@@ -797,6 +814,15 @@ private:
     /// La del fotograma que se esta presentando: acabada, la presentacion
     /// anterior tambien (WaitPreviousPresentation).
     u32 present_fence_now = 0;
+    /**
+     * LAS MARCAS DE LAS ULTIMAS CUATRO PRESENTACIONES DIBUJADAS (0.4.0.6):
+     * fence_sent justo despues de mandar cada una (NotePresentSubmitted). La
+     * valla siguiente a una marca es de una escena mandada DESPUES de esa
+     * presentacion, y como acaban en orden, que haya acabado dice que la
+     * presentacion tambien. Ver FlushForPresent.
+     */
+    std::array<u32, 4> present_marks{};
+    u32 presents_drawn = 0;
     [[nodiscard]] bool FenceDone(u32 fence) const;
     void WaitFence(u32 fence, GpuWait why);
 
@@ -890,6 +916,9 @@ private:
      * daba la vuelta a las 32 dentro del mismo fotograma.
      */
     std::array<u64, kLutTables> lighting_lut_hash{};
+    /// Tablas cambiadas que aun no se han convertido a lighting_lut_shadow
+    /// (0.4.0.5: se convierten en sync, al copiarlas a una version).
+    u32 lighting_lut_row_stale = 0;
     std::array<std::array<u64, kLutTables>, kLutVersions> lighting_lut_version_hash{};
     /// Las versiones que tiene atadas la escena abierta (bit por version).
     u64 lut_scene_mask = 0;
@@ -931,6 +960,36 @@ private:
     std::array<u32, kVertexSegments> vertex_segment_fence{};
     u32 vertex_segments_pending = 0;
     u32 index_capacity = 0;
+    /**
+     * CACHE DE SUBIDAS DE VERTICES (0.4.0.4). Dos zonas de 2 MB en memoria de
+     * la GPU, con una copia con cache de lo subido para comparar. Ver
+     * CachedVertexUpload.
+     */
+    struct VertexCacheEntry {
+        const u8* src = nullptr;
+        u32 bytes = 0;
+        u32 offset = 0;
+        u32 gen = 0;
+        u32 arena = 0;
+        /// La epoca de escritura con la que se comparo por ultima vez, y en
+        /// que presentacion (0.4.0.8, ver Common::WriteEpochs).
+        u32 verified = 0;
+        u32 verified_present = 0;
+    };
+    /// Comparar al menos una vez cada tantas presentaciones aunque ninguna
+    /// pagina haya avisado (0.4.0.8): por si un juego no vaciara la cache.
+    static constexpr u32 kVcacheRecheckPresents = 60;
+    static constexpr u32 kVcacheArenaBytes = 2u * 1024u * 1024u;
+    static constexpr u32 kVcacheEntries = 4096;
+    std::array<Allocation, 2> vcache_gpu;
+    std::unique_ptr<VertexCacheEntry[]> vcache_entries;
+    std::array<u32, 2> vcache_gen{1, 1};
+    std::array<u32, 2> vcache_used{};
+    std::array<u32, 2> vcache_fence{};
+    u32 vcache_pending = 0;
+    u32 vcache_current = 0;
+    bool vcache_failed = false;
+    const u8* CachedVertexUpload(const u8* src, u32 bytes);
     /// El lote en curso es de los que se cronometran por fases.
     bool profile_state = false;
 };

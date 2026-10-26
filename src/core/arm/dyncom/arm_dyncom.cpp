@@ -245,6 +245,19 @@ void ARM_DynCom::ExecuteInstructions(u64 num_instructions) {
             // rodaja, por el interprete. Ver TryRun.
             num_instructions =
                 num_instructions > native_ticks ? num_instructions - native_ticks : 1;
+            /**
+             * PERO NO TODA LA RODAJA (0.4.0.2). Un fallo es casi siempre UNA
+             * instruccion (un registro de E/S, una pagina sin reflejar), y lo
+             * que quedaba de rodaja -- hasta un millon de instrucciones -- se
+             * iba al JIT, 36 veces mas lento. Ahora el JIT hace un trozo
+             * corto (lo justo para que un bucle que sondea un registro no
+             * pague una salida del mundo por vuelta) y la rodaja siguiente
+             * vuelve a nativo.
+             */
+            constexpr u64 kAfterFaultInstructions = 2000;
+            if (num_instructions > kAfterFaultInstructions) {
+                num_instructions = kAfterFaultInstructions;
+            }
             state->NumInstrsToExecute = num_instructions;
         }
     }

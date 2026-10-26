@@ -274,6 +274,23 @@ u32 ProgramBytes(const void* program, bool vertex) {
     return gxp != nullptr ? sceGxmProgramGetSize(gxp) : 0;
 }
 
+/**
+ * LA CAJA, MAS LIGERA (0.4.0.7). Cada dibujado preguntaba a la libreria el
+ * tamano de sus dos programas y los datos de cada textura (seis u ocho
+ * llamadas), y casi siempre son los mismos que en el dibujado anterior: se
+ * recuerdan los ultimos. Solo lo toca el hilo que dibuja.
+ */
+u32 CachedProgramBytes(const void* program, bool vertex) {
+    static const void* last[2] = {nullptr, nullptr};
+    static u32 bytes[2] = {0, 0};
+    const u32 k = vertex ? 0u : 1u;
+    if (program != last[k]) {
+        last[k] = program;
+        bytes[k] = ProgramBytes(program, vertex);
+    }
+    return bytes[k];
+}
+
 /// Por tipo de escena, en una ventana.
 struct KindStats {
     u32 scenes = 0;
@@ -658,11 +675,22 @@ void NoteTexture(u32 slot, const SceGxmTexture* texture) {
     if (slot >= kTextures || texture == nullptr) {
         return;
     }
+    // Ver CachedProgramBytes (0.4.0.7): la misma textura que la vez anterior.
+    static SceGxmTexture last[kTextures];
+    static bool known[kTextures] = {};
+    static u32 data[kTextures], size[kTextures], format[kTextures];
+    if (!known[slot] || std::memcmp(&last[slot], texture, sizeof(SceGxmTexture)) != 0) {
+        last[slot] = *texture;
+        known[slot] = true;
+        data[slot] = Address(sceGxmTextureGetData(texture));
+        size[slot] =
+            (sceGxmTextureGetWidth(texture) << 16) | (sceGxmTextureGetHeight(texture) & 0xFFFF);
+        format[slot] = static_cast<u32>(sceGxmTextureGetFormat(texture));
+    }
     g_pending.textures |= static_cast<u8>(1u << slot);
-    g_pending.texture[slot] = Address(sceGxmTextureGetData(texture));
-    g_pending.texture_size[slot] =
-        (sceGxmTextureGetWidth(texture) << 16) | (sceGxmTextureGetHeight(texture) & 0xFFFF);
-    g_pending.texture_format[slot] = static_cast<u32>(sceGxmTextureGetFormat(texture));
+    g_pending.texture[slot] = data[slot];
+    g_pending.texture_size[slot] = size[slot];
+    g_pending.texture_format[slot] = format[slot];
 }
 
 void Record(const DrawInfo& info) {
@@ -697,7 +725,7 @@ void Record(const DrawInfo& info) {
         g_work.draws++;
         if (info.kind == DrawKind::VertexGpu) {
             g_work.vgpu_indices += info.count;
-            const u32 vs_bytes = ProgramBytes(info.vertex_program, true);
+            const u32 vs_bytes = CachedProgramBytes(info.vertex_program, true);
             g_work.vs_work += static_cast<unsigned long long>(info.count) * vs_bytes;
             if (ProgramWork* slot = ProgramSlot(Address(info.vertex_program))) {
                 slot->indices += info.count;
@@ -707,7 +735,7 @@ void Record(const DrawInfo& info) {
         } else if (info.kind == DrawKind::VertexCpu) {
             g_work.vcpu_vertices += info.count;
         }
-        g_work.fs_bytes += ProgramBytes(info.fragment_program, false);
+        g_work.fs_bytes += CachedProgramBytes(info.fragment_program, false);
     }
     g_pending = Draw{};
 }

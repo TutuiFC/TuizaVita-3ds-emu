@@ -126,6 +126,7 @@ if (ENABLE_SOFTWARE_RENDERER)
     # renderer_gxm/renderer_gxm.h y renderer_gxm/gxm_presenter.h.
     if (VITA)
         target_sources(video_core PRIVATE
+            renderer_gxm/gxm_banco_memoria.cpp
             renderer_gxm/gxm_caja_negra.cpp
             renderer_gxm/gxm_caja_negra.h
             renderer_gxm/gxm_memory.cpp

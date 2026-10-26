@@ -108,6 +108,8 @@ add_library(citra_common STATIC
     vita_diag.h
     web_util.cpp
     web_util.h
+    write_epochs.cpp
+    write_epochs.h
     zstd_compression.cpp
     zstd_compression.h
 )

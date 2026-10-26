@@ -820,6 +820,15 @@ public:
      */
     void RasterizerMarkRegionCached(PAddr start, u32 size, bool cached);
 
+    /**
+     * Este tramo del proceso puede haber cambiado para la GPU (0.4.0.8): un
+     * vaciado de cache del juego o una escritura del sistema. Ver
+     * Common::WriteEpochs.
+     */
+    void MarkWritten(const Kernel::Process& process, VAddr addr, u32 size, u32 source = 0);
+    /// Lo mismo con una direccion fisica (rellenos, transferencias).
+    void MarkWrittenPhysical(PAddr addr, u32 size, u32 source = 0);
+
     /// For a rasterizer-accessible PAddr, gets a list of all possible VAddr
     std::vector<VAddr> PhysicalToVirtualAddressForRasterizer(PAddr addr);
 

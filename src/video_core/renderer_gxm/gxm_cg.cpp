@@ -1745,6 +1745,14 @@ const SceShaccCgCompileOutput* CompileCg(SceShaccCgTargetProfile profile, const 
      * juego de 3DS no cuestan casi nada; lo caro era compilarlos. Los de
      * fragmentos (se ejecutan por pixel) siguen con la optimizacion de serie.
      */
+    /**
+     * O1 EN LOS DE VERTICES (0.1.9.6), y se queda. En 0.4.0.1 se probo O3, que con
+     * la lectura de uniforms corta compila antes y deja binarios la mitad de
+     * grandes (banco: 9 s y 7,5 KB frente a 12 s y 15,7 KB), pero en Zafiro Alfa
+     * cuatro shaders dieron "fatal internal error" en O3 y no en O1 (banco_cg4), y
+     * un error interno deja el compilador roto el resto de la sesion: todos los
+     * de vertices a la CPU y el juego a 3 fps. No vale el riesgo.
+     */
     if (profile == SCE_SHACCCG_PROFILE_VP) {
         options.optimizationLevel = 1;
     }
@@ -1991,6 +1999,8 @@ std::deque<std::shared_ptr<CgJob>> g_jobs;
 bool g_worker_started = false;
 std::atomic<SceUID> g_worker_uid{-1};
 std::atomic<unsigned long long> g_worker_busy_since{0};
+/// Cuando termino el ultimo trabajo el hilo de compilacion (0.4.0.3).
+std::atomic<unsigned long long> g_worker_last_done_us{0};
 std::atomic<u32> g_jobs_queued{0};
 std::atomic<bool> g_worker_boosted{false};
 /// El trabajo en marcha es grande (CgJob::heavy): ese no se sube (0.2.2.7).
@@ -2182,6 +2192,7 @@ void* CgWorkerMain(void*) {
             }
         }
         g_worker_busy_since.store(0, std::memory_order_relaxed);
+        g_worker_last_done_us.store(Common::VitaMicros(), std::memory_order_relaxed);
         job->done.store(true, std::memory_order_release);
         if (g_worker_boosted.exchange(false, std::memory_order_acq_rel)) {
             sceKernelChangeThreadPriority(sceKernelGetThreadId(),
@@ -2278,6 +2289,14 @@ void CgSubmit(std::shared_ptr<CgJob> job, bool urgent) {
     }
     g_jobs_queued.store(static_cast<u32>(g_jobs.size()), std::memory_order_relaxed);
     g_jobs_ready.notify_one();
+}
+
+bool CgWorkerProgressing() {
+    const unsigned long long now = Common::VitaMicros();
+    const unsigned long long last_done = g_worker_last_done_us.load(std::memory_order_relaxed);
+    const unsigned long long busy_since = g_worker_busy_since.load(std::memory_order_relaxed);
+    return (last_done != 0 && now - last_done < 15000000ull) ||
+           (busy_since != 0 && now - busy_since < 60000000ull);
 }
 
 bool CgWorkerOnHeavyJob() {

@@ -16,6 +16,7 @@
 #include "common/optional_helper.h"
 #include "common/settings.h"
 #include "common/swap.h"
+#include "common/write_epochs.h"
 #include "core/arm/arm_interface.h"
 #include "core/arm/exception_handler.h"
 #include "core/core.h"
@@ -349,6 +350,8 @@ public:
 
                 u8* dest_ptr = page_table.pointers[page_index] + page_offset;
                 std::memcpy(dest_ptr, src_buffer, copy_amount);
+                // Ver Common::WriteEpochs (0.4.0.8): lo escribe el sistema.
+                Common::WriteEpochs::MarkHost(dest_ptr, copy_amount);
                 break;
             }
             case PageType::MemoryWatchpoint: {
@@ -358,6 +361,7 @@ public:
 
                 u8* dest_ptr = it->second.memory.GetPtr() + page_offset;
                 std::memcpy(dest_ptr, src_buffer, copy_amount);
+                Common::WriteEpochs::MarkHost(dest_ptr, copy_amount);
                 break;
             }
             case PageType::RasterizerCachedMemory:
@@ -366,7 +370,9 @@ public:
                     RasterizerFlushVirtualRegion(current_vaddr, static_cast<u32>(copy_amount),
                                                  FlushMode::Invalidate);
                 }
-                std::memcpy(GetPointerForRasterizerCache(current_vaddr), src_buffer, copy_amount);
+                u8* const dest_ptr = GetPointerForRasterizerCache(current_vaddr);
+                std::memcpy(dest_ptr, src_buffer, copy_amount);
+                Common::WriteEpochs::MarkHost(dest_ptr, copy_amount);
                 break;
             }
             default:
@@ -499,7 +505,10 @@ MemorySystem::Impl::Impl(Core::System& system_)
     : system{system_}, fcram_mem(std::make_shared<BackingMemImpl<Region::FCRAM>>(*this)),
       vram_mem(std::make_shared<BackingMemImpl<Region::VRAM>>(*this)),
       n3ds_extra_ram_mem(std::make_shared<BackingMemImpl<Region::N3DS>>(*this)),
-      dsp_mem(std::make_shared<BackingMemImpl<Region::DSP>>(*this)) {}
+      dsp_mem(std::make_shared<BackingMemImpl<Region::DSP>>(*this)) {
+    // Ver Common::WriteEpochs (0.4.0.8): sus paginas son las de esta FCRAM.
+    Common::WriteEpochs::SetRange(fcram.get(), fcram_size);
+}
 
 MemorySystem::MemorySystem(Core::System& system) : impl(std::make_unique<Impl>(system)) {}
 MemorySystem::~MemorySystem() = default;
@@ -1319,6 +1328,7 @@ void MemorySystem::ZeroBlock(const Kernel::Process& process, const VAddr dest_ad
 
             u8* dest_ptr = page_table.pointers[page_index] + page_offset;
             std::memset(dest_ptr, 0, copy_amount);
+            Common::WriteEpochs::MarkHost(dest_ptr, copy_amount);
             break;
         }
         case PageType::MemoryWatchpoint: {
@@ -1328,13 +1338,16 @@ void MemorySystem::ZeroBlock(const Kernel::Process& process, const VAddr dest_ad
 
             u8* dest_ptr = it->second.memory.GetPtr() + page_offset;
             std::memset(dest_ptr, 0, copy_amount);
+            Common::WriteEpochs::MarkHost(dest_ptr, copy_amount);
             break;
         }
         case PageType::RasterizerCachedMemory:
         case PageType::RasterizerCachedMemoryWatchpoint: {
             RasterizerFlushVirtualRegion(current_vaddr, static_cast<u32>(copy_amount),
                                          FlushMode::Invalidate);
-            std::memset(GetPointerForRasterizerCache(current_vaddr), 0, copy_amount);
+            u8* const dest_ptr = GetPointerForRasterizerCache(current_vaddr);
+            std::memset(dest_ptr, 0, copy_amount);
+            Common::WriteEpochs::MarkHost(dest_ptr, copy_amount);
             break;
         }
         default:
@@ -1406,6 +1419,58 @@ void MemorySystem::CopyBlock(const Kernel::Process& dest_process,
         dest_addr += static_cast<VAddr>(copy_amount);
         src_addr += static_cast<VAddr>(copy_amount);
         remaining_size -= copy_amount;
+    }
+}
+
+void MemorySystem::MarkWritten(const Kernel::Process& process, VAddr addr, u32 size,
+                               u32 source) {
+    if (size == 0) {
+        return;
+    }
+    // Un tramo enorme (vaciar "todo"): mas barato darlo todo por cambiado.
+    if (size > 32u * 1024u * 1024u) {
+        Common::WriteEpochs::MarkAll();
+        return;
+    }
+    auto& page_table = *process.vm_manager.page_table;
+    std::size_t remaining = size;
+    std::size_t page_index = addr >> CITRA_PAGE_BITS;
+    std::size_t page_offset = addr & CITRA_PAGE_MASK;
+    while (remaining > 0 && page_index < page_table.attributes.size()) {
+        const std::size_t amount = std::min(CITRA_PAGE_SIZE - page_offset, remaining);
+        const VAddr current = static_cast<VAddr>((page_index << CITRA_PAGE_BITS) + page_offset);
+        switch (page_table.attributes[page_index]) {
+        case PageType::Memory:
+            if (page_table.pointers[page_index] != nullptr) {
+                Common::WriteEpochs::MarkHost(page_table.pointers[page_index] + page_offset,
+                                              amount, source);
+            }
+            break;
+        case PageType::RasterizerCachedMemory:
+        case PageType::RasterizerCachedMemoryWatchpoint: {
+            u8* const pointer = impl->GetPointerForRasterizerCache(current);
+            Common::WriteEpochs::MarkHost(pointer, amount, source);
+            break;
+        }
+        case PageType::MemoryWatchpoint:
+            // No se sabe donde cae: todo cambiado.
+            Common::WriteEpochs::MarkAll();
+            return;
+        default:
+            break;
+        }
+        page_index++;
+        page_offset = 0;
+        remaining -= amount;
+    }
+}
+
+void MemorySystem::MarkWrittenPhysical(PAddr addr, u32 size, u32 source) {
+    if (size == 0) {
+        return;
+    }
+    if (const u8* const pointer = GetPhysicalPointer(addr)) {
+        Common::WriteEpochs::MarkHost(pointer, size, source);
     }
 }
 

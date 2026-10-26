@@ -325,6 +325,13 @@ void GSP_GPU::FlushDataCache(Kernel::HLERequestContext& ctx) {
     [[maybe_unused]] u32 address = rp.Pop<u32>();
     [[maybe_unused]] u32 size = rp.Pop<u32>();
     [[maybe_unused]] auto process = rp.PopObject<Kernel::Process>();
+    // Lo que la GPU va a leer de aqui puede haber cambiado (0.4.0.8, ver
+    // Common::WriteEpochs). Sin proceso, todo.
+    if (process != nullptr) {
+        system.Memory().MarkWritten(*process, address, size, 1);
+    } else {
+        system.Memory().MarkWritten(*system.Kernel().GetCurrentProcess(), address, size, 1);
+    }
 
     // TODO(purpasmart96): Verify return header on HW
 
@@ -1009,6 +1016,9 @@ void GSP_GPU::StoreDataCache(Kernel::HLERequestContext& ctx) {
     [[maybe_unused]] u32 address = rp.Pop<u32>();
     [[maybe_unused]] u32 size = rp.Pop<u32>();
     auto process = rp.PopObject<Kernel::Process>();
+    // Ver FlushDataCache (0.4.0.8).
+    system.Memory().MarkWritten(
+        process != nullptr ? *process : *system.Kernel().GetCurrentProcess(), address, size, 2);
 
     IPC::RequestBuilder rb = rp.MakeBuilder(1, 0);
     rb.Push(ResultSuccess);

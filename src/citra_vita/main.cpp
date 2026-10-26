@@ -57,6 +57,12 @@
 #include "core/hle/service/service.h"
 #include "core/loader/loader.h"
 #include "video_core/gpu.h"
+#include "common/write_epochs.h"
+
+namespace Service::Y2R {
+/// Ver Y2rWorker en core/hle/service/cam/y2r_u.cpp (0.4.0.5).
+extern std::atomic<bool> g_y2r_async;
+} // namespace Service::Y2R
 #include "video_core/pica/pica_core.h"
 #include "video_core/renderer_gxm/gxm_cg.h"
 #include "audio_core/hle/hle.h"
@@ -427,7 +433,16 @@ struct UserSettings {
     /// 0.3.1.8: cada cuantas presentaciones se vuelcan las superficies que
     /// nadie ha leido (Gxm::RasterizerGXM::present_writeback_every). 1 = como
     /// hasta 0.3.1.7. Solo ajustes.txt.
-    int present_writeback_every = 4;
+    ///
+    /// DE 4 A 15 (0.4.0.6), con clave nueva ("volcado_cada2=") para que no la
+    /// pise el 4 que ya esta guardado. Cada uno de esos volcados espera a que
+    /// la GPU acabe el fotograma que se acaba de cerrar (hasta 18 ms de chip en
+    /// Super Mario 3D Land) y copia 384 KB de CDRAM sin cache: "volcado" 2 ms
+    /// por fotograma de media en 0.4.0.1, por una superficie que no lee nadie.
+    /// Lo que la lea por la GPU (textura, copia, transferencia) la sigue
+    /// volcando en ese momento; solo una lectura directa de la CPU la veria
+    /// hasta un cuarto de segundo atrasada.
+    int present_writeback_every = 15;
     /// 0.3.1.8: copias de textura de una superficie entera en la GPU
     /// (Gxm::RasterizerGXM::texture_copy_gpu). Apagado desde 0.3.1.9: en
     /// Pokemon Sol costaba 8-10 ms de espera a la GPU por fotograma. Solo
@@ -455,6 +470,21 @@ struct UserSettings {
     /// 0.4.0.0: uniformes con memcpy (Gxm::RasterizerGXM::direct_uniforms).
     /// Solo ajustes.txt.
     bool direct_uniforms = true;
+    /// 0.4.0.4: cache de subidas de vertices
+    /// (Gxm::RasterizerGXM::vertex_upload_cache). Solo ajustes.txt.
+    bool vertex_upload_cache = true;
+    /// 0.4.0.5: Y2R en otro nucleo (Service::Y2R::g_y2r_async). Solo ajustes.txt.
+    /// Apagado desde 0.4.0.9: el video de Kirby iba peor (ver y2r_u.cpp).
+    bool y2r_async = false;
+    /// 0.4.0.6: la espera de presentar por marcas
+    /// (Gxm::RasterizerGXM::present_marks_on). Solo ajustes.txt.
+    bool present_marks = true;
+    /// 0.4.0.6: solo los uniformes que lee el programa de vertices
+    /// (Gxm::RasterizerGXM::exact_vs_uniforms). Solo ajustes.txt.
+    bool exact_vs_uniforms = true;
+    /// 0.4.0.8: los vertices de la cache de subidas sin comparar si ninguna
+    /// de sus paginas ha avisado (Common::WriteEpochs). Solo ajustes.txt.
+    bool vertex_epochs = true;
     bool jit_nativo = false;
     /// 0.3.9.8: el motor nativo tambien en el nucleo 1 (ver
     /// Core::Native::both_cores). Experimental, solo ajustes.txt.
@@ -593,6 +623,14 @@ void ApplyUserSettings() {
                                              std::memory_order_relaxed);
     Gxm::RasterizerGXM::direct_uniforms.store(g_user.direct_uniforms ? 1u : 0u,
                                               std::memory_order_relaxed);
+    Gxm::RasterizerGXM::vertex_upload_cache.store(g_user.vertex_upload_cache ? 1u : 0u,
+                                                  std::memory_order_relaxed);
+    Service::Y2R::g_y2r_async.store(g_user.y2r_async, std::memory_order_relaxed);
+    Gxm::RasterizerGXM::present_marks_on.store(g_user.present_marks ? 1u : 0u,
+                                               std::memory_order_relaxed);
+    Gxm::RasterizerGXM::exact_vs_uniforms.store(g_user.exact_vs_uniforms ? 1u : 0u,
+                                                std::memory_order_relaxed);
+    Common::WriteEpochs::enabled.store(g_user.vertex_epochs, std::memory_order_relaxed);
     Core::Native::enabled = g_user.jit_nativo;
     Core::Native::both_cores = g_user.native_both_cores;
     if (g_user.jit_nativo) {
@@ -673,7 +711,7 @@ void LoadUserSettings() {
     read_bool("vertices_ram=", g_user.vertex_ring_host);
     read_bool("dsp_hilo=", g_user.dsp_thread);
     read_bool("jit_perfil=", g_user.jit_profile);
-    if (read_int("volcado_cada=", value)) {
+    if (read_int("volcado_cada2=", value)) {
         g_user.present_writeback_every = std::clamp(value, 1, 60);
     }
     read_bool("copia_textura_gpu=", g_user.texture_copy_gpu);
@@ -685,6 +723,11 @@ void LoadUserSettings() {
     read_bool("vs_cache_disp=", g_user.vs_layout_cache);
     read_bool("cache_pipeline=", g_user.cache_pipeline);
     read_bool("uniformes_directos=", g_user.direct_uniforms);
+    read_bool("cache_subidas=", g_user.vertex_upload_cache);
+    read_bool("y2r_hilo=", g_user.y2r_async);
+    read_bool("valla_exacta=", g_user.present_marks);
+    read_bool("uniformes_justos=", g_user.exact_vs_uniforms);
+    read_bool("vertices_por_vaciados=", g_user.vertex_epochs);
     read_bool("jit_nativo=", g_user.jit_nativo);
     read_bool("nativo_dos_nucleos=", g_user.native_both_cores);
     if (read_int("vs_tope_kb=", value)) {
@@ -706,10 +749,10 @@ int FormatUserSettings(char* buffer, std::size_t size) {
         "omitir_repetidas=%d\nvs_especializar2=%d\ncopia_gpu=%d\ngpu_hilo=%d\nsin_limite=%d\n"
         "resolucion_gpu2=%d\nshaders_asinc=%d\njit_thumb=%d\njit_parche=%d\n"
         "jit_superbloques=%d\njit_regs_fijos=%d\njit_vfp_fijos=%d\nvertices_ram=%d\n"
-        "dsp_hilo=%d\njit_perfil=%d\nvolcado_cada=%d\ncopia_textura_gpu=%d\n"
+        "dsp_hilo=%d\njit_perfil=%d\nvolcado_cada2=%d\ncopia_textura_gpu=%d\n"
         "jit_tabla_enlaces=%d\njit_saltos_cro=%d\njit_reusar_base=%d\nidioma_menu=%d\n"
         "wbuffer_gpu=%d\nmemo_valor=%d\nestado_sombra=%d\nvs_tope_kb=%d\nvs_cache_disp=%d\ncache_pipeline=%d\njit_nativo=%d\n"
-        "nativo_dos_nucleos=%d\nuniformes_directos=%d\n",
+        "nativo_dos_nucleos=%d\nuniformes_directos=%d\ncache_subidas=%d\ny2r_hilo=%d\nvalla_exacta=%d\nuniformes_justos=%d\nvertices_por_vaciados=%d\n",
         g_user.volume_percent, g_user.language, g_user.half_resolution ? 1 : 0,
         g_user.jit_reg_cache ? 1 : 0, g_user.jit_vfp_data ? 1 : 0, g_user.gxm_no_finish ? 1 : 0,
         g_user.gxm_present_direct ? 1 : 0, g_user.jit_direct_link ? 1 : 0,
@@ -725,7 +768,10 @@ int FormatUserSettings(char* buffer, std::size_t size) {
         g_user.jit_veneers ? 1 : 0, g_user.jit_reuse_base ? 1 : 0, g_user.menu_language,
         g_user.wbuffer_gpu ? 1 : 0, g_user.memo_by_value ? 1 : 0, g_user.state_shadow ? 1 : 0,
         g_user.vs_limit_kb, g_user.vs_layout_cache ? 1 : 0, g_user.cache_pipeline ? 1 : 0, g_user.jit_nativo ? 1 : 0,
-        g_user.native_both_cores ? 1 : 0, g_user.direct_uniforms ? 1 : 0);
+        g_user.native_both_cores ? 1 : 0, g_user.direct_uniforms ? 1 : 0,
+        g_user.vertex_upload_cache ? 1 : 0, g_user.y2r_async ? 1 : 0,
+        g_user.present_marks ? 1 : 0, g_user.exact_vs_uniforms ? 1 : 0,
+        g_user.vertex_epochs ? 1 : 0);
 }
 
 /// Los ajustes con los que se juega, a crash.txt en una linea (0.1.8.7): sin
@@ -2322,6 +2368,7 @@ void Run(vita2d_pgf* font) {
     menu.SetGames(roms);
     // Ver Gxm::RunCgBenchIfAny (0.4.0.0): solo con banco_cg/hacer.txt.
     Gxm::RunCgBenchIfAny();
+    Gxm::RunMemBenchIfAny();
     RunPilotIfAny(font, roms);
     // Las caratulas que falten, en otro hilo (0.3.4.1). Ver vita_covers.h.
     std::vector<std::string> rom_paths;

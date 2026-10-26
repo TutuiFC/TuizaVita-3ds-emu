@@ -36,6 +36,9 @@ bool EnsureCgReady();
  */
 void RunCgBenchIfAny();
 
+/// El banco de memoria (0.4.0.9, gxm_banco_memoria.cpp): solo con banco_mem/hacer.txt.
+void RunMemBenchIfAny();
+
 /// Estado corto para el overlay y crash.txt.
 const char* CgStatus();
 
@@ -181,5 +184,14 @@ CgActivity GetCgActivity();
  * motivos "fs atascado" y "vs atascado" en rasterizer_gxm.cpp.
  */
 bool CgWorkerOnHeavyJob();
+
+/**
+ * EL COMPILADOR AVANZA (0.4.0.3): ha terminado un shader en los ultimos 15 s, o
+ * lleva menos de 60 con el que tiene entre manos. Mientras sea asi, un lote
+ * cuyo shader espera mucho NO se da por atascado (todos sus lotes a la CPU):
+ * sigue el reparto de "compilando largo" (unos pocos por la CPU, el resto se
+ * salta un momento).
+ */
+bool CgWorkerProgressing();
 
 } // namespace Gxm

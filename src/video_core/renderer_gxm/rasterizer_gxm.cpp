@@ -14,6 +14,7 @@
 #include <unordered_set>
 #include <utility>
 #include <fmt/format.h>
+#include <nihstro/shader_bytecode.h>
 #include <psp2/io/fcntl.h>
 #include <psp2/io/stat.h>
 #include <psp2/kernel/modulemgr.h>
@@ -22,6 +23,7 @@
 #include <vita2d.h>
 #include "common/logging/log.h"
 #include "common/vita_diag.h"
+#include "common/write_epochs.h"
 #include "core/memory.h"
 #include "video_core/pica/pica_core.h"
 #include "video_core/pica/regs_external.h"
@@ -69,13 +71,16 @@ std::atomic<u32> RasterizerGXM::vertex_ring_host{1};
 std::array<std::atomic<u32>, 5> RasterizerGXM::texture_marks{};
 std::atomic<u32> RasterizerGXM::async_vs{1};
 std::atomic<u32> RasterizerGXM::transfer_on_gpu{1};
-std::atomic<u32> RasterizerGXM::present_writeback_every{4};
+std::atomic<u32> RasterizerGXM::present_writeback_every{15};
+std::atomic<u32> RasterizerGXM::present_marks_on{1};
+std::atomic<u32> RasterizerGXM::exact_vs_uniforms{1};
 std::atomic<u32> RasterizerGXM::texture_copy_gpu{0};
 std::atomic<u32> RasterizerGXM::wbuffer_on_gpu{1};
 std::atomic<u32> RasterizerGXM::memo_by_value{1};
 std::atomic<u32> RasterizerGXM::vs_layout_cache{1};
 std::atomic<u32> RasterizerGXM::cache_pipeline{1};
 std::atomic<u32> RasterizerGXM::direct_uniforms{1};
+std::atomic<u32> RasterizerGXM::vertex_upload_cache{1};
 std::atomic<u32> RasterizerGXM::vs_compile_limit_kb{23};
 std::atomic<u32> RasterizerGXM::state_shadow_enabled{1};
 std::atomic<u32> RasterizerGXM::resolution_scale{2};
@@ -145,6 +150,43 @@ unsigned long long g_draw_vs_uniforms_us = 0;
 unsigned long long g_draw_blackbox_us = 0;
 unsigned long long g_draw_call_us = 0;
 u32 g_draw_parts_samples = 0;
+/**
+ * LA COLA DE LA GPU AL PRESENTAR (0.4.0.5, diagnostico). En Mario 3D Land el
+ * hilo de la GPU espera 9-14 ms por fotograma a la valla de hace tres
+ * presentaciones con el chip ocupado solo el 52 %: o la GPU va de verdad tres
+ * fotogramas por detras a rafagas, o algo la para (la pantalla). Cuando hay
+ * que esperar: cuantas escenas quedaban por acabar y cuanto hacia que se
+ * envio la esperada.
+ */
+unsigned long long g_present_waits = 0;
+unsigned long long g_present_pending_sum = 0;
+unsigned long long g_present_pending_max = 0;
+unsigned long long g_present_age_sum_us = 0;
+unsigned long long g_present_wait_sum_us = 0;
+/// Esperas de presentar que tuvieron que vaciar la GPU entera (sceGxmFinish).
+unsigned long long g_present_drains = 0;
+/// Aciertos de la cache de subidas sin comparar (0.4.0.8, ver CachedVertexUpload).
+unsigned long long g_vcache_trusted = 0;
+/**
+ * Por que se copia un flujo en vez de servirlo de la zona (0.4.1.0): la fuente
+ * del aviso que ensucio su pagina (indices de Common::WriteEpochs::Source; el
+ * de kSources es "todo" o fuera de la FCRAM), la comprobacion periodica, o que
+ * no estaba (nuevo, o su zona ya se reciclo).
+ */
+constexpr u32 kVcacheWhyRecheck = Common::WriteEpochs::kSources + 1;
+constexpr u32 kVcacheWhyNew = Common::WriteEpochs::kSources + 2;
+std::array<unsigned long long, Common::WriteEpochs::kSources + 3> g_vcache_why{};
+/// Fallos de la cache por huella de fragmentos (0.4.0.8): cuantos, cuantos eran
+/// de una configuracion ya conocida y cuantos pisaban otra huella en su hueco.
+unsigned long long g_fp_misses = 0;
+unsigned long long g_fp_miss_known = 0;
+unsigned long long g_fp_miss_collisions = 0;
+u32 g_epoch_marks_seen = 0;
+/// Vec4 de vs_f copiados por lote (0.4.0.6, ver UsedFloatUniforms).
+unsigned long long g_vs_uniform_floats = 0;
+unsigned long long g_vs_uniform_writes = 0;
+unsigned long long g_vs_uniforms_same = 0;
+unsigned long long g_present_drain_us = 0;
 unsigned long long g_pre_check_us = 0;
 unsigned long long g_pre_surface_us = 0;
 unsigned long long g_pre_endscene_us = 0;
@@ -190,7 +232,20 @@ unsigned long long g_upload_repeats = 0;
 unsigned long long g_upload_bytes = 0;
 unsigned long long g_upload_repeat_bytes = 0;
 unsigned long long g_upload_hash_us = 0;
+/// Ver CachedVertexUpload (0.4.0.4).
+unsigned long long g_vcache_hits = 0;
+unsigned long long g_vcache_misses = 0;
+unsigned long long g_vcache_hit_bytes = 0;
+unsigned long long g_vcache_switches = 0;
+unsigned long long g_vcache_busy = 0;
+
+/**
+ * Iguales byte a byte, con NEON: cuatro cargas de 16 por lado, XOR y OR
+ * acumulado, y solo cada KB se mira el acumulado (pasar un registro de NEON a
+ * uno normal para el salto para la tuberia unos 20 ciclos en el Cortex-A9).
+ */
 unsigned long long g_upload_hash_samples = 0;
+
 
 unsigned long long g_vs_indices_us = 0;
 unsigned long long g_vs_cache_us = 0;
@@ -1433,6 +1488,57 @@ inline void PutUniform(void* buffer, const SceGxmProgramParameter* param, Unifor
     }
     sceGxmSetUniformDataF(buffer, param, 0, count, data);
 }
+
+/**
+ * CUANTOS UNIFORMES DE COMA FLOTANTE LEE EL PROGRAMA (0.4.0.6). Cada lote
+ * copiaba los 96 vec4 de la PICA (1,5 KB) al buffer de uniformes del contexto,
+ * que es memoria sin cache: ~6 us por lote en Super Mario 3D Land, y casi
+ * todos los programas leen solo los primeros. Se mira el codigo del shader
+ * una vez por programa: el indice mas alto que se lee de forma fija, o los 96
+ * si alguno se lee con registro de direccion (la traduccion lo acota a 0-95,
+ * ver get_offset_register). Todo el codigo subido y no solo el del programa,
+ * como UsedBoolUniforms: leer de mas solo cuesta copiar de mas. Las
+ * instrucciones de un solo operando tambien cuentan su segundo campo, que es
+ * basura; tambien es leer de mas.
+ */
+u32 UsedFloatUniforms(const Pica::ShaderSetup& setup) {
+    using nihstro::Instruction;
+    using nihstro::OpCode;
+    using nihstro::RegisterType;
+    using nihstro::SourceRegister;
+    const auto& code = setup.GetProgramCode();
+    const u32 size = std::min<u32>(setup.GetBiggestProgramSize(), Pica::MAX_PROGRAM_CODE_LENGTH);
+    u32 count = 0;
+    const auto note = [&count](const SourceRegister& reg, bool relative) {
+        if (reg.GetRegisterType() != RegisterType::FloatUniform) {
+            return;
+        }
+        count = relative ? 96u : std::max<u32>(count, static_cast<u32>(reg.GetIndex()) + 1);
+    };
+    for (u32 i = 0; i < size && count < 96; i++) {
+        const Instruction instr = {code[i]};
+        const auto info = instr.opcode.Value().GetInfo();
+        const bool inverted = (info.subtype & OpCode::Info::SrcInversed) != 0;
+        switch (info.type) {
+        case OpCode::Type::Arithmetic: {
+            const bool relative = instr.common.address_register_index != 0;
+            note(instr.common.GetSrc1(inverted), !inverted && relative);
+            note(instr.common.GetSrc2(inverted), inverted && relative);
+            break;
+        }
+        case OpCode::Type::MultiplyAdd: {
+            const bool relative = instr.mad.address_register_index != 0;
+            note(instr.mad.GetSrc1(inverted), false);
+            note(instr.mad.GetSrc2(inverted), !inverted && relative);
+            note(instr.mad.GetSrc3(inverted), inverted && relative);
+            break;
+        }
+        default:
+            break;
+        }
+    }
+    return std::min<u32>(count, 96);
+}
 } // Anonymous namespace
 
 /**
@@ -1521,6 +1627,9 @@ struct RasterizerGXM::PipelineCache {
         const SceGxmProgramParameter* light_spot_direction = nullptr;
         const SceGxmProgramParameter* light_dist_atten = nullptr;
         const SceGxmProgramParameter* lighting_global_ambient = nullptr;
+        /// Las luces que lee el shader: el numero mas alto + 1 (0.4.0.6, ver
+        /// la escritura de las luces en SetupDrawState).
+        u8 light_count = 8;
         /// Ver PutUniform (0.4.0.0).
         UniformSlot const_color_slot, combiner_buffer_color_slot, alphatest_ref_slot,
             blend_const_alpha_slot, blend_const_color_slot, fog_lut_slot, fog_color_slot,
@@ -1907,14 +2016,25 @@ struct RasterizerGXM::PipelineCache {
                     pending.job->started_us.load(std::memory_order_relaxed);
                 if (started == 0 && CgWorkerOnHeavyJob()) {
                     // Detras de uno grande: un rato sin el, y luego por software (0.3.9.7).
+                    // Si el grande avanza, "largo" y no atascado (0.4.0.3).
                     return fail(now - pending.job->submitted_us < kAsyncFsBehindHeavyUs
                                     ? "fs compilando"
-                                    : "fs atascado");
+                                : CgWorkerProgressing() ? "fs compilando largo"
+                                                        : "fs atascado");
                 }
                 if ((started != 0 && now - started > kAsyncFsStuckUs) ||
                     (started == 0 && now - pending.job->submitted_us > kAsyncFsQueuedUs)) {
                     CgMarkStarved();
-                    return fail(now - pending.job->submitted_us > kAsyncFsSkipLimitUs
+                    /**
+                     * ATASCADO SOLO SI EL COMPILADOR NO AVANZA (0.4.0.3). Con 118
+                     * shaders en cola (la demo de juego de Kirby Triple Deluxe,
+                     * 26-10) los ultimos esperaban mas de 60 s aunque salia uno
+                     * cada medio segundo: se daban por atascados, TODOS sus lotes
+                     * se rasterizaban por software (2-5 fps), y eso le quitaba la
+                     * CPU al propio compilador. Ver CgWorkerProgressing.
+                     */
+                    return fail(now - pending.job->submitted_us > kAsyncFsSkipLimitUs &&
+                                        !CgWorkerProgressing()
                                     ? "fs atascado"
                                     : "fs compilando largo");
                 }
@@ -2016,6 +2136,14 @@ struct RasterizerGXM::PipelineCache {
         }
 
         entry->lit = needs_lighting;
+        {
+            // Los numeros de luz que lee el shader (WriteLight los pone fijos).
+            u32 lights = 0;
+            for (u32 slot = 0; slot < config.lighting.src_num && slot < 8; slot++) {
+                lights = std::max<u32>(lights, config.lighting.lights[slot].num.Value() + 1u);
+            }
+            entry->light_count = static_cast<u8>(needs_lighting ? lights : 0u);
+        }
         entry->proj = needs_w;
         entry->blend = blend;
         /**
@@ -2389,6 +2517,8 @@ struct RasterizerGXM::HwShaderCache {
         /// Ver PutUniform (0.4.0.0).
         UniformSlot uniform_f_slot, uniform_i_slot, uniform_b_slot, uniform_default_slot,
             uniform_wbuf_slot;
+        /// Los vec4 de vs_f que lee su codigo (0.4.0.6, ver UsedFloatUniforms).
+        u32 used_f = 96;
         /// "vs_in<registro>", o null si el programa no lee ese registro de un
         /// flujo (lo elimina el compilador o sale de otro sitio).
         std::array<const SceGxmProgramParameter*, 16> inputs{};
@@ -2454,9 +2584,11 @@ struct RasterizerGXM::HwShaderCache {
                         CgWorkerOnHeavyJob();
                     const unsigned long long limit =
                         slow_but_moving ? kAsyncVsHeavyLimitUs : kAsyncVsSkipLimitUs;
-                    *out_reason = young           ? "vs compilando"
-                                  : age > limit   ? "vs atascado"
-                                                  : "vs compilando largo";
+                    // Ver CgWorkerProgressing (0.4.0.3): mientras el compilador
+                    // avance, "largo" y no atascado.
+                    *out_reason = young ? "vs compilando"
+                                  : (age > limit && !CgWorkerProgressing()) ? "vs atascado"
+                                                                            : "vs compilando largo";
                     if (!young) {
                         CgMarkStarved();
                     }
@@ -2488,6 +2620,7 @@ struct RasterizerGXM::HwShaderCache {
             return nullptr;
         }
         auto program = std::make_unique<Program>();
+        program->used_f = UsedFloatUniforms(setup);
         Build(*program, key, setup, config, inputs, write_lighting, write_w);
         const Program* result = program->usable ? program.get() : nullptr;
         if (program->job != nullptr) {
@@ -3337,7 +3470,21 @@ struct RasterizerGXM::BatchMemo {
      * estan compilandose se dejan pasar por Get, que es quien sabe mirar su
      * trabajo pendiente y reintentarlas.
      */
-    static constexpr std::size_t kFsCacheSize = 32;
+    /**
+     * 256 Y DE ACCESO DIRECTO (0.4.0.5; eran 32 recorridas una a una, con
+     * reemplazo en rueda). En Mario 3D Land solo ~22 % de los cambios de
+     * material salian de aqui ("pipeline reusado" 4.635 de 20.675 "fs
+     * rehecho"): el resto construia el FSConfig entero en Get. La huella es
+     * de 64 bits, asi que el hueco sale de sus bits altos y basta comparar la
+     * clave.
+     */
+    /**
+     * DOS VIAS (0.4.0.9): 256 conjuntos de dos. En Zafiro Alfa (0.4.0.8) TODOS
+     * los fallos de esta cache eran una configuracion ya conocida que habia
+     * echado otra huella de su hueco ("huella fs" en crash.txt). En cada
+     * conjunto, [0] la ultima usada y [1] la anterior.
+     */
+    static constexpr std::size_t kFsCacheSize = 512;
     u64 fs_fp = 0;
     std::array<u64, kFsCacheSize> fs_cache_key{};
     std::array<const void*, kFsCacheSize> fs_cache_entry{};
@@ -3603,6 +3750,12 @@ void RasterizerGXM::EndScene() {
             }
         }
         vertex_segments_pending = 0;
+        for (u32 arena = 0; arena < 2; arena++) {
+            if (((vcache_pending >> arena) & 1u) != 0) {
+                vcache_fence[arena] = fence_sent;
+            }
+        }
+        vcache_pending = 0;
         // Lo retirado sin escena abierta lo pudo leer, como mucho, la ultima
         // escena enviada.
         if (textures != nullptr && textures->HasRetired()) {
@@ -3656,6 +3809,7 @@ void RasterizerGXM::EndScene() {
     {
         const Common::ScopedVitaStage stage{"gxm cerrar escena"};
         fence_sent++;
+        fence_sent_us[fence_sent & 63u] = Common::VitaMicros();
         SceGxmNotification done{};
         done.address = fence_address;
         done.value = fence_sent;
@@ -3673,6 +3827,13 @@ void RasterizerGXM::EndScene() {
         }
     }
     vertex_segments_pending = 0;
+    // Y las zonas de la cache de subidas que ha leido (0.4.0.4).
+    for (u32 arena = 0; arena < 2; arena++) {
+        if (((vcache_pending >> arena) & 1u) != 0) {
+            vcache_fence[arena] = fence_sent;
+        }
+    }
+    vcache_pending = 0;
     // Las versiones de las tablas de luz que ha atado esta escena (0.3.9.6).
     for (u64 mask = lut_scene_mask; mask != 0; mask &= mask - 1) {
         lut_fence[static_cast<u32>(std::countr_zero(mask))] = fence_sent;
@@ -3903,6 +4064,15 @@ bool PresentTextureFormat(u32 color_format, SceGxmTextureFormat& out) {
     }
 }
 } // Anonymous namespace
+
+void RasterizerGXM::NotePresentSubmitted() {
+    if (s_instance == nullptr) {
+        return;
+    }
+    RasterizerGXM& self = *s_instance;
+    self.present_marks[self.presents_drawn & 3u] = self.fence_sent;
+    self.presents_drawn++;
+}
 
 void RasterizerGXM::WaitPreviousPresentation() {
     if (s_instance == nullptr) {
@@ -4708,6 +4878,7 @@ bool RasterizerGXM::BlitToCopy(ScreenCopy& copy, Surface& source, u32 first_row,
     sceGxmDraw(context, SCE_GXM_PRIMITIVE_TRIANGLE_STRIP, SCE_GXM_INDEX_FORMAT_U16,
                quad + 8 * kBlitVertexStride, 4);
     fence_sent++;
+    fence_sent_us[fence_sent & 63u] = Common::VitaMicros();
     SceGxmNotification done{};
     done.address = fence_address;
     done.value = fence_sent;
@@ -5566,17 +5737,23 @@ bool RasterizerGXM::UpdateLightingLut() {
         while (dirty != 0) {
             const u32 index = static_cast<u32>(std::countr_zero(dirty));
             dirty &= ~(1u << index);
+            /**
+             * LA HUELLA DE LO QUE ESCRIBIO EL JUEGO, Y CONVERTIR SOLO AL COPIAR
+             * (0.4.0.5). Se convertian las 256 entradas y se hacia la huella de
+             * los 2 KB ya convertidos en CADA cambio. Pero la conversion es una
+             * funcion fija de las entradas de la PICA: misma entrada, misma
+             * tabla. Asi que la huella sale de las entradas (1 KB, la mitad) y la
+             * conversion se hace en sync, y solo si alguna version tiene que
+             * copiar esa tabla. Cuando el juego vuelve a unas tablas que ya
+             * estan en alguna version (Mario 3D Land alterna materiales todo el
+             * rato), no se convierte nada.
+             */
             const auto& source = pica.lighting.luts[index];
-            f32* row =
-                lighting_lut_shadow.data() + static_cast<std::size_t>(index) * kLutEntries * 2;
-            for (u32 i = 0; i < kLutEntries; i++) {
-                row[i * 2] = source[i].ToFloat();
-                row[i * 2 + 1] = source[i].DiffToFloat();
-            }
             lighting_lut_gen[index] = ++lighting_lut_gen_counter;
             // Nunca 0: 0 es "no se sabe que tiene" en lighting_lut_version_hash.
             lighting_lut_hash[index] =
-                Common::ComputeHash64(row, kLutEntries * 2 * sizeof(f32)) | 1ull;
+                Common::ComputeHash64(source.data(), sizeof(source)) | 1ull;
+            lighting_lut_row_stale |= 1u << index;
         }
         pica.lighting.lut_dirty = 0;
     }
@@ -5588,6 +5765,17 @@ bool RasterizerGXM::UpdateLightingLut() {
         auto& held = lighting_lut_version_hash[version];
         for (u32 index = 0; index < kLutCount; index++) {
             if (held[index] != lighting_lut_hash[index]) {
+                if (((lighting_lut_row_stale >> index) & 1u) != 0) {
+                    // Ver arriba: se convierte al hacer falta copiarla.
+                    const auto& source = pica.lighting.luts[index];
+                    f32* row = lighting_lut_shadow.data() +
+                               static_cast<std::size_t>(index) * kLutEntries * 2;
+                    for (u32 i = 0; i < kLutEntries; i++) {
+                        row[i * 2] = source[i].ToFloat();
+                        row[i * 2 + 1] = source[i].DiffToFloat();
+                    }
+                    lighting_lut_row_stale &= ~(1u << index);
+                }
                 std::memcpy(base + index * kRowBytes,
                             reinterpret_cast<const u8*>(lighting_lut_shadow.data()) +
                                 index * kRowBytes,
@@ -5759,14 +5947,52 @@ void RasterizerGXM::FlushForPresent() {
      * fotograma esperando a la de hace dos, con escenas de 21 ms de chip; un
      * fotograma mas de margen deja solapar la CPU con la GPU.
      */
-    const u32 older = present_fences[2];
+    /**
+     * LA VALLA JUSTA, AUNQUE ESE FOTOGRAMA NO TUVIERA ESCENA (0.4.0.6).
+     *
+     * Se presenta en CADA vblank emulado, y un juego a 30 FPS (Super Mario 3D
+     * Land, Zafiro Alfa, casi todos los 3D) solo dibuja en uno de cada dos:
+     * la mitad de los fotogramas no tienen escena, su "primera valla" es 0,
+     * y tres presentaciones despues eso era sceGxmFinish -- esperar a que la
+     * GPU acabe TODO lo mandado, incluido el fotograma que se acaba de cerrar.
+     * En Mario 3D Land, 9-10 ms de cada fotograma del hilo de la GPU parado
+     * ("valla" de 0.4.0.1) con el chip ocupado solo la mitad del tiempo.
+     *
+     * Lo que de verdad hace falta es que haya acabado la presentacion que uso
+     * por ultima vez el hueco del presentador que viene (la de hace cuatro
+     * DIBUJADAS, ver kPresentSlots), y para eso vale la primera valla mandada
+     * despues de ella, sea del fotograma que sea: su marca + 1. Solo si no se
+     * ha mandado ninguna escena desde entonces se vacia la GPU, y entonces en
+     * la cola solo quedan presentaciones, que son dos cuadrados.
+     */
+    u32 older = present_fences[2];
+    bool wait_needed = presents_seen >= 3;
+    if (present_marks_on.load(std::memory_order_relaxed) != 0) {
+        wait_needed = presents_drawn >= 4;
+        if (wait_needed) {
+            const u32 mark = present_marks[presents_drawn & 3u];
+            older = static_cast<s32>(fence_sent - mark) > 0 ? mark + 1 : 0;
+        }
+    }
     const unsigned long long fence_begin = Common::VitaMicros();
-    if (presents_seen >= 3) {
-        if (older != 0) {
+    if (wait_needed) {
+        if (older != 0 && !FenceDone(older)) {
+            const unsigned long long now = Common::VitaMicros();
+            const u64 pending = static_cast<u32>(fence_sent - *fence_address);
+            g_present_waits++;
+            g_present_pending_sum += pending;
+            g_present_pending_max = std::max<u64>(g_present_pending_max, pending);
+            g_present_age_sum_us += now - fence_sent_us[older & 63u];
+            WaitFence(older, GpuWait::Frame);
+            g_present_wait_sum_us += Common::VitaMicros() - now;
+        } else if (older != 0) {
             WaitFence(older, GpuWait::Frame);
         } else if (context != nullptr) {
+            const unsigned long long now = Common::VitaMicros();
+            g_present_drains++;
             gpu_pending = true;
             WaitGpu(GpuWait::Frame);
+            g_present_drain_us += Common::VitaMicros() - now;
         }
     }
     const unsigned long long fence_end = Common::VitaMicros();
@@ -7127,10 +7353,21 @@ bool RasterizerGXM::SetupDrawState(Surface* surface, const Entry* pipeline,
                 put_color(lighting_regs.global_ambient, memo.global_ambient.data());
                 memo.lights_dirty = false;
             }
+            /**
+             * SOLO LAS LUCES QUE LEE EL SHADER (0.4.0.6). Las ocho de cada
+             * parametro eran 7 x 128 bytes por lote a memoria sin cache, y los
+             * juegos encienden una o dos: el shader las lee por su numero,
+             * fijo al traducirlo (WriteLight), asi que lo que hay detras del
+             * numero mas alto no lo mira nadie. Ver light_count.
+             */
+            const u32 light_floats =
+                exact_vs_uniforms.load(std::memory_order_relaxed) != 0
+                    ? static_cast<u32>(pipeline->light_count) * 4u
+                    : 32u;
             const auto put = [&](const SceGxmProgramParameter* param, UniformSlot slot,
                                  const std::array<f32, 32>& values) {
-                if (param != nullptr) {
-                    PutUniform(uniform_buffer, param, slot, 32, values.data());
+                if (param != nullptr && light_floats != 0) {
+                    PutUniform(uniform_buffer, param, slot, light_floats, values.data());
                 }
             };
             put(pipeline->light_specular_0, pipeline->light_specular_0_slot, memo.specular_0);
@@ -7430,6 +7667,108 @@ static bool HwVsReject(const char* why) {
     return false;
 }
 
+/**
+ * CACHE DE SUBIDAS DE VERTICES (0.4.0.4). Copiar los vertices de cada lote a
+ * la memoria de la GPU va a ~300 MB/s (memoria sin cache) y es la fase mas
+ * cara del lote en Mario 3D Land ("copiar" 23 us de 42). Pero casi todo es
+ * lo mismo que ya se subio: "subidas: repetidas" da el 79 % de los bytes en
+ * Mario 3D Land y el 99 % en Zafiro Alfa (geometria estatica redibujada).
+ *
+ * Cada flujo se busca por su direccion y tamano. Hasta 0.4.0.9 un acierto se
+ * COMPARABA con una copia en sombra, y eso resulto mas caro que copiar: desde
+ * 0.4.1.0 se reutiliza sin leer si las epocas de escritura lo permiten y si
+ * no se vuelve a copiar (ver dentro).
+ *
+ * Dos zonas de 2 MB: cuando la que esta en uso se llena se pasa a la otra,
+ * cuyo contenido se da por perdido (su generacion sube) y que solo se pisa
+ * despues de su valla. Si la escena abierta la esta leyendo, no se cambia: el
+ * flujo va por el anillo de siempre, sin cerrar la escena.
+ */
+const u8* RasterizerGXM::CachedVertexUpload(const u8* src, u32 bytes) {
+    /**
+     * COPIAR O FIARSE, NUNCA COMPARAR (0.4.1.0). El banco de memoria de 0.4.0.9
+     * midio en la consola, para 12 KB de memoria fria: copiarlos a la memoria
+     * de la GPU 33 us; compararlos con su copia en sombra 60 us (lee dos
+     * buffers frios); una huella NEON 44 us; solo leerlos, con pld, 26. O sea
+     * que la cache de 0.4.0.4, que comparaba en cada acierto, costaba casi el
+     * doble que no tenerla. Ahora un flujo cuyas paginas no han recibido ningun
+     * aviso de escritura desde que se copio (Common::WriteEpochs) se sirve de
+     * la zona sin leerlo; si no, se vuelve a copiar, a la zona en vez de al
+     * anillo, que cuesta lo mismo que la copia de siempre y deja la copia lista
+     * para la siguiente vez. Y una vez cada kVcacheRecheckPresents
+     * presentaciones se copia igual, por si algun juego no vaciara la cache.
+     */
+    if (vcache_failed || bytes < 256 || bytes > kVcacheArenaBytes / 8) {
+        return nullptr;
+    }
+    if (!vcache_entries) {
+        for (auto& arena : vcache_gpu) {
+            arena = Allocate(Pool::Host, kVcacheArenaBytes);
+            if (!arena.Valid()) {
+                vcache_failed = true;
+                vcache_gpu = {};
+                NoteFmt("gxm vertices", "cache de subidas: sin memoria de la GPU, apagada");
+                return nullptr;
+            }
+        }
+        vcache_entries.reset(new (std::nothrow) VertexCacheEntry[kVcacheEntries]());
+        if (!vcache_entries) {
+            vcache_failed = true;
+            vcache_gpu = {};
+            NoteFmt("gxm vertices", "cache de subidas: sin memoria, apagada");
+            return nullptr;
+        }
+        vcache_fence.fill(fence_sent);
+    }
+    const u32 slot = static_cast<u32>(((reinterpret_cast<uintptr_t>(src) >> 4) ^
+                                       (static_cast<uintptr_t>(bytes) * 0x9E3779B1u)) %
+                                      kVcacheEntries);
+    VertexCacheEntry& entry = vcache_entries[slot];
+    // La epoca de antes de copiar nada (ver Common::WriteEpochs::Now).
+    const u32 epoch_now = Common::WriteEpochs::Now();
+    if (entry.src == src && entry.bytes == bytes && entry.gen == vcache_gen[entry.arena]) {
+        u32 culprit = Common::WriteEpochs::kSources;
+        if (presents_seen - entry.verified_present >= kVcacheRecheckPresents) {
+            g_vcache_why[kVcacheWhyRecheck]++;
+        } else if (Common::WriteEpochs::CleanSince(src, bytes, entry.verified, &culprit)) {
+            vcache_pending |= 1u << entry.arena;
+            g_vcache_hits++;
+            g_vcache_trusted++;
+            g_vcache_hit_bytes += bytes;
+            return static_cast<const u8*>(vcache_gpu[entry.arena].Data()) + entry.offset;
+        } else {
+            g_vcache_why[std::min<u32>(culprit, Common::WriteEpochs::kSources)]++;
+        }
+    } else {
+        g_vcache_why[kVcacheWhyNew]++;
+    }
+    u32 arena = vcache_current;
+    u32 offset = (vcache_used[arena] + 15u) & ~15u;
+    if (offset + bytes > kVcacheArenaBytes) {
+        const u32 other = arena ^ 1u;
+        if (((vcache_pending >> other) & 1u) != 0) {
+            // La escena abierta lee la otra: este flujo, por el anillo.
+            g_vcache_busy++;
+            return nullptr;
+        }
+        WaitFence(vcache_fence[other], GpuWait::VertexRing);
+        vcache_gen[other]++;
+        vcache_used[other] = 0;
+        vcache_current = other;
+        arena = other;
+        offset = 0;
+        g_vcache_switches++;
+    }
+    u8* const gpu = static_cast<u8*>(vcache_gpu[arena].Data()) + offset;
+    std::memcpy(gpu, src, bytes);
+    vcache_used[arena] = offset + bytes;
+    vcache_pending |= 1u << arena;
+    entry = VertexCacheEntry{src, bytes, offset, vcache_gen[arena], arena, epoch_now,
+                             presents_seen};
+    g_vcache_misses++;
+    return gpu;
+}
+
 u8* RasterizerGXM::ReserveVertexSpace(u32 bytes) {
     /**
      * EL ANILLO EN TRAMOS (0.2.1.1). Al llegar al final del anillo se cerraba
@@ -7547,14 +7886,21 @@ bool RasterizerGXM::AccelerateDrawBatch(bool is_indexed) {
      * el total del lote tambien sale de esos, por ocho: leer el reloj es una
      * llamada al kernel, y eran dos por lote.
      */
+    /**
+     * UNO DE CADA 16 (0.4.0.6, antes 8). Un lote cronometrado lee el reloj unas
+     * 25 veces (fases, datos, estado, copias, dibujo) y cada lectura es una
+     * llamada al kernel de ~0,75 us: ~19 us de mas en ese lote, 2,3 us de media
+     * por lote con uno de cada 8, que en el hilo de la GPU es el 3 % de todo.
+     * Con 16 quedan cientos de muestras por ventana igual.
+     */
     static u32 profile_tick = 0;
-    const bool profile = (++profile_tick & 7u) == 0;
+    const bool profile = (++profile_tick & 15u) == 0;
     struct BatchTimer {
         bool timed;
         unsigned long long begin = timed ? Common::VitaMicros() : 0;
         ~BatchTimer() {
             if (timed) {
-                Common::FrameStats::batch_us.fetch_add((Common::VitaMicros() - begin) * 8,
+                Common::FrameStats::batch_us.fetch_add((Common::VitaMicros() - begin) * 16,
                                                        std::memory_order_relaxed);
             }
         }
@@ -7636,6 +7982,9 @@ bool RasterizerGXM::AccelerateDrawBatch(bool is_indexed) {
         const bool by_value = memo_by_value.load(std::memory_order_relaxed) != 0;
         std::array<u64, 12> changed = dirty;
         const auto& values = regs.reg_array;
+        // Las escrituras iguales se cuentan aqui y se suman una vez (0.4.0.7): un
+        // atomico por escritura eran ~30 por lote en Super Mario 3D Land.
+        u32 same_writes = 0;
         for (u32 i = 0; i < dirty.size(); i++) {
             u64 bits = dirty[i] & (kFsMemoMask[i] | kVsMemoMask[i] | kVsBoolMask[i]);
             while (bits != 0) {
@@ -7659,9 +8008,12 @@ bool RasterizerGXM::AccelerateDrawBatch(bool is_indexed) {
                     memo.shadow[reg] = values[reg];
                 } else if (by_value) {
                     changed[i] &= ~(1ull << bit);
-                    memo_same_writes.fetch_add(1, std::memory_order_relaxed);
+                    same_writes++;
                 }
             }
+        }
+        if (same_writes != 0) {
+            memo_same_writes.fetch_add(same_writes, std::memory_order_relaxed);
         }
         bool fs_dirty = false;
         bool vs_dirty = false;
@@ -7750,23 +8102,47 @@ bool RasterizerGXM::AccelerateDrawBatch(bool is_indexed) {
     if (pipeline == nullptr && cache_pipeline.load(std::memory_order_relaxed) != 0) {
         fs_key_fp = memo.fs_fp;
         fs_key_ok = true;
-        for (std::size_t i = 0; i < BatchMemo::kFsCacheSize; i++) {
-            if (memo.fs_cache_key[i] != fs_key_fp || memo.fs_cache_entry[i] == nullptr) {
+        const std::size_t set =
+            static_cast<std::size_t>((fs_key_fp * 0x9E3779B97F4A7C15ull) >> 56) * 2;
+        for (std::size_t way = 0; way < 2; way++) {
+            if (memo.fs_cache_key[set + way] != fs_key_fp ||
+                memo.fs_cache_entry[set + way] == nullptr) {
                 continue;
             }
-            pipeline = static_cast<const PipelineCache::Entry*>(memo.fs_cache_entry[i]);
+            pipeline = static_cast<const PipelineCache::Entry*>(memo.fs_cache_entry[set + way]);
+            if (way == 1) {
+                // La mas reciente, delante.
+                std::swap(memo.fs_cache_key[set], memo.fs_cache_key[set + 1]);
+                std::swap(memo.fs_cache_entry[set], memo.fs_cache_entry[set + 1]);
+            }
             memo.pipeline = pipeline;
             g_pipeline_hits.fetch_add(1, std::memory_order_relaxed);
             break;
         }
     }
     if (pipeline == nullptr) {
+        // Diagnostico de la cache por huella (0.4.0.8): por que falla.
+        const std::size_t known_before = pipelines->entries.size();
+        if (fs_key_ok) {
+            const std::size_t set =
+                static_cast<std::size_t>((fs_key_fp * 0x9E3779B97F4A7C15ull) >> 56) * 2;
+            g_fp_misses++;
+            if (memo.fs_cache_key[set + 1] != 0 && memo.fs_cache_key[set + 1] != fs_key_fp) {
+                g_fp_miss_collisions++;
+            }
+        }
         pipeline = pipelines->Get(regs, &fs_reason);
+        if (fs_key_ok && pipeline != nullptr && pipelines->entries.size() == known_before) {
+            g_fp_miss_known++;
+        }
         if (pipeline != nullptr && fs_key_ok && pipeline->usable && pipeline->job == nullptr) {
-            const u32 at = memo.fs_cache_next;
-            memo.fs_cache_next = (at + 1) % BatchMemo::kFsCacheSize;
-            memo.fs_cache_key[at] = fs_key_fp;
-            memo.fs_cache_entry[at] = pipeline;
+            const std::size_t set =
+                static_cast<std::size_t>((fs_key_fp * 0x9E3779B97F4A7C15ull) >> 56) * 2;
+            // La nueva delante; la de delante pasa a la segunda via.
+            memo.fs_cache_key[set + 1] = memo.fs_cache_key[set];
+            memo.fs_cache_entry[set + 1] = memo.fs_cache_entry[set];
+            memo.fs_cache_key[set] = fs_key_fp;
+            memo.fs_cache_entry[set] = pipeline;
         }
         // Su shader de fragmentos se esta compilando: el lote se salta (0.1.9.8).
         if (pipeline == nullptr && fs_reason != nullptr &&
@@ -8424,7 +8800,16 @@ bool RasterizerGXM::AccelerateDrawBatch(bool is_indexed) {
                 slot = key;
             }
         }
+        const bool use_cache = vertex_upload_cache.load(std::memory_order_relaxed) != 0;
         for (u32 stream = 0; stream < stream_count; stream++) {
+            // Ver CachedVertexUpload (0.4.0.4). El hueco del anillo ya
+            // reservado para este flujo se queda sin usar.
+            if (const u8* cached = use_cache ? CachedVertexUpload(stream_source[stream],
+                                                                  stream_bytes[stream])
+                                             : nullptr) {
+                stream_data[stream] = cached;
+                continue;
+            }
             std::memcpy(space, stream_source[stream], stream_bytes[stream]);
             stream_data[stream] = space;
             space += (stream_bytes[stream] + 15u) & ~15u;
@@ -8492,8 +8877,23 @@ bool RasterizerGXM::AccelerateDrawBatch(bool is_indexed) {
         const auto& uniforms = pica.vs_setup.uniforms;
         if (program->uniform_f != nullptr) {
             static_assert(sizeof(uniforms.f) == 96 * 4 * sizeof(float));
-            PutUniform(vertex_uniforms, program->uniform_f, program->uniform_f_slot, 96 * 4,
-                       reinterpret_cast<const float*>(uniforms.f.data()));
+            // Ver UsedFloatUniforms (0.4.0.6): el resto no lo lee el programa.
+            const u32 used = exact_vs_uniforms.load(std::memory_order_relaxed) != 0
+                                 ? program->used_f
+                                 : 96u;
+            g_vs_uniform_floats += used;
+            g_vs_uniform_writes++;
+            // Diagnostico (0.4.0.9): mismos uniformes y programa que el lote anterior.
+            static const void* last_uniform_program = nullptr;
+            if (program == last_uniform_program && !pica.vs_setup.uniforms_dirty) {
+                g_vs_uniforms_same++;
+            }
+            last_uniform_program = program;
+            pica.vs_setup.uniforms_dirty = false;
+            if (used != 0) {
+                PutUniform(vertex_uniforms, program->uniform_f, program->uniform_f_slot,
+                           used * 4, reinterpret_cast<const float*>(uniforms.f.data()));
+            }
         }
         if (program->uniform_i != nullptr) {
             float ints[16];
@@ -8750,6 +9150,56 @@ std::string RasterizerGXM::TakeBatchProfile() {
     }
     text += fmt::format("\nsubidas: repetidas {} de {} ({} KB de {} KB)", g_upload_repeats,
                         g_upload_streams, g_upload_repeat_bytes / 1024, g_upload_bytes / 1024);
+    text += fmt::format(" | cache: aciertos {} copias {} ({} KB sin copiar), cambios de zona {}, "
+                        "zona ocupada {} | sin leer {} (avisos de escritura {})",
+                        g_vcache_hits, g_vcache_misses, g_vcache_hit_bytes / 1024,
+                        g_vcache_switches, g_vcache_busy, g_vcache_trusted,
+                        Common::WriteEpochs::Marks() - g_epoch_marks_seen);
+    g_epoch_marks_seen = Common::WriteEpochs::Marks();
+    g_vcache_trusted = 0;
+    {
+        // De donde vienen los avisos (0.4.0.9): llamadas y KB por fuente.
+        u32 calls[Common::WriteEpochs::kSources];
+        u32 kib[Common::WriteEpochs::kSources];
+        Common::WriteEpochs::TakeSourceStats(calls, kib);
+        const auto& w = g_vcache_why;
+        text += fmt::format(" | copiado por: escrituras {} gsp vaciar {} gsp guardar {} gx {} "
+                            "svc {} rellenos {} copias {} todo {} cada 60 {} nuevo {}",
+                            w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7], w[8], w[9]);
+        g_vcache_why.fill(0);
+        text += fmt::format(" | avisos por fuente (llamadas/KB): escrituras {}/{} "
+                            "gsp vaciar {}/{} gsp guardar {}/{} gx {}/{} svc {}/{} "
+                            "rellenos {}/{} copias {}/{}",
+                            calls[0], kib[0], calls[1], kib[1], calls[2], kib[2], calls[3],
+                            kib[3], calls[4], kib[4], calls[5], kib[5], calls[6], kib[6]);
+    }
+    text += fmt::format("\nhuella fs: fallos {} (de configuracion ya conocida {}, hueco ocupado por otra {})",
+                        g_fp_misses, g_fp_miss_known, g_fp_miss_collisions);
+    g_fp_misses = g_fp_miss_known = g_fp_miss_collisions = 0;
+    if (g_vs_uniform_writes != 0) {
+        text += fmt::format(" | uniformes vs: {:.1f} vec4 por lote de 96, iguales al anterior {}",
+                            static_cast<double>(g_vs_uniform_floats) / g_vs_uniform_writes,
+                            g_vs_uniforms_same);
+        g_vs_uniforms_same = 0;
+    }
+    g_vs_uniform_floats = g_vs_uniform_writes = 0;
+    g_vcache_hits = g_vcache_misses = g_vcache_hit_bytes = 0;
+    g_vcache_switches = g_vcache_busy = 0;
+    if (g_present_waits != 0 || g_present_drains != 0) {
+        const double n = static_cast<double>(std::max<unsigned long long>(g_present_waits, 1));
+        const double d = static_cast<double>(std::max<unsigned long long>(g_present_drains, 1));
+        text += fmt::format("\nvalla de presentar: {} esperas, {:.1f} ms cada una | escenas sin "
+                            "acabar media {:.1f} max {} | la esperada se envio hace {:.1f} ms | "
+                            "vaciados enteros {} ({:.1f} ms cada uno) | marcas {}",
+                            g_present_waits, g_present_wait_sum_us / n / 1000.0,
+                            g_present_pending_sum / n, g_present_pending_max,
+                            g_present_age_sum_us / n / 1000.0, g_present_drains,
+                            g_present_drain_us / d / 1000.0,
+                            present_marks_on.load(std::memory_order_relaxed) != 0 ? "si" : "no");
+        g_present_waits = g_present_pending_sum = g_present_pending_max = 0;
+        g_present_age_sum_us = g_present_wait_sum_us = 0;
+        g_present_drains = g_present_drain_us = 0;
+    }
     g_data_reserve_us = 0;
     g_data_copy_us = 0;
     g_data_index_us = 0;

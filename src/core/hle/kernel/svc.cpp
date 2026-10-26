@@ -1155,6 +1155,8 @@ Result SVC::StoreProcessDataCache(Handle process_handle, VAddr address, u32 size
     const std::shared_ptr<Process> process =
         kernel.GetCurrentProcess()->handle_table.Get<Process>(process_handle);
     R_UNLESS(process, ResultInvalidHandle);
+    // Ver Common::WriteEpochs (0.4.0.8): la GPU puede ver bytes nuevos ahi.
+    memory.MarkWritten(*process, address, size, 4);
 
     LOG_DEBUG(Kernel_SVC, "called address=0x{:08X}, size=0x{:08X}", address, size);
 
@@ -1166,6 +1168,8 @@ Result SVC::FlushProcessDataCache(Handle process_handle, VAddr address, u32 size
     const std::shared_ptr<Process> process =
         kernel.GetCurrentProcess()->handle_table.Get<Process>(process_handle);
     R_UNLESS(process, ResultInvalidHandle);
+    // Ver Common::WriteEpochs (0.4.0.8).
+    memory.MarkWritten(*process, address, size, 4);
 
     LOG_DEBUG(Kernel_SVC, "called address=0x{:08X}, size=0x{:08X}", address, size);
 

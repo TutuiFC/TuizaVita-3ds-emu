@@ -4,6 +4,13 @@
 
 #include <array>
 #include <cstring>
+#ifdef __PSVITA__
+#include <atomic>
+#include <condition_variable>
+#include <mutex>
+#include <thread>
+#include "common/vita_diag.h"
+#endif
 #include "common/archives.h"
 #include "common/common_funcs.h"
 #include "common/logging/log.h"
@@ -512,18 +519,125 @@ void Y2R_U::GetDitheringWeightParams(Kernel::HLERequestContext& ctx) {
     LOG_DEBUG(Service_Y2R, "called");
 }
 
+#ifdef __PSVITA__
+/// Ajuste "y2r_hilo=" (0.4.0.5): la conversion en otro nucleo. 1 por defecto.
+// Apagado por defecto desde 0.4.0.9: ver el aviso de fin, abajo.
+std::atomic<bool> g_y2r_async{false};
+
+namespace {
+/**
+ * EL HILO DE Y2R (0.4.0.5). En la consola, Y2R es un chip aparte: el juego
+ * manda la imagen y SIGUE (en un video, decodificando la siguiente) hasta que
+ * le llega el aviso de fin. Aqui la conversion la hacia el hilo de emulacion
+ * dentro de StartConversion: ~8 ms por imagen de 400x240 en la intro de Kirby
+ * Triple Deluxe, 35 por segundo, una cuarta parte de ese hilo. Ahora la hace
+ * este hilo, en el nucleo 2, mientras el juego sigue.
+ *
+ * Un solo trabajo a la vez (el servicio no admite otro hasta el aviso de fin),
+ * con su configuracion copiada: lo que el juego cambie despues de
+ * StartConversion no le afecta, como en el chip.
+ */
+struct Y2rWorker {
+    std::mutex mutex;
+    std::condition_variable work_ready;
+    std::condition_variable work_done;
+    bool has_job = false;
+    bool done = true;
+    Memory::MemorySystem* memory = nullptr;
+    ConversionConfiguration job{};
+
+    void Main() {
+        Common::VitaPinThreadToUserCore(2, "y2r");
+        Common::VitaSetThreadPriority(Common::kVitaPriorityHelper, "y2r");
+        while (true) {
+            ConversionConfiguration work;
+            Memory::MemorySystem* mem = nullptr;
+            {
+                std::unique_lock lock{mutex};
+                work_ready.wait(lock, [this] { return has_job; });
+                work = job;
+                mem = memory;
+                has_job = false;
+            }
+            HW::Y2R::PerformConversion(*mem, work);
+            {
+                std::lock_guard lock{mutex};
+                done = true;
+            }
+            work_done.notify_all();
+        }
+    }
+    void Submit(Memory::MemorySystem& mem, const ConversionConfiguration& cvt) {
+        {
+            std::lock_guard lock{mutex};
+            memory = &mem;
+            job = cvt;
+            has_job = true;
+            done = false;
+        }
+        work_ready.notify_one();
+    }
+    bool Done() {
+        std::lock_guard lock{mutex};
+        return done;
+    }
+    void Wait() {
+        std::unique_lock lock{mutex};
+        work_done.wait(lock, [this] { return done; });
+    }
+};
+
+Y2rWorker* GetWorker() {
+    // Vive lo que la aplicacion: el servicio se rehace en cada partida.
+    static Y2rWorker* worker = [] {
+        auto* created = new Y2rWorker;
+        std::thread([created] { created->Main(); }).detach();
+        return created;
+    }();
+    return worker;
+}
+} // Anonymous namespace
+
+/// El trabajo del hilo ha acabado (o se espera aqui): su salida, fuera de la
+/// cache de la GPU en orden (ver GPU::InvalidateRegionOrdered).
+void Y2R_U::FinishAsync() {
+    if (!async_pending) {
+        return;
+    }
+    GetWorker()->Wait();
+    async_pending = false;
+    system.Memory().RasterizerFlushVirtualRegion(async_dst, async_bytes,
+                                                 Memory::FlushMode::InvalidateOrdered);
+}
+#endif
+
 void Y2R_U::StartConversion(Kernel::HLERequestContext& ctx) {
     IPC::RequestParser rp(ctx);
 
     // dst_image_size would seem to be perfect for this, but it doesn't include the gap :(
     u32 total_output_size =
         conversion.input_lines * (conversion.dst.transfer_unit + conversion.dst.gap);
-    // Ver GPU::InvalidateRegionOrdered (0.3.9.9): primero la conversion y despues,
-    // en la cola de la GPU, quitar la salida de la cache. Antes se vaciaba y
-    // esperaba la cola entera (FlushAndInvalidate hace gpu.Sync()).
-    HW::Y2R::PerformConversion(system.Memory(), conversion);
-    system.Memory().RasterizerFlushVirtualRegion(conversion.dst.address, total_output_size,
-                                                 Memory::FlushMode::InvalidateOrdered);
+#ifdef __PSVITA__
+    // La anterior, si aun no habia avisado de su fin (no deberia).
+    FinishAsync();
+    if (g_y2r_async.load(std::memory_order_relaxed)) {
+        // Ver Y2rWorker (0.4.0.5): en el nucleo 2; el aviso de fin espera a
+        // que acabe (el evento de abajo se aplaza mientras tanto).
+        GetWorker()->Submit(system.Memory(), conversion);
+        async_pending = true;
+        async_dst = conversion.dst.address;
+        async_bytes = total_output_size;
+        async_delays = 0;
+    } else
+#endif
+    {
+        // Ver GPU::InvalidateRegionOrdered (0.3.9.9): primero la conversion y
+        // despues, en la cola de la GPU, quitar la salida de la cache. Antes se
+        // vaciaba y esperaba la cola entera (FlushAndInvalidate hace gpu.Sync()).
+        HW::Y2R::PerformConversion(system.Memory(), conversion);
+        system.Memory().RasterizerFlushVirtualRegion(conversion.dst.address, total_output_size,
+                                                     Memory::FlushMode::InvalidateOrdered);
+    }
 
     if (is_busy_conversion) {
         system.CoreTiming().RemoveEvent(completion_signal_event);
@@ -544,6 +658,9 @@ void Y2R_U::StartConversion(Kernel::HLERequestContext& ctx) {
 
 void Y2R_U::StopConversion(Kernel::HLERequestContext& ctx) {
     IPC::RequestParser rp(ctx);
+#ifdef __PSVITA__
+    FinishAsync();
+#endif
 
     if (is_busy_conversion) {
         is_busy_conversion = false;
@@ -720,12 +837,32 @@ Y2R_U::Y2R_U(Core::System& system) : ServiceFramework("y2r:u", 1), system(system
     completion_event = system.Kernel().CreateEvent(Kernel::ResetType::OneShot, "Y2R:Completed");
     completion_signal_event =
         system.CoreTiming().RegisterEvent("Y2R Completion Signal Event", [this](uintptr_t, s64) {
+#ifdef __PSVITA__
+            /**
+             * EL AVISO DE FIN, CUANDO DE VERDAD HA ACABADO (0.4.0.5), ESPERANDO
+             * Y NO APLAZANDO (0.4.0.9). Aplazar el aviso en tiempo emulado mientras
+             * el hilo convertia hacia SALTAR el reloj del juego: el juego solo
+             * espera este aviso, la CPU emulada salta de evento en evento y el
+             * tiempo emulado corria mas que el real. En la intro de Kirby Triple
+             * Deluxe (0.4.0.6) eso era "vel" 110-167 %, el DSP ahogado (18-194
+             * ms por fotograma) y el video a 0,4-12 FPS frente a 26-28 en 0.4.0.2.
+             * Ahora se espera al hilo aqui mismo, sin mover el reloj.
+             */
+            FinishAsync();
+#endif
             completion_event->Signal();
             is_busy_conversion = false;
         });
 }
 
-Y2R_U::~Y2R_U() = default;
+Y2R_U::~Y2R_U() {
+#ifdef __PSVITA__
+    // Que el hilo no siga escribiendo en la memoria de una partida cerrada.
+    if (async_pending) {
+        GetWorker()->Wait();
+    }
+#endif
+}
 
 void InstallInterfaces(Core::System& system) {
     auto& service_manager = system.ServiceManager();

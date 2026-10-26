@@ -1486,10 +1486,20 @@ private:
     void Generate() {
         /**
          * Lectura de un uniform flotante con desplazamiento por registro de
-         * direccion. Es la traduccion literal de la del generador de GLSL: el
+         * direccion. Era la traduccion literal de la del generador de GLSL: el
          * desplazamiento fuera de [-128, 127] no cuenta, el indice se envuelve
          * a siete bits y todo lo que pase de 96 devuelve unos, que es lo que da
          * el hardware.
+         *
+         * MAS CORTA DESDE 0.4.0.1, y es lo que mas pesaba de todo el shader.
+         * Banco del compilador (banco_cg/, shader de piel de 27 KB de Zafiro
+         * Alfa): con las dos comparaciones encadenadas y la vuelta, 80 s de
+         * compilacion y 29 KB de binario; solo acotando el indice, 12 s y
+         * 15,7 KB (y en O3, 9 s y 7,5 KB). El binario es lo que ejecuta la GPU
+         * por vertice: en Mario 3D Land el 85 % del chip son los shaders de
+         * vertices, en proporcion a su tamano. Dentro de 0-95 es igual que antes;
+         * fuera de 0-95 se queda en el borde (0 o 95) en vez de dar unos o
+         * dar la vuelta: los juegos no leen fuera de sus 96 uniformes.
          */
         if (FloatAddress()) {
             /**
@@ -1505,20 +1515,13 @@ private:
             shader.AddLine("}}");
             shader.AddLine("float4 get_offset_register(float base_index, float offset) {{");
             ++shader.scope;
-            shader.AddLine(
-                "float fixed_offset = (offset >= -128.0 && offset <= 127.0) ? offset : 0.0;");
-            shader.AddLine("float index = base_index + fixed_offset;");
-            shader.AddLine("index = index < 0.0 ? index + 128.0 : "
-                           "(index >= 128.0 ? index - 128.0 : index);");
-            shader.AddLine("return index < 96.0 ? vs_f[(int)index] : float4(1.0, 1.0, 1.0, 1.0);");
+            shader.AddLine("return vs_f[(int)clamp(base_index + offset, 0.0, 95.0)];");
             --shader.scope;
             shader.AddLine("}}");
         } else {
             shader.AddLine("float4 get_offset_register(int base_index, int offset) {{");
             ++shader.scope;
-            shader.AddLine("int fixed_offset = (offset >= -128 && offset <= 127) ? offset : 0;");
-            shader.AddLine("int index = (base_index + fixed_offset) & 0x7F;");
-            shader.AddLine("return index < 96 ? vs_f[index] : float4(1.0, 1.0, 1.0, 1.0);");
+            shader.AddLine("return vs_f[(int)clamp((float)(base_index + offset), 0.0, 95.0)];");
             --shader.scope;
             shader.AddLine("}}");
         }

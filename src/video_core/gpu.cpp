@@ -342,6 +342,15 @@ void GPU::ExecuteCommand(const Service::GSP::Command& command,
         // Write to the memory fill GPU registers.
         // If both buffers are set GSP dispatches PSC0 only.
         const bool has_both_bufs = params.start1 != 0 && params.start2 != 0;
+        // Ver Common::WriteEpochs (0.4.0.8): lo que rellena cambia.
+        if (params.start1 != 0 && params.end1 > params.start1) {
+            impl->memory.MarkWrittenPhysical(VirtualToPhysicalAddress(params.start1),
+                                             params.end1 - params.start1, 5);
+        }
+        if (params.start2 != 0 && params.end2 > params.start2) {
+            impl->memory.MarkWrittenPhysical(VirtualToPhysicalAddress(params.start2),
+                                             params.end2 - params.start2, 5);
+        }
         if (params.start1 != 0) {
             memfill[0].address_start = VirtualToPhysicalAddress(params.start1) >> 3;
             memfill[0].address_end = VirtualToPhysicalAddress(params.end1) >> 3;
@@ -365,6 +374,11 @@ void GPU::ExecuteCommand(const Service::GSP::Command& command,
         auto& params = command.display_transfer;
         auto& display_transfer = regs.display_transfer_config;
 
+        // Ver Common::WriteEpochs (0.4.0.8): el destino cambia. De sobra: ancho
+        // por alto a cuatro bytes.
+        impl->memory.MarkWrittenPhysical(
+            VirtualToPhysicalAddress(params.out_buffer_address),
+            (params.out_buffer_size & 0xFFFF) * (params.out_buffer_size >> 16) * 4u, 6);
         // Write to the transfer engine GPU registers.
         display_transfer.input_address = VirtualToPhysicalAddress(params.in_buffer_address) >> 3;
         display_transfer.output_address = VirtualToPhysicalAddress(params.out_buffer_address) >> 3;
@@ -384,6 +398,10 @@ void GPU::ExecuteCommand(const Service::GSP::Command& command,
         auto& params = command.texture_copy;
         auto& texture_copy = regs.display_transfer_config;
 
+        // Ver Common::WriteEpochs (0.4.0.8): el destino cambia. De sobra: el
+        // tamano por dos (los huecos de salida son como mucho otro tanto).
+        impl->memory.MarkWrittenPhysical(VirtualToPhysicalAddress(params.out_buffer_address),
+                                         params.size * 2u + 4096u, 6);
         // Write to the transfer engine GPU registers.
         texture_copy.input_address = VirtualToPhysicalAddress(params.in_buffer_address) >> 3;
         texture_copy.output_address = VirtualToPhysicalAddress(params.out_buffer_address) >> 3;
@@ -400,6 +418,15 @@ void GPU::ExecuteCommand(const Service::GSP::Command& command,
     case CommandId::CacheFlush: {
         // Rasterizer flushing handled elsewhere in CPU read/write and other GPU handlers
         // Use command.cache_flush.regions to implement this handler
+        // 0.4.0.8: lo que la GPU va a leer de aqui puede haber cambiado (ver
+        // Common::WriteEpochs). Las regiones son del proceso que mando la orden.
+        const auto process =
+            dma_process != nullptr ? dma_process : impl->system.Kernel().GetCurrentProcess();
+        for (const auto& region : command.cache_flush.regions) {
+            if (region.size != 0 && process != nullptr) {
+                impl->memory.MarkWritten(*process, region.address, region.size, 3);
+            }
+        }
         break;
     }
     default:

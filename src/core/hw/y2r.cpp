@@ -7,6 +7,7 @@
 #include <cstddef>
 #include <cstring>
 #include <memory>
+#include <vector>
 #if defined(__ARM_NEON)
 #include <arm_neon.h>
 #endif
@@ -183,6 +184,33 @@ static void ConvertYUVToRGB(const u8* input_Y, const u8* input_U, const u8* inpu
  * arriba. Comprobado en el PC contra el codigo escalar con 8,8 millones de
  * pixeles (los seis juegos de coeficientes estandar y coeficientes al azar).
  */
+static inline void ConvertEightRGB(uint8x8_t y8, uint8x8_t u8x, uint8x8_t v8x,
+                                   const CoefficientSet& c, uint8x8_t& r8, uint8x8_t& g8,
+                                   uint8x8_t& b8) {
+    const int16x8_t y = vreinterpretq_s16_u16(vmovl_u8(y8));
+    const int16x8_t u = vreinterpretq_s16_u16(vmovl_u8(u8x));
+    const int16x8_t v = vreinterpretq_s16_u16(vmovl_u8(v8x));
+    const int32x4_t kr = vdupq_n_s32(c[5] + 0x18);
+    const int32x4_t kg = vdupq_n_s32(c[6] + 0x18);
+    const int32x4_t kb = vdupq_n_s32(c[7] + 0x18);
+    const auto half = [&](int16x4_t yh, int16x4_t uh, int16x4_t vh, uint16x4_t& r16,
+                          uint16x4_t& g16, uint16x4_t& b16) {
+        const int32x4_t cy = vmull_n_s16(yh, c[0]);
+        const int32x4_t r = vmlal_n_s16(cy, vh, c[1]);
+        const int32x4_t g = vmlsl_n_s16(vmlsl_n_s16(cy, vh, c[2]), uh, c[3]);
+        const int32x4_t b = vmlal_n_s16(cy, uh, c[4]);
+        r16 = vqshrun_n_s32(vaddq_s32(vshrq_n_s32(r, 3), kr), 5);
+        g16 = vqshrun_n_s32(vaddq_s32(vshrq_n_s32(g, 3), kg), 5);
+        b16 = vqshrun_n_s32(vaddq_s32(vshrq_n_s32(b, 3), kb), 5);
+    };
+    uint16x4_t r_lo, g_lo, b_lo, r_hi, g_hi, b_hi;
+    half(vget_low_s16(y), vget_low_s16(u), vget_low_s16(v), r_lo, g_lo, b_lo);
+    half(vget_high_s16(y), vget_high_s16(u), vget_high_s16(v), r_hi, g_hi, b_hi);
+    b8 = vqmovn_u16(vcombine_u16(b_lo, b_hi));
+    g8 = vqmovn_u16(vcombine_u16(g_lo, g_hi));
+    r8 = vqmovn_u16(vcombine_u16(r_lo, r_hi));
+}
+
 static inline void ConvertEight(uint8x8_t y8, uint8x8_t u8x, uint8x8_t v8x,
                                 const CoefficientSet& c, u32* out) {
     const int16x8_t y = vreinterpretq_s16_u16(vmovl_u8(y8));
@@ -222,6 +250,129 @@ static inline uint8x8_t LoadChromaPairs(const u8* in) {
     return vzip_u8(v, v).val[0];
 }
 
+/// Ocho pixeles de la fila 'y' desde la columna 'x', como los lee ConvertYUVToRGBNeon.
+template <InputFormat input_format>
+static inline void LoadEight(const u8* input_Y, const u8* input_U, const u8* input_V,
+                             unsigned int width, unsigned int y, unsigned int x,
+                             uint8x8_t& y8, uint8x8_t& u8x, uint8x8_t& v8x) {
+    if constexpr (input_format == InputFormat::YUYV422_Interleaved) {
+        const uint8x8x2_t yc = vld2_u8(input_Y + (y * width + x) * 2);
+        y8 = yc.val[0];
+        const uint8x8x2_t uv = vuzp_u8(yc.val[1], yc.val[1]);
+        u8x = vzip_u8(uv.val[0], uv.val[0]).val[0];
+        v8x = vzip_u8(uv.val[1], uv.val[1]).val[0];
+    } else if constexpr (input_format == InputFormat::YUV422_Indiv8 ||
+                         input_format == InputFormat::YUV422_Indiv16) {
+        y8 = vld1_u8(input_Y + y * width + x);
+        u8x = LoadChromaPairs(input_U + (y * width + x) / 2);
+        v8x = LoadChromaPairs(input_V + (y * width + x) / 2);
+    } else {
+        y8 = vld1_u8(input_Y + y * width + x);
+        u8x = LoadChromaPairs(input_U + ((y / 2) * width + x) / 2);
+        v8x = LoadChromaPairs(input_V + ((y / 2) * width + x) / 2);
+    }
+}
+
+/**
+ * UNA FRANJA EN UNA PASADA (0.4.0.1). Con bloques de 8x8 y sin giro, que es lo
+ * que piden los videos (texturas de la PICA), la franja hacia cuatro pasadas:
+ * convertir a mosaicos de RGB32, reordenar cada mosaico en Z con la tabla,
+ * copiarlo al bufer de salida y codificarlo al formato final. En la intro de
+ * Kirby Triple Deluxe (400x240, RGB8) eran ~4,1 ms convertir y ~3,7 ms
+ * colocar por imagen (crash.txt de 0.4.0.0). Aqui cada par de filas se
+ * convierte y se escribe ya en su sitio del mosaico y en su formato: en el
+ * orden Z de 8x8, las filas 2k y 2k+1 de las columnas 0-3 son ocho pixeles
+ * seguidos (pares de columnas alternando fila), y las columnas 4-7 los ocho
+ * siguientes a 16 de distancia. Eso es un vzip de pares de bytes por canal.
+ */
+template <OutputFormat output_format>
+static inline void StoreEight(u8* out, uint8x8_t r, uint8x8_t g, uint8x8_t b, u8 alpha) {
+    if constexpr (output_format == OutputFormat::RGBA8) {
+        // Bytes A, B, G, R: ver EncodeRGBA8.
+        uint8x8x4_t px;
+        px.val[0] = vdup_n_u8(alpha);
+        px.val[1] = b;
+        px.val[2] = g;
+        px.val[3] = r;
+        vst4_u8(out, px);
+    } else if constexpr (output_format == OutputFormat::RGB8) {
+        uint8x8x3_t px;
+        px.val[0] = b;
+        px.val[1] = g;
+        px.val[2] = r;
+        vst3_u8(out, px);
+    } else if constexpr (output_format == OutputFormat::RGB565) {
+        uint16x8_t x = vshll_n_u8(r, 8);
+        x = vsriq_n_u16(x, vshll_n_u8(g, 8), 5);
+        x = vsriq_n_u16(x, vshll_n_u8(b, 8), 11);
+        vst1q_u8(out, vreinterpretq_u8_u16(x));
+    } else {
+        uint16x8_t x = vshll_n_u8(r, 8);
+        x = vsriq_n_u16(x, vshll_n_u8(g, 8), 5);
+        x = vsriq_n_u16(x, vshll_n_u8(b, 8), 10);
+        x = vsriq_n_u16(x, vshll_n_u8(vdup_n_u8(alpha), 8), 15);
+        vst1q_u8(out, vreinterpretq_u8_u16(x));
+    }
+}
+
+template <InputFormat input_format, OutputFormat output_format>
+static void ConvertStripTiled(const u8* input_Y, const u8* input_U, const u8* input_V,
+                              unsigned int width, const CoefficientSet& c, u8 alpha,
+                              u8* out) {
+    constexpr u32 bpp = output_format == OutputFormat::RGBA8  ? 4
+                        : output_format == OutputFormat::RGB8 ? 3
+                                                              : 2;
+    // Primer pixel en Z de las filas 0-1, 2-3, 4-5 y 6-7 (ver morton_lut).
+    static constexpr u8 kPairBase[4] = {0, 8, 32, 40};
+    for (unsigned int x = 0; x < width; x += 8) {
+        u8* const tile = out + (x / 8) * 64 * bpp;
+        for (unsigned int pair = 0; pair < 4; pair++) {
+            uint8x8_t y8, u8x, v8x, r0, g0, b0, r1, g1, b1;
+            LoadEight<input_format>(input_Y, input_U, input_V, width, pair * 2, x, y8, u8x,
+                                    v8x);
+            ConvertEightRGB(y8, u8x, v8x, c, r0, g0, b0);
+            LoadEight<input_format>(input_Y, input_U, input_V, width, pair * 2 + 1, x, y8,
+                                    u8x, v8x);
+            ConvertEightRGB(y8, u8x, v8x, c, r1, g1, b1);
+            const uint16x4x2_t rz = vzip_u16(vreinterpret_u16_u8(r0), vreinterpret_u16_u8(r1));
+            const uint16x4x2_t gz = vzip_u16(vreinterpret_u16_u8(g0), vreinterpret_u16_u8(g1));
+            const uint16x4x2_t bz = vzip_u16(vreinterpret_u16_u8(b0), vreinterpret_u16_u8(b1));
+            StoreEight<output_format>(tile + kPairBase[pair] * bpp,
+                                      vreinterpret_u8_u16(rz.val[0]),
+                                      vreinterpret_u8_u16(gz.val[0]),
+                                      vreinterpret_u8_u16(bz.val[0]), alpha);
+            StoreEight<output_format>(tile + (kPairBase[pair] + 16) * bpp,
+                                      vreinterpret_u8_u16(rz.val[1]),
+                                      vreinterpret_u8_u16(gz.val[1]),
+                                      vreinterpret_u8_u16(bz.val[1]), alpha);
+        }
+    }
+}
+
+template <InputFormat input_format>
+static void FusedStrip(const u8* input_Y, const u8* input_U, const u8* input_V,
+                       const ConversionConfiguration& cvt, u8* out) {
+    const u8 alpha = static_cast<u8>(cvt.alpha);
+    switch (cvt.output_format) {
+    case OutputFormat::RGBA8:
+        ConvertStripTiled<input_format, OutputFormat::RGBA8>(
+            input_Y, input_U, input_V, cvt.input_line_width, cvt.coefficients, alpha, out);
+        break;
+    case OutputFormat::RGB8:
+        ConvertStripTiled<input_format, OutputFormat::RGB8>(
+            input_Y, input_U, input_V, cvt.input_line_width, cvt.coefficients, alpha, out);
+        break;
+    case OutputFormat::RGB5A1:
+        ConvertStripTiled<input_format, OutputFormat::RGB5A1>(
+            input_Y, input_U, input_V, cvt.input_line_width, cvt.coefficients, alpha, out);
+        break;
+    case OutputFormat::RGB565:
+        ConvertStripTiled<input_format, OutputFormat::RGB565>(
+            input_Y, input_U, input_V, cvt.input_line_width, cvt.coefficients, alpha, out);
+        break;
+    }
+}
+
 /// Lo mismo que ConvertYUVToRGB, de ocho en ocho (el ancho siempre es multiplo
 /// de 8).
 template <InputFormat input_format>
@@ -256,10 +407,15 @@ static void ConvertYUVToRGBNeon(const u8* input_Y, const u8* input_U, const u8* 
 }
 #endif
 
+static bool g_skip_convert = false;
+
 template <InputFormat input_format>
 static void ConvertYUV(const u8* input_Y, const u8* input_U, const u8* input_V, ImageTile output[],
                        unsigned int width, unsigned int height,
                        const CoefficientSet& coefficients) {
+    if (g_skip_convert) {
+        return;
+    }
 #ifdef __PSVITA__
     Phase(0); // ReceiveData acaba de traer la franja
     struct EndConvert {
@@ -553,6 +709,60 @@ void PerformConversion(Memory::MemorySystem& memory, ConversionConfiguration cvt
     std::size_t num_tiles = cvt.input_line_width / 8;
     ASSERT(num_tiles <= MAX_TILES);
 
+#if defined(__ARM_NEON)
+    /**
+     * LA FRANJA FUSIONADA (0.4.0.1, ver ConvertStripTiled): bloques de 8x8, sin
+     * giro, y la salida de cada franja en una sola unidad de transferencia (o
+     * sin huecos), dentro de memoria seguida. LA RED: las primeras kFusedChecks
+     * imagenes se hacen por los dos caminos -- la fusionada en un bufer aparte
+     * y la de siempre en la memoria del juego -- y se comparan byte a byte. Una
+     * diferencia la apaga para toda la sesion y dice donde en crash.txt.
+     */
+    static constexpr u32 kFusedChecks = 6;
+    static u32 fused_checked = 0;
+    static bool fused_off = false;
+    u8* fused_out = nullptr;
+    std::vector<u8> fused_scratch;
+    u8* fused_guest = nullptr;
+    std::size_t fused_stride = 0;
+    std::size_t fused_strip_bytes = 0;
+    {
+        const u32 bpp = cvt.output_format == OutputFormat::RGBA8  ? 4
+                        : cvt.output_format == OutputFormat::RGB8 ? 3
+                                                                  : 2;
+        const std::size_t strip_bytes = std::size_t{cvt.input_line_width} * 8 * bpp;
+        const bool unit_ok = cvt.dst.gap == 0 || cvt.dst.transfer_unit == strip_bytes;
+        const std::size_t stride = cvt.dst.gap == 0 ? strip_bytes : strip_bytes + cvt.dst.gap;
+        const std::size_t strips = cvt.input_lines / 8;
+        const std::size_t span = strips == 0 ? 0 : (strips - 1) * stride + strip_bytes;
+        if (!fused_off && cvt.block_alignment == BlockAlignment::Block8x8 &&
+            cvt.rotation == Rotation::None && cvt.input_lines % 8 == 0 && strips != 0 &&
+            unit_ok && cvt.input_format <= InputFormat::YUYV422_Interleaved &&
+            cvt.output_format <= OutputFormat::RGB565) {
+            u8* const first = memory.GetPointer(cvt.dst.address);
+            u8* const last = memory.GetPointer(cvt.dst.address + static_cast<u32>(span) - 1);
+            if (first != nullptr && last == first + span - 1) {
+                fused_guest = first;
+                fused_stride = stride;
+                fused_strip_bytes = strip_bytes;
+                if (fused_checked < kFusedChecks) {
+                    fused_scratch.assign(span, 0);
+                    fused_out = fused_scratch.data();
+                } else {
+                    fused_out = first;
+                }
+            }
+        }
+    }
+    const bool fused_only = fused_out != nullptr && fused_out == fused_guest;
+    g_skip_convert = fused_only;
+    struct SkipReset {
+        ~SkipReset() {
+            g_skip_convert = false;
+        }
+    } const skip_reset;
+#endif
+
     // Buffer used as a CDMA source/target.
     std::unique_ptr<u8[]> data_buffer(new u8[cvt.input_line_width * 8 * 4]);
     // Intermediate storage for decoded 8x8 image tiles. Always stored as RGB32.
@@ -630,6 +840,39 @@ void PerformConversion(Memory::MemorySystem& memory, ConversionConfiguration cvt
             return;
         }
 
+#if defined(__ARM_NEON)
+        if (fused_out != nullptr) {
+            u8* const strip_out = fused_out + (y / 8) * fused_stride;
+            switch (cvt.input_format) {
+            case InputFormat::YUV422_Indiv8:
+                FusedStrip<InputFormat::YUV422_Indiv8>(input_Y, input_U, input_V, cvt,
+                                                       strip_out);
+                break;
+            case InputFormat::YUV420_Indiv8:
+                FusedStrip<InputFormat::YUV420_Indiv8>(input_Y, input_U, input_V, cvt,
+                                                       strip_out);
+                break;
+            case InputFormat::YUV422_Indiv16:
+                FusedStrip<InputFormat::YUV422_Indiv16>(input_Y, input_U, input_V, cvt,
+                                                        strip_out);
+                break;
+            case InputFormat::YUV420_Indiv16:
+                FusedStrip<InputFormat::YUV420_Indiv16>(input_Y, input_U, input_V, cvt,
+                                                        strip_out);
+                break;
+            case InputFormat::YUYV422_Interleaved:
+                FusedStrip<InputFormat::YUYV422_Interleaved>(input_Y, nullptr, nullptr, cvt,
+                                                             strip_out);
+                break;
+            }
+            if (fused_only) {
+#ifdef __PSVITA__
+                Phase(2);
+#endif
+                continue;
+            }
+        }
+#endif
         u32* output_buffer = reinterpret_cast<u32*>(data_buffer.get());
 
         // Sin rotacion y en lineal, RotateTile0 con linear_lut es una copia
@@ -710,5 +953,40 @@ void PerformConversion(Memory::MemorySystem& memory, ConversionConfiguration cvt
             return;
         }
     }
+#if defined(__ARM_NEON)
+    if (fused_out != nullptr && !fused_only) {
+        const std::size_t strips = cvt.input_lines / 8;
+        for (std::size_t s = 0; s < strips && !fused_off; s++) {
+            const u8* const want = fused_guest + s * fused_stride;
+            const u8* const got = fused_out + s * fused_stride;
+            if (std::memcmp(want, got, fused_strip_bytes) == 0) {
+                continue;
+            }
+            std::size_t at = 0;
+            while (at < fused_strip_bytes && want[at] == got[at]) {
+                at++;
+            }
+            fused_off = true;
+#ifdef __PSVITA__
+            Common::VitaNote(
+                "y2r", fmt::format("franja fusionada DISTINTA (se apaga): {}x{} entrada {} "
+                                   "salida {}, franja {} byte {}: {:02x} en vez de {:02x}",
+                                   cvt.input_line_width, cvt.input_lines,
+                                   static_cast<u32>(cvt.input_format),
+                                   static_cast<u32>(cvt.output_format), s, at, got[at],
+                                   want[at])
+                           .c_str());
+#endif
+        }
+        if (!fused_off && ++fused_checked == kFusedChecks) {
+#ifdef __PSVITA__
+            Common::VitaNote("y2r", fmt::format("franja fusionada comprobada en {} imagenes: "
+                                                "a partir de ahora va sola",
+                                                kFusedChecks)
+                                        .c_str());
+#endif
+        }
+    }
+#endif
 }
 } // namespace HW::Y2R

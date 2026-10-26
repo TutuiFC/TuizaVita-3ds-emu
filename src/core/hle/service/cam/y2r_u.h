@@ -356,6 +356,16 @@ private:
     bool transfer_end_interrupt_enabled = false;
     bool spacial_dithering_enabled = false;
     bool is_busy_conversion = false;
+#ifdef __PSVITA__
+    /// Conversion en marcha en el hilo de Y2R (0.4.0.5): su destino, para
+    /// quitarlo de la cache de la GPU al acabar, y cuantas veces se ha
+    /// aplazado el aviso de fin esperandola. Ver StartConversion.
+    bool async_pending = false;
+    VAddr async_dst = 0;
+    u32 async_bytes = 0;
+    u32 async_delays = 0;
+    void FinishAsync();
+#endif
 
     template <class Archive>
     void serialize(Archive& ar, const unsigned int);

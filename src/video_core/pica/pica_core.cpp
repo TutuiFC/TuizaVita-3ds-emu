@@ -401,9 +401,20 @@ void PicaCore::ProcessCmdList(PAddr list, u32 size, bool ignore_list) [[hot]] {
                     for (u32 i = 0; i < run; ++i) {
                         const u32 id = ids[i];
                         const u32 write_mask = ExpandBitsToBytes[masks[i]];
-                        regs.internal.reg_array[id] =
-                            (regs.internal.reg_array[id] & ~write_mask) | (values[i] & write_mask);
-                        dirty_regs.Set(id);
+                        /**
+                         * SUCIO SOLO SI CAMBIA (0.4.0.8). Aqui solo llegan registros
+                         * normales (los puertos y disparos van por WriteInternalReg),
+                         * y el unico que mira dirty_regs es el memo del rasterizador
+                         * GXM, que ya compara por valor: un juego que reescribe ~40
+                         * registros iguales antes de cada lote (Super Mario 3D Land)
+                         * le hacia revisarlos uno a uno.
+                         */
+                        const u32 old_value = regs.internal.reg_array[id];
+                        const u32 new_value = (old_value & ~write_mask) | (values[i] & write_mask);
+                        if (new_value != old_value) {
+                            regs.internal.reg_array[id] = new_value;
+                            dirty_regs.Set(id);
+                        }
                     }
                     cmd_list.current_index = index;
 
@@ -1010,11 +1021,15 @@ void PicaCore::WriteInternalRegSequential(u32 id, const u32* __restrict values, 
             // Verified in MSVC that vectorization is happening.
             u32* __restrict batch_dst = dst + offset;
             const u32* __restrict batch_src = values + offset;
+            // Sucio solo si cambia (0.4.0.8): ver el camino rapido de ProcessCmdList.
             for (u32 i = 0; i < batch_count; ++i) {
-                batch_dst[i] = (batch_dst[i] & ~write_mask) | (batch_src[i] & write_mask);
+                const u32 old_value = batch_dst[i];
+                const u32 new_value = (old_value & ~write_mask) | (batch_src[i] & write_mask);
+                if (new_value != old_value) {
+                    batch_dst[i] = new_value;
+                    dirty_regs.Set(reg + i);
+                }
             }
-
-            dirty_regs.SetRange(reg, batch_count);
             offset += batch_count;
         }
         // Whatever register stopped the batch (if we didn't reach the end)
