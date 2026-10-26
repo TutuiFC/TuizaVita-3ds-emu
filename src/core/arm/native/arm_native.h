@@ -153,7 +153,10 @@ bool DecodeSvc(Memory::MemorySystem& memory, u32 pc, bool thumb, u32& out_svc);
  * `ticks` recibe los ciclos de ARM11 que hay que cobrarle al reloj emulado.
  * Devuelve false sin tocar nada si no esta disponible o si no se encendio.
  */
-bool TryRun(ARMul_State& state, u64 max_instructions, u32& ticks);
+/// `then_interpreter` (0.3.9.0): la rodaja acabo en un fallo (memoria,
+/// instruccion indefinida, codigo): el pc ya apunta a la instruccion que
+/// fallo y el interprete tiene que ejecutarla en esta misma rodaja.
+bool TryRun(ARMul_State& state, u64 max_instructions, u32& ticks, bool& then_interpreter);
 
 /// Se enciende con "jit_nativo=1" en ajustes.txt. Apagado por defecto: esto
 /// ejecuta codigo del juego de verdad en la CPU de la consola.

@@ -7,6 +7,7 @@
 #include <array>
 #include <cstddef>
 #include <deque>
+#include "audio_core/audio_pool.h"
 #include "common/common_types.h"
 
 namespace AudioCore {
@@ -24,7 +25,9 @@ using StereoFrame16 = std::array<std::array<s16, 2>, samples_per_frame>;
 using QuadFrame32 = std::array<std::array<s32, 4>, samples_per_frame>;
 
 /// A variable length buffer of signed PCM16 stereo samples.
-using StereoBuffer16 = std::deque<std::array<s16, 2>>;
+/// En la Vita, con los bloques de la deque de un pool propio (0.3.9.0, ver audio_pool.h).
+using StereoBuffer16 =
+    std::deque<std::array<s16, 2>, AudioCore::PoolAllocator<std::array<s16, 2>>>;
 
 constexpr std::size_t num_dsp_pipe = 8;
 enum class DspPipe {

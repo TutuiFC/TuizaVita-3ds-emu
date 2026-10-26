@@ -218,16 +218,23 @@ void ARM_DynCom::ExecuteInstructions(u64 num_instructions) {
      */
     {
         u32 native_ticks = 0;
-        // Solo el nucleo 0 (0.3.8.9): con el 1 en nativo, Smash Bros. acababa en su
-        // propia rutina de error (un trap Thumb en 0x00100eda y salto a 0x4) a los
-        // 1-3 minutos. Casi todos los juegos solo usan el 0, y en Smash el 1 apenas
-        // trabaja. Ver Core::Native::TryRun.
-        if (GetID() == 0 && Core::Native::TryRun(*state, num_instructions, native_ticks)) {
+        bool then_interpreter = false;
+        // Los dos nucleos otra vez (0.3.9.0). En 0.3.8.9 solo iba el 0: con el 1,
+        // Smash Bros. acababa en su propia rutina de error, y era el pc de los
+        // fallos (ver Core::Native::TryRun), que tambien le pasaba al 0.
+        if (Core::Native::TryRun(*state, num_instructions, native_ticks, then_interpreter)) {
             if (timer) {
                 timer->AddTicks(native_ticks);
             }
-            state->ServeBreak();
-            return;
+            if (!then_interpreter) {
+                state->ServeBreak();
+                return;
+            }
+            // Acabo en un fallo: la instruccion que fallo, y lo que quede de la
+            // rodaja, por el interprete. Ver TryRun.
+            num_instructions =
+                num_instructions > native_ticks ? num_instructions - native_ticks : 1;
+            state->NumInstrsToExecute = num_instructions;
         }
     }
 #endif

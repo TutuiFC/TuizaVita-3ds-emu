@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include "audio_core/interpolate.h"
+#include "audio_core/hle/dsp_stats.h"
 #include "common/assert.h"
 
 namespace AudioCore::AudioInterp {
@@ -83,10 +84,19 @@ static void StepOverSamples(State& state, StereoBuffer16& input, float rate, Ste
     if (input.empty())
         return;
 
+    {
+        const unsigned int milli = rate < 4.0e6f ? static_cast<unsigned int>(rate * 1000.0f)
+                                                 : 0xFFFFFFFFu;
+        if (milli > AudioCore::HLE::Stats::interp_max_rate.load(std::memory_order_relaxed)) {
+            AudioCore::HLE::Stats::interp_max_rate.store(milli, std::memory_order_relaxed);
+        }
+    }
     if (StepOverSamplesContiguous(state, input, static_cast<u64>(rate * scale_factor), output,
                                   outputi, fn)) {
+        AudioCore::HLE::Stats::interp_fast.fetch_add(1, std::memory_order_relaxed);
         return;
     }
+    AudioCore::HLE::Stats::interp_slow.fetch_add(1, std::memory_order_relaxed);
 
     input.insert(input.begin(), {state.xn2, state.xn1});
 

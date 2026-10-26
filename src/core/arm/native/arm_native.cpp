@@ -422,7 +422,8 @@ void LogStatsNow() {
          g_code_changes);
 }
 
-bool TryRun(ARMul_State& state, u64 max_instructions, u32& ticks) {
+bool TryRun(ARMul_State& state, u64 max_instructions, u32& ticks, bool& then_interpreter) {
+    then_interpreter = false;
     ticks = 0;
     if (!enabled || max_instructions == 0 || !Available() || !g_world) {
         return false;
@@ -568,15 +569,37 @@ bool TryRun(ARMul_State& state, u64 max_instructions, u32& ticks) {
     case AZ_REASON_BUDGET:
         // Se acabo la rodaja sin novedad: lo normal.
         return true;
-    default:
+    default: {
         /**
-         * Fallo de memoria, instruccion indefinida, lo que sea: el estado esta
-         * escrito tal cual y el interprete reejecuta esa instruccion con el
-         * codigo que ya existe. Esto NO es un error, es el reparto de trabajo.
+         * Fallo de memoria, instruccion indefinida, lo que sea: el interprete
+         * ejecuta esa instruccion con el codigo que ya existe. Esto NO es un
+         * error, es el reparto de trabajo.
+         *
+         * EL PC DEL FALLO, NO EL DE VUELTA (0.3.9.0). El modulo devuelve el lr
+         * de la excepcion tal cual (srsdb en vectors.S; solo corrige el de las
+         * IRQ), y ese no es la instruccion que fallo: aborto de datos +8,
+         * aborto de codigo +4, indefinida +4 en ARM y +2 en Thumb. Hasta aqui
+         * se daba por bueno y ademas la rodaja siguiente volvia a nativo en ese
+         * pc: la instruccion que fallaba no se ejecutaba nunca, y con un aborto
+         * de datos tampoco la siguiente. De vez en cuando eso rompia el juego:
+         * Smash Bros. con el segundo nucleo en nativo acababa en su rutina de
+         * error y New Super Mario Bros. 2 saltando a 0, a los 1-3 minutos.
          */
+        const bool thumb = (ctx.cpsr & (1u << 5)) != 0;
+        u32 back = 0;
+        if (ctx.reason == AZ_REASON_DABT) {
+            back = 8;
+        } else if (ctx.reason == AZ_REASON_PABT) {
+            back = 4;
+        } else if (ctx.reason == AZ_REASON_UNDEF) {
+            back = thumb ? 2 : 4;
+        }
+        state.Reg[15] = ctx.r[15] - back;
+        then_interpreter = true;
         g_last_bail = ReasonName(ctx.reason);
         g_native_bails++;
         return true;
+    }
     }
 }
 
@@ -714,7 +737,8 @@ bool DecodeSvc(Memory::MemorySystem&, u32, bool, u32&) {
     return false;
 }
 bool enabled = false;
-bool TryRun(ARMul_State&, u64, u32& ticks) {
+bool TryRun(ARMul_State&, u64, u32& ticks, bool& then_interpreter) {
+    then_interpreter = false;
     ticks = 0;
     return false;
 }

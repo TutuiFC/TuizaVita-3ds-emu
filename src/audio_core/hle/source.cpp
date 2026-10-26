@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cmath>
 #include <fmt/format.h>
 #if defined(__ARM_NEON)
 #include <arm_neon.h>
@@ -69,8 +70,21 @@ void Source::MixInto(QuadFrame32& dest, std::size_t intermediate_mix_id) {
         return;
     }
 
-    const bool ramp_active = state.gain_ramp_active.at(intermediate_mix_id);
+    bool ramp_active = state.gain_ramp_active.at(intermediate_mix_id);
     const std::array<float, 4>& ramp_start = state.gain_ramp_start.at(intermediate_mix_id);
+    /**
+     * UNA RAMPA QUE NO SUBE NI BAJA (0.3.9.0). El juego marca la ganancia como
+     * cambiada aunque la reescriba igual (Zelda Ocarina of Time 3D, en cada
+     * trama), y eso mandaba la fuente al bucle de la rampa, en VFP y de una en
+     * una: 'mezclar' 1,9 ms por trama de audio con 24 fuentes. Con el inicio
+     * igual al final y finitos, la ganancia de la rampa es inicio + 0 * avance
+     * = la misma, asi que el camino sin rampa da lo mismo.
+     */
+    if (ramp_active && ramp_start == gains && std::isfinite(gains[0]) &&
+        std::isfinite(gains[1]) && std::isfinite(gains[2]) && std::isfinite(gains[3])) {
+        state.gain_ramp_active.at(intermediate_mix_id) = false;
+        ramp_active = false;
+    }
     constexpr float ramp_scale = 1.0f / static_cast<float>(samples_per_frame - 1);
 
     /**
@@ -134,6 +148,50 @@ void Source::MixInto(QuadFrame32& dest, std::size_t intermediate_mix_id) {
 #endif
     }
 
+#if defined(__ARM_NEON)
+    /**
+     * LA RAMPA CON NEON (0.3.9.0). Zelda Ocarina of Time 3D cambia las
+     * ganancias de verdad en cada trama (el sonido sigue a la camara), y este
+     * bucle en VFP, de una muestra en una y por cada una de las tres mezclas,
+     * era casi toda la 'mezcla' del DSP (1,3 ms por trama de 5 ms con 24
+     * fuentes). Mismas cuentas, en el mismo orden: avance = muestra * escala,
+     * ganancia = inicio + (final - inicio) * avance, producto y truncado; el
+     * A9 no tiene FMA, asi que ni el compilador ni NEON las funden.
+     */
+    {
+        static_assert(samples_per_frame % 4 == 0);
+        const float32x4_t start0 = vdupq_n_f32(ramp_start[0]);
+        const float32x4_t start1 = vdupq_n_f32(ramp_start[1]);
+        const float32x4_t start2 = vdupq_n_f32(ramp_start[2]);
+        const float32x4_t start3 = vdupq_n_f32(ramp_start[3]);
+        const float32x4_t diff0 = vdupq_n_f32(gains[0] - ramp_start[0]);
+        const float32x4_t diff1 = vdupq_n_f32(gains[1] - ramp_start[1]);
+        const float32x4_t diff2 = vdupq_n_f32(gains[2] - ramp_start[2]);
+        const float32x4_t diff3 = vdupq_n_f32(gains[3] - ramp_start[3]);
+        const int32x4_t lane = {0, 1, 2, 3};
+        const s16* in = reinterpret_cast<const s16*>(current_frame.data());
+        s32* out = reinterpret_cast<s32*>(dest.data());
+        for (std::size_t samplei = 0; samplei < samples_per_frame;
+             samplei += 4, in += 8, out += 16) {
+            const float32x4_t index =
+                vcvtq_f32_s32(vaddq_s32(vdupq_n_s32(static_cast<s32>(samplei)), lane));
+            const float32x4_t progress = vmulq_n_f32(index, ramp_scale);
+            const float32x4_t gain0 = vaddq_f32(start0, vmulq_f32(diff0, progress));
+            const float32x4_t gain1 = vaddq_f32(start1, vmulq_f32(diff1, progress));
+            const float32x4_t gain2 = vaddq_f32(start2, vmulq_f32(diff2, progress));
+            const float32x4_t gain3 = vaddq_f32(start3, vmulq_f32(diff3, progress));
+            const int16x4x2_t stereo = vld2_s16(in);
+            const float32x4_t left = vcvtq_f32_s32(vmovl_s16(stereo.val[0]));
+            const float32x4_t right = vcvtq_f32_s32(vmovl_s16(stereo.val[1]));
+            int32x4x4_t quad = vld4q_s32(out);
+            quad.val[0] = vaddq_s32(quad.val[0], vcvtq_s32_f32(vmulq_f32(gain0, left)));
+            quad.val[1] = vaddq_s32(quad.val[1], vcvtq_s32_f32(vmulq_f32(gain1, right)));
+            quad.val[2] = vaddq_s32(quad.val[2], vcvtq_s32_f32(vmulq_f32(gain2, left)));
+            quad.val[3] = vaddq_s32(quad.val[3], vcvtq_s32_f32(vmulq_f32(gain3, right)));
+            vst4q_s32(out, quad);
+        }
+    }
+#else
     for (std::size_t samplei = 0; samplei < samples_per_frame; samplei++) {
         const float progress = static_cast<float>(samplei) * ramp_scale;
         const float gain0 =
@@ -151,6 +209,7 @@ void Source::MixInto(QuadFrame32& dest, std::size_t intermediate_mix_id) {
         dest[samplei][2] += static_cast<s32>(gain2 * current_frame[samplei][0]);
         dest[samplei][3] += static_cast<s32>(gain3 * current_frame[samplei][1]);
     }
+#endif
 
     if (ramp_active) {
         state.gain_ramp_start.at(intermediate_mix_id) = gains;
@@ -488,6 +547,15 @@ void Source::GenerateFrame() {
     //
     // current_sample_number is maintained below from the exact amount of input
     // removed by AudioInterp, so the memory offset and current_buffer stay in sync.
+    const bool timing = Stats::phase_timing;
+    unsigned long long phase_at = timing ? Common::VitaMicros() : 0;
+    const auto phase = [&](unsigned long long& slot) {
+        if (timing) {
+            const unsigned long long now = Common::VitaMicros();
+            slot += now - phase_at;
+            phase_at = now;
+        }
+    };
     if (!state.current_buffer.empty() && state.current_buffer_is_looping &&
         state.current_buffer_format == Format::PCM16 &&
         state.current_buffer_physical_address != 0 &&
@@ -526,7 +594,9 @@ void Source::GenerateFrame() {
         }
     }
 
+    phase(Stats::phase_refresh_us);
     DecodeADPCMAhead(InputAhead(state.rate_multiplier, current_frame.size()));
+    phase(Stats::phase_decode_us);
     if (state.current_buffer.empty()) {
         // TODO(SachinV): Should dequeue happen at the end of the frame generation?
         if (DequeueBuffer()) {
@@ -572,6 +642,7 @@ void Source::GenerateFrame() {
         // its own fractional phase/history. Use what it actually consumed instead
         // of reconstructing the source position with a truncated float product.
         const std::size_t input_size_before = state.current_buffer.size();
+        phase(Stats::phase_decode_us);
 
         switch (state.interpolation_mode) {
         case InterpolationMode::None:
@@ -595,9 +666,14 @@ void Source::GenerateFrame() {
         const std::size_t input_size_after = state.current_buffer.size();
         ASSERT(input_size_after <= input_size_before);
         state.current_sample_number += static_cast<u32>(input_size_before - input_size_after);
+        if (timing) {
+            Stats::phase_samples_in += input_size_before - input_size_after;
+        }
+        phase(Stats::phase_interp_us);
     }
 
     state.filters.ProcessFrame(current_frame);
+    phase(Stats::phase_filter_us);
 }
 
 bool Source::DequeueBuffer() {

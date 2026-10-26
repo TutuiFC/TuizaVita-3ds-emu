@@ -667,13 +667,36 @@ void DspHle::Impl::RunMix() {
     std::array<QuadFrame32, 3> intermediate_mixes = {};
     u32 active = 0;
     mixer_where.store("fuentes", std::memory_order_relaxed);
+#ifdef __PSVITA__
+    // Ver HLE::Stats::phase_timing: una trama de cada 32, con reloj.
+    static u32 timed_ticks = 0;
+    static u32 phase_ticks = 0;
+    static unsigned long long gen_us = 0, mix_us = 0, final_us = 0, out_us = 0;
+    static u32 phase_notes = 0;
+    const bool timed = (++phase_ticks & 31u) == 0;
+    HLE::Stats::phase_timing = timed;
+    unsigned long long at = timed ? Common::VitaMicros() : 0;
+    const auto lap = [&](unsigned long long& slot) {
+        if (timed) {
+            const unsigned long long now = Common::VitaMicros();
+            slot += now - at;
+            at = now;
+        }
+    };
+#endif
     for (std::size_t i = 0; i < HLE::num_sources; i++) {
         mixer_source.store(static_cast<int>(i), std::memory_order_relaxed);
         mixer_statuses[i] = sources[i].Generate();
+#ifdef __PSVITA__
+        lap(gen_us);
+#endif
         active += mixer_statuses[i].is_enabled ? 1u : 0u;
         for (std::size_t mix = 0; mix < 3; mix++) {
             sources[i].MixInto(intermediate_mixes[mix], mix);
         }
+#ifdef __PSVITA__
+        lap(mix_us);
+#endif
     }
     HLE::Stats::ticks.fetch_add(1, std::memory_order_relaxed);
     HLE::Stats::active.fetch_add(active, std::memory_order_relaxed);
@@ -681,10 +704,40 @@ void DspHle::Impl::RunMix() {
     mixer_aux_sent = {mixers.AuxBusEnabled(0), mixers.AuxBusEnabled(1)};
     mixer_dsp_status = mixers.Mix(mixer_read_samples, mixer_write_samples, intermediate_mixes);
     mixer_frame = mixers.GetOutput();
+#ifdef __PSVITA__
+    lap(final_us);
+#endif
     mixer_where.store("salida", std::memory_order_relaxed);
     parent.OutputFrame(mixer_frame);
     mixer_where.store("libre", std::memory_order_relaxed);
 #ifdef __PSVITA__
+    lap(out_us);
+    HLE::Stats::phase_timing = false;
+    if (timed && ++timed_ticks == 63 && phase_notes < 20) {
+        // 63 tramas cronometradas = ~2000 tramas = 10 s de audio.
+        phase_notes++;
+        const double n = timed_ticks;
+        Common::VitaNote(
+            "dsp fases",
+            fmt::format("us por trama: fuentes {:.0f} (refresco {:.0f} decodificar {:.0f} "
+                        "interpolar {:.0f} filtros {:.0f}, {:.0f} muestras de entrada) "
+                        "mezclar {:.0f} final {:.0f} salida {:.0f} | interpolar: {} rapidas "
+                        "{} lentas, ritmo max {:.3f}",
+                        gen_us / n, HLE::Stats::phase_refresh_us / n,
+                        HLE::Stats::phase_decode_us / n, HLE::Stats::phase_interp_us / n,
+                        HLE::Stats::phase_filter_us / n, HLE::Stats::phase_samples_in / n,
+                        mix_us / n, final_us / n, out_us / n,
+                        HLE::Stats::interp_fast.exchange(0, std::memory_order_relaxed),
+                        HLE::Stats::interp_slow.exchange(0, std::memory_order_relaxed),
+                        HLE::Stats::interp_max_rate.exchange(0, std::memory_order_relaxed) /
+                            1000.0)
+                .c_str());
+        timed_ticks = 0;
+        gen_us = mix_us = final_us = out_us = 0;
+        HLE::Stats::phase_refresh_us = HLE::Stats::phase_decode_us = 0;
+        HLE::Stats::phase_interp_us = HLE::Stats::phase_filter_us = 0;
+        HLE::Stats::phase_samples_in = 0;
+    }
     HLE::Stats::worker_us.fetch_add(Common::VitaMicros() - begin, std::memory_order_relaxed);
 #endif
 }

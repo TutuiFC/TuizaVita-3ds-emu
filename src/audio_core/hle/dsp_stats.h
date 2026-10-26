@@ -30,4 +30,22 @@ inline std::atomic<unsigned long long> worker_us{0};
 /// Lo que el hilo de emulacion espera a que acabe esa mezcla (0.3.2.1).
 inline std::atomic<unsigned long long> wait_us{0};
 
+/**
+ * EN QUE SE VA LA MEZCLA (0.3.9.0). Zelda Ocarina of Time 3D pasa ~5 ms por
+ * cada trama de audio de 5 ms con 24 fuentes. Se cronometra una trama de
+ * cada 32 (cada lectura del reloj es una llamada al kernel) y se reparte
+ * entre las fases; RunMix lo anota cada 10 s.
+ */
+inline bool phase_timing = false;
+inline unsigned long long phase_refresh_us = 0;
+inline unsigned long long phase_decode_us = 0;
+inline unsigned long long phase_interp_us = 0;
+inline unsigned long long phase_filter_us = 0;
+inline unsigned long long phase_samples_in = 0;
+/// Llamadas a la interpolacion por la ventana contigua y por la deque (lento),
+/// y el mayor ritmo visto (en 1/1000).
+inline std::atomic<unsigned int> interp_fast{0};
+inline std::atomic<unsigned int> interp_slow{0};
+inline std::atomic<unsigned int> interp_max_rate{0};
+
 } // namespace AudioCore::HLE::Stats

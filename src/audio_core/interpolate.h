@@ -6,13 +6,16 @@
 
 #include <array>
 #include <deque>
+#include "audio_core/audio_pool.h"
 #include "audio_core/audio_types.h"
 #include "common/common_types.h"
 
 namespace AudioCore::AudioInterp {
 
 /// A variable length buffer of signed PCM16 stereo samples.
-using StereoBuffer16 = std::deque<std::array<s16, 2>>;
+/// En la Vita, con los bloques de la deque de un pool propio (0.3.9.0, ver audio_pool.h).
+using StereoBuffer16 =
+    std::deque<std::array<s16, 2>, AudioCore::PoolAllocator<std::array<s16, 2>>>;
 
 struct State {
     /// Two historical samples.
