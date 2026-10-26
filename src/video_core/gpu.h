@@ -91,6 +91,15 @@ inline std::atomic<u32> irq_waits{0};
 inline std::atomic<u32> syncs{0};
 inline std::atomic<u32> present_waits{0};
 inline std::atomic<u32> queue_max{0};
+/**
+ * DENTRO DE 'OCUPADO' (0.3.9.9). En Mario 3D Land el hilo sale ocupado un
+ * 91 % y solo gasta un 54 % de CPU: el resto esta parado dentro de algo.
+ * Presentar (SwapBuffers en el hilo de la GPU) y abrir y cerrar escenas de
+ * GXM, que son las llamadas que pueden esperar a la GPU de la consola.
+ */
+inline std::atomic<u64> present_us{0};
+inline std::atomic<u64> scene_begin_us{0};
+inline std::atomic<u64> scene_end_us{0};
 
 inline void Reset() {
     cmdlist_ns.store(0, std::memory_order_relaxed);
@@ -244,6 +253,12 @@ private:
     void QueueCommand(const Service::GSP::Command& command);
     void QueueBufferSwap(u32 screen_id, const Service::GSP::FrameBufferInfo& info);
     void QueuePresent();
+
+public:
+    /// Ver Memory::FlushMode::InvalidateOrdered (0.3.9.9).
+    void InvalidateRegionOrdered(PAddr addr, u32 size);
+
+private:
 
     friend class boost::serialization::access;
     template <class Archive>

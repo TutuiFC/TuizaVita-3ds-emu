@@ -408,12 +408,17 @@ public:
             }
 
             auto& gpu = system.GPU();
-            gpu.Sync();
-            auto& renderer = gpu.Renderer();
             VAddr overlap_start = std::max(start, region_start);
             VAddr overlap_end = std::min(end, region_end);
             PAddr physical_start = paddr_region_start + (overlap_start - region_start);
             u32 overlap_size = overlap_end - overlap_start;
+            if (mode == FlushMode::InvalidateOrdered) {
+                // Ver FlushMode::InvalidateOrdered: sin gpu.Sync().
+                gpu.InvalidateRegionOrdered(physical_start, overlap_size);
+                return;
+            }
+            gpu.Sync();
+            auto& renderer = gpu.Renderer();
 
             auto* rasterizer = renderer.Rasterizer();
             switch (mode) {
@@ -425,6 +430,8 @@ public:
                 break;
             case FlushMode::FlushAndInvalidate:
                 rasterizer->FlushAndInvalidateRegion(physical_start, overlap_size);
+                break;
+            case FlushMode::InvalidateOrdered:
                 break;
             }
         };

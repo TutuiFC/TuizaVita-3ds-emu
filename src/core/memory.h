@@ -324,6 +324,13 @@ enum class FlushMode {
     Invalidate,
     /// Write back modified surfaces to RAM, and also remove them from the cache
     FlushAndInvalidate,
+    /**
+     * Quitar la region de la cache EN ORDEN con el trabajo del hilo de la GPU,
+     * sin esperarle (0.3.9.9): para cuando la CPU acaba de escribir esa
+     * memoria. Lo encolado antes sigue viendo lo que habia; lo que se encole
+     * despues, lo nuevo. Sin hilo de la GPU es lo mismo que Invalidate.
+     */
+    InvalidateOrdered,
 };
 
 class MemorySystem {

@@ -30,6 +30,7 @@
 #include "video_core/pica/regs_rasterizer.h"
 #include "video_core/pica_types.h"
 #include "video_core/utils.h"
+#include "video_core/gpu.h"
 #include "video_core/renderer_gxm/gxm_caja_negra.h"
 #include "video_core/renderer_gxm/gxm_cg.h"
 #include "video_core/renderer_gxm/gxm_presenter.h"
@@ -81,6 +82,27 @@ std::atomic<u32> RasterizerGXM::gpu_transfers{0};
 std::atomic<u32> RasterizerGXM::transfer_materialized{0};
 std::atomic<u32> RasterizerGXM::gpu_texture_transfers{0};
 namespace {
+/// Ver VideoCore::GxStats::scene_begin_us (0.3.9.9).
+int TimedBeginScene(SceGxmContext* context, unsigned int flags,
+                    const SceGxmRenderTarget* target, const SceGxmValidRegion* region,
+                    SceGxmSyncObject* vertex_sync, SceGxmSyncObject* fragment_sync,
+                    const SceGxmColorSurface* color,
+                    const SceGxmDepthStencilSurface* depth) {
+    const unsigned long long begin = Common::VitaMicros();
+    const int rc = sceGxmBeginScene(context, flags, target, region, vertex_sync,
+                                    fragment_sync, color, depth);
+    VideoCore::GxStats::scene_begin_us.fetch_add(Common::VitaMicros() - begin,
+                                                 std::memory_order_relaxed);
+    return rc;
+}
+int TimedEndScene(SceGxmContext* context, const SceGxmNotification* vertex_done,
+                  const SceGxmNotification* fragment_done) {
+    const unsigned long long begin = Common::VitaMicros();
+    const int rc = sceGxmEndScene(context, vertex_done, fragment_done);
+    VideoCore::GxStats::scene_end_us.fetch_add(Common::VitaMicros() - begin,
+                                               std::memory_order_relaxed);
+    return rc;
+}
 /// De state_texture_us, lo de TextureFromCopy (0.2.3.1): las texturas por lote
 /// pasaron de ~11 us en 0.2.2.1 a ~46 en 0.2.2.8, y hay que saber si es eso o
 /// el cache.
@@ -3515,7 +3537,7 @@ void RasterizerGXM::EndScene() {
         SceGxmNotification done{};
         done.address = fence_address;
         done.value = fence_sent;
-        sceGxmEndScene(context, nullptr, &done);
+        TimedEndScene(context, nullptr, &done);
         BlackBox::CloseScene(fence_sent);
         open_surface->last_fence = fence_sent;
     }
@@ -4518,7 +4540,7 @@ bool RasterizerGXM::BlitToCopy(ScreenCopy& copy, Surface& source, u32 first_row,
     // Lo dibujado en la superficie se manda antes que el blit que lo lee.
     EndScene();
     const Common::ScopedVitaStage stage{"gxm copia: blit"};
-    const int rc = sceGxmBeginScene(context, 0, copy.render_target, nullptr, nullptr, nullptr,
+    const int rc = TimedBeginScene(context, 0, copy.render_target, nullptr, nullptr, nullptr,
                                     &copy.color_surface, &copy.depth_surface);
     if (rc != 0) {
         static bool noted = false;
@@ -4567,7 +4589,7 @@ bool RasterizerGXM::BlitToCopy(ScreenCopy& copy, Surface& source, u32 first_row,
     SceGxmNotification done{};
     done.address = fence_address;
     done.value = fence_sent;
-    sceGxmEndScene(context, nullptr, &done);
+    TimedEndScene(context, nullptr, &done);
     BlackBox::CloseScene(fence_sent);
     copy.fence = fence_sent;
     gpu_pending = true;
@@ -5294,7 +5316,7 @@ void RasterizerGXM::DrawClearQuad(Surface& surface) {
 void RasterizerGXM::FlushClear(Surface& surface) {
     EndScene();
     ClearDepthIfNeeded(surface);
-    if (sceGxmBeginScene(context, 0, surface.render_target, nullptr, nullptr, nullptr,
+    if (TimedBeginScene(context, 0, surface.render_target, nullptr, nullptr, nullptr,
                          &surface.color_surface, &surface.depth_surface) != 0) {
         ApplyClearOnCpu(surface);
         return;
@@ -6503,7 +6525,7 @@ bool RasterizerGXM::SetupDrawState(Surface* surface, const Entry* pipeline,
         ClearDepthIfNeeded(*surface);
         const Common::ScopedVitaStage stage{"gxm abrir escena"};
         const int scene_rc =
-            sceGxmBeginScene(context, 0, surface->render_target, nullptr, nullptr, nullptr,
+            TimedBeginScene(context, 0, surface->render_target, nullptr, nullptr, nullptr,
                              &surface->color_surface, &surface->depth_surface);
         if (scene_rc != 0) {
             // Se anota el codigo: 0x805b0007 seria "ya hay una escena abierta"

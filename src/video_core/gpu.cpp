@@ -106,6 +106,8 @@ struct GPU::AsyncWorker {
         Command,
         BufferSwap,
         Present,
+        /// Ver GPU::InvalidateRegionOrdered (0.3.9.9).
+        Invalidate,
     };
     struct Item {
         Type type = Type::Command;
@@ -116,6 +118,8 @@ struct GPU::AsyncWorker {
         /// que se toma al encolar: el nucleo emulado no se lee desde este hilo.
         std::shared_ptr<Kernel::Process> process;
         std::chrono::microseconds time_us{};
+        PAddr addr = 0;
+        u32 size = 0;
     };
 
     /// Pila explicita, para saber que direcciones son de este hilo (ver
@@ -900,12 +904,20 @@ void GPU::AsyncLoop() {
                 case AsyncWorker::Type::BufferSwap:
                     ApplyBufferSwap(item.screen_id, item.info);
                     break;
+                case AsyncWorker::Type::Invalidate:
+                    impl->renderer->Rasterizer()->InvalidateRegion(item.addr, item.size);
+                    break;
                 case AsyncWorker::Type::Present:
 #ifdef __PSVITA__
                     Common::vita_gpu_stage.store("gpu: presentar", std::memory_order_relaxed);
 #endif
                     worker.present_time_us = item.time_us;
-                    impl->renderer->SwapBuffers();
+                    {
+                        const u64 present_begin = NowUs();
+                        impl->renderer->SwapBuffers();
+                        GxStats::present_us.fetch_add(NowUs() - present_begin,
+                                                      std::memory_order_relaxed);
+                    }
                     break;
                 }
             } catch (const std::exception& e) {
@@ -1031,6 +1043,35 @@ void GPU::QueueCommand(const Service::GSP::Command& command) {
     u32 seen = GxStats::queue_max.load(std::memory_order_relaxed);
     while (depth > seen &&
            !GxStats::queue_max.compare_exchange_weak(seen, depth, std::memory_order_relaxed)) {
+    }
+}
+
+/**
+ * QUITAR DE LA CACHE SIN ESPERAR A LA GPU (0.3.9.9). Y2R hacia gpu.Sync()
+ * antes de cada conversion (RasterizerFlushVirtualRegion): esperar a que el
+ * hilo de la GPU vaciara la cola entera, hasta 17 ms por imagen de video en
+ * la intro de Kirby Triple Deluxe ("y2r:u ... 146-227 ms por segundo").
+ * Ahora la CPU escribe y la invalidacion va a la cola, detras de lo que ya
+ * habia: los lotes encolados antes ven la textura vieja, como en la consola,
+ * y los de despues la recargan de la memoria.
+ */
+void GPU::InvalidateRegionOrdered(PAddr addr, u32 size) {
+    if (!Async() || OnGpuThread()) {
+        impl->renderer->Rasterizer()->InvalidateRegion(addr, size);
+        return;
+    }
+    AsyncWorker::Item item;
+    item.type = AsyncWorker::Type::Invalidate;
+    item.addr = addr;
+    item.size = size;
+    bool wake = false;
+    {
+        std::lock_guard lock{async->mutex};
+        async->queue.push_back(std::move(item));
+        wake = async->sleeping;
+    }
+    if (wake) {
+        async->work_ready.notify_one();
     }
 }
 

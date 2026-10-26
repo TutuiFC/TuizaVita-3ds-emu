@@ -518,10 +518,12 @@ void Y2R_U::StartConversion(Kernel::HLERequestContext& ctx) {
     // dst_image_size would seem to be perfect for this, but it doesn't include the gap :(
     u32 total_output_size =
         conversion.input_lines * (conversion.dst.transfer_unit + conversion.dst.gap);
-    system.Memory().RasterizerFlushVirtualRegion(conversion.dst.address, total_output_size,
-                                                 Memory::FlushMode::FlushAndInvalidate);
-
+    // Ver GPU::InvalidateRegionOrdered (0.3.9.9): primero la conversion y despues,
+    // en la cola de la GPU, quitar la salida de la cache. Antes se vaciaba y
+    // esperaba la cola entera (FlushAndInvalidate hace gpu.Sync()).
     HW::Y2R::PerformConversion(system.Memory(), conversion);
+    system.Memory().RasterizerFlushVirtualRegion(conversion.dst.address, total_output_size,
+                                                 Memory::FlushMode::InvalidateOrdered);
 
     if (is_busy_conversion) {
         system.CoreTiming().RemoveEvent(completion_signal_event);

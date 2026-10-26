@@ -797,6 +797,21 @@ void EmuWindow_Vita::DrawStatsOverlay() {
             const double wait = static_cast<double>(
                 VideoCore::GxStats::emu_wait_us.exchange(0, std::memory_order_relaxed));
             stats_gpu_busy_percent = interval_us > 0.0 ? busy / interval_us * 100.0 : 0.0;
+            {
+                // Por fotograma del juego, como 'ocupado': ver GxStats::present_us.
+                const double per_frame = interval_us > 0.0 && stats_frame_ms > 0.0
+                                             ? stats_frame_ms / interval_us
+                                             : 0.0;
+                stats_gpu_present_ms = static_cast<double>(VideoCore::GxStats::present_us.exchange(
+                                           0, std::memory_order_relaxed)) *
+                                       per_frame;
+                stats_gpu_begin_ms = static_cast<double>(VideoCore::GxStats::scene_begin_us.exchange(
+                                         0, std::memory_order_relaxed)) *
+                                     per_frame;
+                stats_gpu_end_ms = static_cast<double>(VideoCore::GxStats::scene_end_us.exchange(
+                                       0, std::memory_order_relaxed)) *
+                                   per_frame;
+            }
             stats_gpu_wait_percent = interval_us > 0.0 ? wait / interval_us * 100.0 : 0.0;
             stats_gpu_irq_waits =
                 VideoCore::GxStats::irq_waits.exchange(0, std::memory_order_relaxed);
@@ -1469,7 +1484,9 @@ void EmuWindow_Vita::DrawStatsOverlay() {
                 Common::VitaNote(
                     "gpu hilo",
                     fmt::format("{} | ocupado {:.0f}% ({:.1f} ms/fot) | juego esperando {:.0f}% "
-                                "({:.1f} ms/fot) | esperas irq {} sinc {} pres {} | cola max {}",
+                                "({:.1f} ms/fot) | esperas irq {} sinc {} pres {} | cola max {} | "
+                                "dentro: presentar {:.1f} abrir escena {:.1f} cerrar escena "
+                                "{:.1f} ms/fot",
                                 VideoCore::GPU::async_enabled.load(std::memory_order_relaxed)
                                     ? "ON"
                                     : "off",
@@ -1478,7 +1495,8 @@ void EmuWindow_Vita::DrawStatsOverlay() {
                                 stats_gpu_wait_percent,
                                 stats_gpu_wait_percent * stats_frame_ms / 100.0,
                                 stats_gpu_irq_waits, stats_gpu_syncs, stats_gpu_present_waits,
-                                stats_gpu_queue_max)
+                                stats_gpu_queue_max, stats_gpu_present_ms, stats_gpu_begin_ms,
+                                stats_gpu_end_ms)
                         .c_str());
                 Common::VitaNote("lote fases", Gxm::RasterizerGXM::TakeBatchProfile().c_str());
                 Common::VitaNote("esperas gpu", stats_gpu_waits.c_str());
