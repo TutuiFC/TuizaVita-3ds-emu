@@ -61,14 +61,24 @@ namespace {
  * emulacion entra aqui.
  */
 constexpr u32 kSvcSample = 8;
-u32 g_svc_tick = 0;
+u32 g_svc_tick = 0x9E3779B9u; ///< estado del xorshift (no puede ser 0)
 bool g_svc_timed = true;
 } // Anonymous namespace
 #endif
 
 void PerfStats::BeginSVCProcessing() {
 #ifdef __PSVITA__
-    g_svc_timed = (++g_svc_tick % kSvcSample) == 0;
+    /**
+     * AL AZAR, NO UNA DE CADA OCHO EXACTA (0.3.9.1). Si el juego repite la misma
+     * serie de SVC en cada fotograma, la octava cae siempre en la misma -- en
+     * Pokemon X, una espera larga -- y por ocho se pasa: 'cpu' (lo que queda
+     * del fotograma) salia negativo. Con un xorshift la probabilidad es la
+     * misma, 1/8, y la estimacion no tiene sesgo.
+     */
+    g_svc_tick ^= g_svc_tick << 13;
+    g_svc_tick ^= g_svc_tick >> 17;
+    g_svc_tick ^= g_svc_tick << 5;
+    g_svc_timed = (g_svc_tick & (kSvcSample - 1)) == 0;
     if (!g_svc_timed) {
         return;
     }
