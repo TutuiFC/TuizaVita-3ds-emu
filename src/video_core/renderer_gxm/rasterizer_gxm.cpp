@@ -1354,7 +1354,13 @@ struct RasterizerGXM::PipelineCache {
      * se sigue saltando en vez de irse entero por software; pasado, se da el
      * compilador por colgado como siempre.
      */
-    static constexpr unsigned long long kAsyncFsBehindHeavyUs = 240000000;
+    /**
+     * 20 s desde 0.3.9.7 (eran 240). Con 240, en el titulo y la primera escena
+     * de Zelda Ocarina of Time 3D la pantalla de arriba estuvo en negro mas de
+     * dos minutos detras de un shader de vertices de 24 KB. Pasado esto el lote
+     * se dibuja por software: mas lento, pero se ve.
+     */
+    static constexpr unsigned long long kAsyncFsBehindHeavyUs = 20000000;
 
     struct Entry {
         /**
@@ -1779,9 +1785,11 @@ struct RasterizerGXM::PipelineCache {
                 const unsigned long long now = Common::VitaMicros();
                 const unsigned long long started =
                     pending.job->started_us.load(std::memory_order_relaxed);
-                if (started == 0 && CgWorkerOnHeavyJob() &&
-                    now - pending.job->submitted_us < kAsyncFsBehindHeavyUs) {
-                    return fail("fs compilando");
+                if (started == 0 && CgWorkerOnHeavyJob()) {
+                    // Detras de uno grande: un rato sin el, y luego por software (0.3.9.7).
+                    return fail(now - pending.job->submitted_us < kAsyncFsBehindHeavyUs
+                                    ? "fs compilando"
+                                    : "fs atascado");
                 }
                 if ((started != 0 && now - started > kAsyncFsStuckUs) ||
                     (started == 0 && now - pending.job->submitted_us > kAsyncFsQueuedUs)) {

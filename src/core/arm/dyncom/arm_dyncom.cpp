@@ -219,10 +219,17 @@ void ARM_DynCom::ExecuteInstructions(u64 num_instructions) {
     {
         u32 native_ticks = 0;
         bool then_interpreter = false;
-        // Los dos nucleos otra vez (0.3.9.0). En 0.3.8.9 solo iba el 0: con el 1,
-        // Smash Bros. acababa en su propia rutina de error, y era el pc de los
-        // fallos (ver Core::Native::TryRun), que tambien le pasaba al 0.
-        if (Core::Native::TryRun(*state, num_instructions, native_ticks, then_interpreter)) {
+        /**
+         * SOLO EL NUCLEO 0, OTRA VEZ (0.3.9.7). En 0.3.9.0 volvieron los dos tras
+         * arreglar el pc de los fallos, probado en el dialogo del arranque de
+         * Smash Bros. Pero en su demo (26-10) el juego seguia corrompiendose a los
+         * ~150 s con los dos nucleos en nativo (LR del juego = una instruccion,
+         * y el JIT cayendo al usarlo como direccion); con el 0 solo, 436 s
+         * limpios a 41 % de velocidad (56 % con los dos, 15 % sin nativo). Queda
+         * por encontrar que le pasa al nucleo 1.
+         */
+        if (GetID() == 0 &&
+            Core::Native::TryRun(*state, num_instructions, native_ticks, then_interpreter)) {
             if (timer) {
                 timer->AddTicks(native_ticks);
             }

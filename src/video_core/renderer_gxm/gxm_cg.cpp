@@ -354,6 +354,8 @@ u32 g_cache_notes = 0;
  */
 std::atomic<u32> g_start_notes{0};
 std::atomic<u32> g_time_notes{0};
+/// Cuando empezo la partida (PreloadCgCache), ver kHeavyGraceUs (0.3.9.7).
+std::atomic<unsigned long long> g_session_start_us{0};
 
 u64 Fnv1a64(const char* data, std::size_t size) {
     u64 hash = 0xCBF29CE484222325ull;
@@ -1412,6 +1414,7 @@ u32 PreloadCgCache(u64 program_id, const std::function<void(u32, u32)>& progress
     PurgeUnoptimizedPrograms();
     g_start_notes.store(0, std::memory_order_relaxed);
     g_time_notes.store(0, std::memory_order_relaxed);
+    g_session_start_us.store(Common::VitaMicros(), std::memory_order_relaxed);
     g_cache_notes = 0;
     g_mem_notes = 0;
     // Nada de lo anterior sirve para otro juego.
@@ -2002,7 +2005,18 @@ unsigned long long g_last_light_submit_us = 0;
  * con sus lotes por software a 0,5 FPS. Al entrar en una zona nueva los
  * pequenos llegan a rafagas: se deja pasar la rafaga entera antes.
  */
-constexpr unsigned long long kHeavyCalmUs = 3000000;
+constexpr unsigned long long kHeavyCalmUs = 10000000;
+/**
+ * Y NINGUNO GRANDE AL EMPEZAR LA PARTIDA (0.3.9.7). En el titulo de Zelda Ocarina of
+ * Time 3D uno de vertices de 24 KB entro en el primer hueco de calma y tuvo el
+ * compilador mas de dos minutos; los de fragmentos que llegaron detras esperaron
+ * y la pantalla de arriba salio en negro todo ese rato. En los primeros
+ * kHeavyGraceUs de cada partida solo se compilan los pequenos, salvo que el
+ * grande lleve kHeavyMaxWaitUs en la cola (que no se quede sin compilar nunca).
+ * La calma de antes de uno grande pasa de 3 a 10 s por lo mismo.
+ */
+constexpr unsigned long long kHeavyGraceUs = 60000000;
+constexpr unsigned long long kHeavyMaxWaitUs = 90000000;
 /// Justo por encima de los ayudantes y del hilo de la GPU (159).
 constexpr int kCgBoostedPriority = Common::kVitaPriorityHelper - 1;
 
@@ -2132,12 +2146,17 @@ void* CgWorkerMain(void*) {
                 if (pick != g_jobs.end()) {
                     break;
                 }
-                const unsigned long long since = Common::VitaMicros() - g_last_light_submit_us;
-                if (since >= kHeavyCalmUs) {
+                const unsigned long long now = Common::VitaMicros();
+                const unsigned long long since = now - g_last_light_submit_us;
+                const unsigned long long session =
+                    now - g_session_start_us.load(std::memory_order_relaxed);
+                const unsigned long long oldest = now - g_jobs.front()->submitted_us;
+                if ((since >= kHeavyCalmUs && session >= kHeavyGraceUs) ||
+                    oldest >= kHeavyMaxWaitUs) {
                     pick = g_jobs.begin();
                     break;
                 }
-                g_jobs_ready.wait_for(lock, std::chrono::microseconds(kHeavyCalmUs - since));
+                g_jobs_ready.wait_for(lock, std::chrono::microseconds(1000000));
             }
             job = std::move(*pick);
             g_jobs.erase(pick);
