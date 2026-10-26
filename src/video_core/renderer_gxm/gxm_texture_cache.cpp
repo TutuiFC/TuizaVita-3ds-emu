@@ -471,15 +471,6 @@ u32 TextureCache::InvalidateRange(PAddr addr, u32 size) {
      */
     for (auto& entry : entries) {
         if (entry.valid && entry.address < end && addr < entry.address + entry.span) {
-            static u32 noted = 0;
-            if ((entry.fill_tag != 0 || entry.pending_fill_tag != 0) && noted < 6) {
-                noted++;
-                Common::VitaNote("gxm textura",
-                                 fmt::format("vaciado {:#010x}+{:#x} quita la etiqueta de relleno "
-                                             "de {:#010x}+{:#x}",
-                                             addr, size, entry.address, entry.span)
-                                     .c_str());
-            }
             marked += MarkStale(entry, addr, end) ? 1u : 0u;
             entry.fill_tag = 0;
             entry.pending_fill_tag = 0;
@@ -496,26 +487,29 @@ u32 TextureCache::InvalidateFill(PAddr addr, u32 size, u32 texel, u32 bpp) {
         if (!entry.valid || entry.address >= end || addr >= entry.address + entry.span) {
             continue;
         }
-        const bool covered = entry.address >= addr && entry.address + entry.span <= end;
-        // Los bytes del patron y su fase al principio de la entrada.
-        const u64 tag = covered ? (1ull << 63) | (static_cast<u64>(texel & mask) << 8) |
-                                      (static_cast<u64>(bpp) << 4) | ((entry.address - addr) % bpp)
-                                : 0;
-        if (covered && !entry.stale && entry.fill_tag == tag) {
+        /**
+         * La etiqueta: el patron, su fase y el TRAMO de la entrada que pisa
+         * (0.3.9.2). Hasta aqui solo valia si el relleno cubria la entrada
+         * entera, y Smash Bros. borra cada fotograma su 3D de 512x400 (800 KB)
+         * encima de una textura de 512x512 en la misma direccion: revisada
+         * entera cada vez (800 KB de hash, ~2,7 ms por fotograma) para
+         * descubrir que no habia cambiado. El razonamiento no necesita que la
+         * cubra: si tras el mismo relleno la revision la encontro igual, sus
+         * bytes de ese tramo ya eran el patron, y repetirlo no cambia nada.
+         */
+        const u32 lo = addr > entry.address ? addr - entry.address : 0;
+        const u32 hi = std::min<u32>(end - entry.address, entry.span);
+        u64 tag = (static_cast<u64>(lo) << 32) ^ hi;
+        tag ^= (static_cast<u64>(texel & mask) << 24) ^ (static_cast<u64>(bpp) << 56) ^
+               (static_cast<u64>((entry.address + lo - addr) % bpp) << 60);
+        // splitmix64: que dos rellenos distintos no den la misma etiqueta.
+        tag += 0x9E3779B97F4A7C15ull;
+        tag = (tag ^ (tag >> 30)) * 0xBF58476D1CE4E5B9ull;
+        tag = (tag ^ (tag >> 27)) * 0x94D049BB133111EBull;
+        tag = (tag ^ (tag >> 31)) | (1ull << 63);
+        if (!entry.stale && entry.fill_tag == tag) {
             fill_skips.fetch_add(1, std::memory_order_relaxed);
             continue;
-        }
-        // Por que no se ahorra la revision (0.3.8.8, diagnostico): unas pocas.
-        static u32 noted = 0;
-        if (noted < 12) {
-            noted++;
-            Common::VitaNote(
-                "gxm textura",
-                fmt::format("relleno {:#010x}+{:#x} texel {:#010x} bpp {} marca {:#010x}+{:#x} "
-                            "cubierta {} vieja {} etiqueta {:#x} (esta {:#x})",
-                            addr, size, texel, bpp, entry.address, entry.span, covered ? 1 : 0,
-                            entry.stale ? 1 : 0, entry.fill_tag, tag)
-                    .c_str());
         }
         marked += MarkStale(entry, addr, end) ? 1u : 0u;
         entry.fill_tag = 0;
