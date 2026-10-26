@@ -453,6 +453,9 @@ struct UserSettings {
     bool vs_layout_cache = true;
     bool cache_pipeline = true;
     bool jit_nativo = false;
+    /// 0.3.9.8: el motor nativo tambien en el nucleo 1 (ver
+    /// Core::Native::both_cores). Experimental, solo ajustes.txt.
+    bool native_both_cores = false;
     /// 0.3.4.9: tamano maximo de un shader de vertices que se compila en partida,
     /// en KB (Gxm::RasterizerGXM::vs_compile_limit_kb). Solo ajustes.txt.
     int vs_limit_kb = 23;
@@ -586,6 +589,7 @@ void ApplyUserSettings() {
     Gxm::RasterizerGXM::cache_pipeline.store(g_user.cache_pipeline ? 1u : 0u,
                                              std::memory_order_relaxed);
     Core::Native::enabled = g_user.jit_nativo;
+    Core::Native::both_cores = g_user.native_both_cores;
     if (g_user.jit_nativo) {
         Common::VitaNote("nativo", "jit_nativo=1: se intentara ejecutar codigo del "
                                    "juego en la CPU de la consola");
@@ -676,6 +680,7 @@ void LoadUserSettings() {
     read_bool("vs_cache_disp=", g_user.vs_layout_cache);
     read_bool("cache_pipeline=", g_user.cache_pipeline);
     read_bool("jit_nativo=", g_user.jit_nativo);
+    read_bool("nativo_dos_nucleos=", g_user.native_both_cores);
     if (read_int("vs_tope_kb=", value)) {
         g_user.vs_limit_kb = std::clamp(value, 16, 40);
     }
@@ -697,7 +702,8 @@ int FormatUserSettings(char* buffer, std::size_t size) {
         "jit_superbloques=%d\njit_regs_fijos=%d\njit_vfp_fijos=%d\nvertices_ram=%d\n"
         "dsp_hilo=%d\njit_perfil=%d\nvolcado_cada=%d\ncopia_textura_gpu=%d\n"
         "jit_tabla_enlaces=%d\njit_saltos_cro=%d\njit_reusar_base=%d\nidioma_menu=%d\n"
-        "wbuffer_gpu=%d\nmemo_valor=%d\nestado_sombra=%d\nvs_tope_kb=%d\nvs_cache_disp=%d\ncache_pipeline=%d\njit_nativo=%d\n",
+        "wbuffer_gpu=%d\nmemo_valor=%d\nestado_sombra=%d\nvs_tope_kb=%d\nvs_cache_disp=%d\ncache_pipeline=%d\njit_nativo=%d\n"
+        "nativo_dos_nucleos=%d\n",
         g_user.volume_percent, g_user.language, g_user.half_resolution ? 1 : 0,
         g_user.jit_reg_cache ? 1 : 0, g_user.jit_vfp_data ? 1 : 0, g_user.gxm_no_finish ? 1 : 0,
         g_user.gxm_present_direct ? 1 : 0, g_user.jit_direct_link ? 1 : 0,
@@ -712,7 +718,8 @@ int FormatUserSettings(char* buffer, std::size_t size) {
         g_user.texture_copy_gpu ? 1 : 0, g_user.jit_link_table ? 1 : 0,
         g_user.jit_veneers ? 1 : 0, g_user.jit_reuse_base ? 1 : 0, g_user.menu_language,
         g_user.wbuffer_gpu ? 1 : 0, g_user.memo_by_value ? 1 : 0, g_user.state_shadow ? 1 : 0,
-        g_user.vs_limit_kb, g_user.vs_layout_cache ? 1 : 0, g_user.cache_pipeline ? 1 : 0, g_user.jit_nativo ? 1 : 0);
+        g_user.vs_limit_kb, g_user.vs_layout_cache ? 1 : 0, g_user.cache_pipeline ? 1 : 0, g_user.jit_nativo ? 1 : 0,
+        g_user.native_both_cores ? 1 : 0);
 }
 
 /// Los ajustes con los que se juega, a crash.txt en una linea (0.1.8.7): sin

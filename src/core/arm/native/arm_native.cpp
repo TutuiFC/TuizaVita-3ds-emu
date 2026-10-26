@@ -411,6 +411,7 @@ void CtxToState(const AzGuestCtx& ctx, ARMul_State& state) {
 } // Anonymous namespace
 
 bool enabled = false;
+bool both_cores = false;
 
 /// El resumen, sin reiniciar los contadores (lo llama tambien TryRun).
 void LogStatsNow() {
@@ -421,6 +422,21 @@ void LogStatsNow() {
          g_native_ticks, g_native_slices != 0 ? g_native_ticks / g_native_slices : 0,
          g_code_changes);
 }
+
+struct NativeSliceRecord {
+    u32 core, seq, in_pc, in_lr, in_sp, out_pc, out_lr, out_sp, cpsr, reason, entries, r0;
+};
+struct NativeRing {
+    char magic[16];
+    u32 next;
+    u32 pad[3];
+    NativeSliceRecord records[256];
+};
+NativeRing g_native_ring = {{'A', 'Z', 'N', 'A', 'T', 'I', 'V', 'O', 'A', 'N', 'I', 'L', 'L', 'O',
+                             '0', '1'},
+                            0,
+                            {0, 0, 0},
+                            {}};
 
 bool TryRun(ARMul_State& state, u64 max_instructions, u32& ticks, bool& then_interpreter) {
     then_interpreter = false;
@@ -482,7 +498,30 @@ bool TryRun(ARMul_State& state, u64 max_instructions, u32& ticks, bool& then_int
     g_native_slices++;
     const u32 pc_antes = state.Reg[15];
     const u32 lr_antes = state.Reg[14];
+    const u32 sp_antes = state.Reg[13];
     CtxToState(ctx, state);
+    /**
+     * EL ANILLO PARA LOS VOLCADOS (0.3.9.8, diagnostico). Las ultimas rodajas
+     * nativas, en una variable global con una marca al principio: si el juego
+     * cae, el volcado de la consola trae la zona de datos del programa y se
+     * puede leer fuera que hizo cada nucleo justo antes. Para el fallo del
+     * nucleo 1 en la demo de Smash Bros. (ver ARM_DynCom::ExecuteInstructions).
+     */
+    {
+        NativeSliceRecord& rec = g_native_ring.records[g_native_ring.next++ & 255u];
+        rec.core = static_cast<u32>(reinterpret_cast<uintptr_t>(&state));
+        rec.seq = g_native_slices;
+        rec.in_pc = pc_antes;
+        rec.in_lr = lr_antes;
+        rec.in_sp = sp_antes;
+        rec.out_pc = ctx.r[15];
+        rec.out_lr = ctx.r[14];
+        rec.out_sp = ctx.r[13];
+        rec.cpsr = ctx.cpsr;
+        rec.reason = ctx.reason;
+        rec.entries = info.entries;
+        rec.r0 = ctx.r[0];
+    }
     /**
      * EL SALTO FUERA DEL CODIGO (0.3.8.9, diagnostico). En Smash Bros. con el
      * motor nativo el segundo nucleo acaba ejecutando ceros por debajo de
@@ -737,6 +776,7 @@ bool DecodeSvc(Memory::MemorySystem&, u32, bool, u32&) {
     return false;
 }
 bool enabled = false;
+bool both_cores = false;
 bool TryRun(ARMul_State&, u64, u32& ticks, bool& then_interpreter) {
     then_interpreter = false;
     ticks = 0;

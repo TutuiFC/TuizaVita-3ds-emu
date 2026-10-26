@@ -210,7 +210,9 @@ void VitaNote(const char* title, const char* detail) {
     // Sin mutex a proposito: esto se llama tambien desde manejadores de fallo
     // fatal, y un candado ahi puede acabar en bloqueo si el hilo que muere ya
     // lo tenia cogido.
-    char line[768];
+    // 1536 desde 0.3.9.8: con 768 la nota de las fases de lote perdia el final
+    // ("subidas: re").
+    char line[1536];
     std::size_t n = 0;
 
     const auto append = [&](const char* text, std::size_t max_copy) {

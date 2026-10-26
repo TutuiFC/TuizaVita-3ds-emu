@@ -161,6 +161,14 @@ bool TryRun(ARMul_State& state, u64 max_instructions, u32& ticks, bool& then_int
 /// Se enciende con "jit_nativo=1" en ajustes.txt. Apagado por defecto: esto
 /// ejecuta codigo del juego de verdad en la CPU de la consola.
 extern bool enabled;
+/**
+ * Tambien el nucleo 1 (0.3.9.8, ajuste nativo_dos_nucleos=, apagado por
+ * defecto). Con los dos, la demo de Smash Bros. va de 20 a 31-34 fps, pero
+ * una de cuatro pruebas se corrompio a los ~150 s y la causa sigue sin
+ * encontrarse (ver ARM_DynCom::ExecuteInstructions). Para quien quiera
+ * probarlo sabiendo eso.
+ */
+extern bool both_cores;
 
 /// Deja en crash.txt lo que ha hecho el motor desde la ultima vez. Sin esto no
 /// hay forma de saber si esta ejecutando algo o abandonando siempre, que es

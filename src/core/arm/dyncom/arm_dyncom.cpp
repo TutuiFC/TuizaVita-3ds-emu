@@ -227,8 +227,12 @@ void ARM_DynCom::ExecuteInstructions(u64 num_instructions) {
          * y el JIT cayendo al usarlo como direccion); con el 0 solo, 436 s
          * limpios a 41 % de velocidad (56 % con los dos, 15 % sin nativo). Queda
          * por encontrar que le pasa al nucleo 1.
+         *
+         * 0.3.9.8: con nativo_dos_nucleos=1 en ajustes.txt vuelve al 1. Dos
+         * pruebas mas con un anillo de rodajas (300 y 440 s) salieron limpias a
+         * 31-34 fps: el fallo existe pero es intermitente. Apagado por defecto.
          */
-        if (GetID() == 0 &&
+        if ((GetID() == 0 || Core::Native::both_cores) &&
             Core::Native::TryRun(*state, num_instructions, native_ticks, then_interpreter)) {
             if (timer) {
                 timer->AddTicks(native_ticks);

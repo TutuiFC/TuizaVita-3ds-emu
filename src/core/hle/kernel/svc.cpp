@@ -3,6 +3,7 @@
 // Refer to the license.txt file included.
 
 #include <algorithm>
+#include <cstdio>
 #include <array>
 #include <chrono>
 #include <fmt/format.h>
@@ -663,6 +664,26 @@ Result SVC::ConnectToPort(Handle* out_handle, VAddr port_name_address) {
     return kernel.GetCurrentProcess()->handle_table.Create(out_handle, client_session);
 }
 
+#ifdef __PSVITA__
+namespace {
+/**
+ * A QUIEN VAN LOS SendSyncRequest (0.3.9.8, diagnostico). En la demo de Smash
+ * Bros. son ~500 por segundo y ~200 ms por segundo del hilo de emulacion, y
+ * los servicios HLE ("servicios:") solo explican 4 ms. Por sesion: llamadas,
+ * tiempo dentro de session->SendSyncRequest y si es HLE. Solo el hilo de
+ * emulacion entra aqui (con el cerrojo del kernel cogido).
+ */
+struct IpcCost {
+    const void* key = nullptr;
+    char name[40] = {};
+    bool hle = false;
+    u32 calls = 0;
+    unsigned long long us = 0;
+};
+std::array<IpcCost, 16> g_ipc_costs{};
+} // Anonymous namespace
+#endif
+
 /// Makes a blocking IPC call to an OS service.
 Result SVC::SendSyncRequest(Handle handle) {
     std::shared_ptr<ClientSession> session =
@@ -687,10 +708,36 @@ Result SVC::SendSyncRequest(Handle handle) {
     if (is_hle) {
         system.perf_stats->BeginIPCProcessing();
     }
+#ifdef __PSVITA__
+    const unsigned long long ipc_begin = Common::VitaMicros();
+#endif
     const auto res = session->SendSyncRequest(thread);
     if (is_hle) {
         system.perf_stats->EndIPCProcessing();
     }
+#ifdef __PSVITA__
+    {
+        const unsigned long long ipc_us = Common::VitaMicros() - ipc_begin;
+        IpcCost* slot = nullptr;
+        for (auto& cost : g_ipc_costs) {
+            if (cost.key == session.get() || cost.key == nullptr) {
+                slot = &cost;
+                break;
+            }
+        }
+        if (slot == nullptr) {
+            slot = &g_ipc_costs.back(); // lleno: lo que no quepa, al ultimo
+        }
+        if (slot->key == nullptr) {
+            slot->key = session.get();
+            slot->hle = is_hle;
+            const std::string name = session->GetName();
+            std::snprintf(slot->name, sizeof(slot->name), "%s", name.c_str());
+        }
+        slot->calls++;
+        slot->us += ipc_us;
+    }
+#endif
 #ifdef __PSVITA__
     // Si sigue corriendo es que la espera del IPC ya se ha gastado aqui (ver
     // ConsumeIpcDelay en server_session.cpp) y no ha despertado nadie mas.
@@ -2557,6 +2604,25 @@ std::string Core::TakeSvcProfile() {
                             static_cast<double>(rows[i].timed_us) * 8.0 * 1000.0 /
                                 static_cast<double>(wall),
                             static_cast<unsigned long long>(rows[i].calls) * 1000000ull / wall);
+    }
+    // Ver IpcCost: las sesiones que mas tiempo se llevan.
+    std::array<const Kernel::IpcCost*, 16> ipc{};
+    std::size_t ipc_n = 0;
+    for (const auto& cost : Kernel::g_ipc_costs) {
+        if (cost.key != nullptr && cost.calls != 0) {
+            ipc[ipc_n++] = &cost;
+        }
+    }
+    std::sort(ipc.begin(), ipc.begin() + ipc_n,
+              [](const Kernel::IpcCost* a, const Kernel::IpcCost* b) { return a->us > b->us; });
+    text += " | ipc ms por s:";
+    for (std::size_t i = 0; i < ipc_n && i < 6; i++) {
+        text += fmt::format(" {}{} {:.1f} ({}/s)", ipc[i]->name, ipc[i]->hle ? "" : " [juego]",
+                            static_cast<double>(ipc[i]->us) * 1000.0 / static_cast<double>(wall),
+                            static_cast<unsigned long long>(ipc[i]->calls) * 1000000ull / wall);
+    }
+    for (auto& cost : Kernel::g_ipc_costs) {
+        cost = {};
     }
     return text;
 }
