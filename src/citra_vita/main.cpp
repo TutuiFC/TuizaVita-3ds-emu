@@ -452,6 +452,9 @@ struct UserSettings {
     /// (Gxm::RasterizerGXM::vs_layout_cache). Solo ajustes.txt.
     bool vs_layout_cache = true;
     bool cache_pipeline = true;
+    /// 0.4.0.0: uniformes con memcpy (Gxm::RasterizerGXM::direct_uniforms).
+    /// Solo ajustes.txt.
+    bool direct_uniforms = true;
     bool jit_nativo = false;
     /// 0.3.9.8: el motor nativo tambien en el nucleo 1 (ver
     /// Core::Native::both_cores). Experimental, solo ajustes.txt.
@@ -588,6 +591,8 @@ void ApplyUserSettings() {
                                               std::memory_order_relaxed);
     Gxm::RasterizerGXM::cache_pipeline.store(g_user.cache_pipeline ? 1u : 0u,
                                              std::memory_order_relaxed);
+    Gxm::RasterizerGXM::direct_uniforms.store(g_user.direct_uniforms ? 1u : 0u,
+                                              std::memory_order_relaxed);
     Core::Native::enabled = g_user.jit_nativo;
     Core::Native::both_cores = g_user.native_both_cores;
     if (g_user.jit_nativo) {
@@ -679,6 +684,7 @@ void LoadUserSettings() {
     read_bool("memo_valor=", g_user.memo_by_value);
     read_bool("vs_cache_disp=", g_user.vs_layout_cache);
     read_bool("cache_pipeline=", g_user.cache_pipeline);
+    read_bool("uniformes_directos=", g_user.direct_uniforms);
     read_bool("jit_nativo=", g_user.jit_nativo);
     read_bool("nativo_dos_nucleos=", g_user.native_both_cores);
     if (read_int("vs_tope_kb=", value)) {
@@ -703,7 +709,7 @@ int FormatUserSettings(char* buffer, std::size_t size) {
         "dsp_hilo=%d\njit_perfil=%d\nvolcado_cada=%d\ncopia_textura_gpu=%d\n"
         "jit_tabla_enlaces=%d\njit_saltos_cro=%d\njit_reusar_base=%d\nidioma_menu=%d\n"
         "wbuffer_gpu=%d\nmemo_valor=%d\nestado_sombra=%d\nvs_tope_kb=%d\nvs_cache_disp=%d\ncache_pipeline=%d\njit_nativo=%d\n"
-        "nativo_dos_nucleos=%d\n",
+        "nativo_dos_nucleos=%d\nuniformes_directos=%d\n",
         g_user.volume_percent, g_user.language, g_user.half_resolution ? 1 : 0,
         g_user.jit_reg_cache ? 1 : 0, g_user.jit_vfp_data ? 1 : 0, g_user.gxm_no_finish ? 1 : 0,
         g_user.gxm_present_direct ? 1 : 0, g_user.jit_direct_link ? 1 : 0,
@@ -719,7 +725,7 @@ int FormatUserSettings(char* buffer, std::size_t size) {
         g_user.jit_veneers ? 1 : 0, g_user.jit_reuse_base ? 1 : 0, g_user.menu_language,
         g_user.wbuffer_gpu ? 1 : 0, g_user.memo_by_value ? 1 : 0, g_user.state_shadow ? 1 : 0,
         g_user.vs_limit_kb, g_user.vs_layout_cache ? 1 : 0, g_user.cache_pipeline ? 1 : 0, g_user.jit_nativo ? 1 : 0,
-        g_user.native_both_cores ? 1 : 0);
+        g_user.native_both_cores ? 1 : 0, g_user.direct_uniforms ? 1 : 0);
 }
 
 /// Los ajustes con los que se juega, a crash.txt en una linea (0.1.8.7): sin
@@ -2314,6 +2320,8 @@ void Run(vita2d_pgf* font) {
     VitaFrontend::HomeMenu menu(font);
     const std::vector<RomEntry> roms = ScanRoms();
     menu.SetGames(roms);
+    // Ver Gxm::RunCgBenchIfAny (0.4.0.0): solo con banco_cg/hacer.txt.
+    Gxm::RunCgBenchIfAny();
     RunPilotIfAny(font, roms);
     // Las caratulas que falten, en otro hilo (0.3.4.1). Ver vita_covers.h.
     std::vector<std::string> rom_paths;

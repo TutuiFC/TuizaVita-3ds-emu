@@ -18,6 +18,12 @@
 
 namespace Kernel {
 
+#ifdef __PSVITA__
+/// Ver ServerSession::HandleSyncRequest (0.4.0.0): las fases de una peticion
+/// a un servicio HLE, en us por llamada, para crash.txt. Pone a cero.
+std::string TakeIpcPhaseText();
+#endif
+
 class ClientSession;
 class ClientPort;
 class ServerSession;

@@ -302,7 +302,12 @@ add_link_options(
 # Y antes de subirla, comprobar cuanto ha crecido de verdad el codigo: pasar
 # texture_decode.cpp y etc1.cpp a -O3 parecia que pedia megabytes y resulto que
 # engordo el binario 1.296 bytes.
-add_link_options(-Wl,--section-start=.init_array=0x81600000)
+#
+# Segunda subida, en 0.4.0.0: con las medidas del hilo de la GPU, el banco
+# del compilador y los uniformes directos, .ARM.exidx acababa 5.924 bytes
+# DENTRO de 0x81600000 y el enlazador se negaba ("overlaps section"). Un
+# mega mas, a 0x81700000: ~1 MB menos de heap, con ~88 MB libres en partida.
+add_link_options(-Wl,--section-start=.init_array=0x81700000)
 
 # La Vita necesita threads POSIX reales; newlib los trae via -lpthread.
 find_package(Threads QUIET)

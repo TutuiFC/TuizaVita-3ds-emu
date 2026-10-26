@@ -395,6 +395,10 @@ private:
     double stats_gpu_busy_percent = 0.0;
     /// Ver VideoCore::GxStats::present_us (0.3.9.9), en ms por fotograma.
     double stats_gpu_present_ms = 0.0;
+    /// Ver VideoCore::GxStats::present_flush_us (0.4.0.0).
+    double stats_gpu_flush_ms = 0.0;
+    double stats_gpu_fence_ms = 0.0;
+    double stats_gpu_writeback_ms = 0.0;
     double stats_gpu_begin_ms = 0.0;
     double stats_gpu_end_ms = 0.0;
     double stats_gpu_wait_percent = 0.0;

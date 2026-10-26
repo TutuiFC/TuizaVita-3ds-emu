@@ -2504,6 +2504,9 @@ struct SvcCost {
 std::array<SvcCost, 128> g_svc_costs{};
 u32 g_svc_profile_tick = 0;
 unsigned long long g_svc_profile_since = 0;
+/// Esperando al cerrojo del kernel HLE, en las SVC cronometradas (0.4.0.0):
+/// lo cogen tambien otros hilos (las interrupciones del DSP).
+std::atomic<u64> g_hle_lock_us{0};
 } // Anonymous namespace
 #endif
 
@@ -2537,7 +2540,15 @@ void SVC::CallSVC(u32 immediate) {
 #endif
 
     // Lock the kernel mutex when we enter the kernel HLE.
+#ifdef __PSVITA__
+    const unsigned long long lock_begin = profiled ? Common::VitaMicros() : 0;
+#endif
     std::scoped_lock lock{kernel.GetHLELock()};
+#ifdef __PSVITA__
+    if (profiled) {
+        g_hle_lock_us.fetch_add(Common::VitaMicros() - lock_begin, std::memory_order_relaxed);
+    }
+#endif
 
     DEBUG_ASSERT_MSG(kernel.GetCurrentProcess()->status == ProcessStatus::Running,
                      "Running threads from exiting processes is unimplemented");
@@ -2624,6 +2635,10 @@ std::string Core::TakeSvcProfile() {
     for (auto& cost : Kernel::g_ipc_costs) {
         cost = {};
     }
+    text += " | " + Kernel::TakeIpcPhaseText();
+    text += fmt::format(" | cerrojo hle {:.1f} ms por s",
+                        static_cast<double>(Kernel::g_hle_lock_us.exchange(0)) * 8.0 * 1000.0 /
+                            static_cast<double>(wall));
     return text;
 }
 #endif

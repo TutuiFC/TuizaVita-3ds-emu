@@ -4,7 +4,9 @@
 
 #include "video_core/renderer_gxm/renderer_gxm.h"
 
+#include "common/vita_diag.h"
 #include "core/core.h"
+#include "video_core/gpu.h"
 
 namespace Gxm {
 
@@ -20,7 +22,10 @@ void RendererGXM::SwapBuffers() {
     // de que PrepareRenderTarget (y el frontend) lean los framebuffers: si no,
     // se presentaria la imagen anterior. Las superficies que el presentador lee
     // directamente por una copia de pantalla en la GPU no se vuelcan (0.1.8.6).
+    const unsigned long long flush_begin = Common::VitaMicros();
     rasterizer.FlushForPresent();
+    VideoCore::GxStats::present_flush_us.fetch_add(Common::VitaMicros() - flush_begin,
+                                                   std::memory_order_relaxed);
 
     // El fotograma lo produce el camino de software completo (salto de
     // fotogramas incluido). La diferencia con el renderer de software esta

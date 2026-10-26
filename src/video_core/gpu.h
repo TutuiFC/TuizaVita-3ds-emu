@@ -98,6 +98,16 @@ inline std::atomic<u32> queue_max{0};
  * GXM, que son las llamadas que pueden esperar a la GPU de la consola.
  */
 inline std::atomic<u64> present_us{0};
+/**
+ * PRESENTAR POR PARTES (0.4.0.0). En Mario 3D Land "presentar" son 13-16 ms
+ * de cada fotograma del hilo de la GPU. FlushForPresent: esperar a la valla
+ * de hace tres fotogramas y volcar a la memoria del invitado las superficies
+ * que tocan (cada volcado_cada presentaciones); el resto de 'presentar' es
+ * dibujar las pantallas de la Vita y entregarlas (vita2d).
+ */
+inline std::atomic<u64> present_flush_us{0};
+inline std::atomic<u64> present_fence_us{0};
+inline std::atomic<u64> present_writeback_us{0};
 inline std::atomic<u64> scene_begin_us{0};
 inline std::atomic<u64> scene_end_us{0};
 

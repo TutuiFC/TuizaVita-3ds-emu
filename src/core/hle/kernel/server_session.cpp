@@ -14,6 +14,9 @@
 #include "core/hle/kernel/session.h"
 #include "core/hle/kernel/thread.h"
 #ifdef __PSVITA__
+#include <atomic>
+#include <fmt/format.h>
+#include "common/vita_diag.h"
 #include "core/arm/arm_interface.h"
 #include "core/core_timing.h"
 #endif
@@ -92,6 +95,35 @@ namespace {
  * que pasaria es exactamente esto: el nucleo ocioso hasta que el hilo despierta
  * con la respuesta. Asi que se gasta ese tiempo en el contador y el hilo sigue.
  */
+/**
+ * LAS FASES DE UNA PETICION HLE (0.4.0.0, diagnostico). En Kirby's Extra Epic
+ * Yarn cada SendSyncRequest a gsp::Gpu cuesta ~81 us (ipc ms por s) y el
+ * servicio en si ~27 (servicios:). Una de cada ocho peticiones se cronometra
+ * por partes para ver donde se va el resto.
+ */
+constexpr u32 kIpcPhases = 6;
+std::array<std::atomic<u64>, kIpcPhases> g_ipc_phase_us{};
+std::atomic<u32> g_ipc_phase_samples{0};
+u32 g_ipc_phase_tick = 0;
+
+struct IpcPhases {
+    bool timed;
+    unsigned long long mark = timed ? Common::VitaMicros() : 0;
+    void Mark(u32 phase) {
+        if (timed) {
+            const unsigned long long now = Common::VitaMicros();
+            g_ipc_phase_us[phase].fetch_add(now - mark, std::memory_order_relaxed);
+            mark = now;
+        }
+    }
+    ~IpcPhases() {
+        if (timed) {
+            Mark(kIpcPhases - 1);
+            g_ipc_phase_samples.fetch_add(1, std::memory_order_relaxed);
+        }
+    }
+};
+
 bool ConsumeIpcDelay(KernelSystem& kernel, u64 delay_ns) {
     if (kernel.current_cpu == nullptr || kernel.GetCurrentThreadManager().HaveReadyThreads()) {
         return false;
@@ -105,9 +137,32 @@ bool ConsumeIpcDelay(KernelSystem& kernel, u64 delay_ns) {
     return true;
 }
 } // Anonymous namespace
+
+std::string TakeIpcPhaseText() {
+    const u32 samples = g_ipc_phase_samples.exchange(0, std::memory_order_relaxed);
+    std::array<double, kIpcPhases> us{};
+    for (u32 i = 0; i < kIpcPhases; i++) {
+        us[i] = static_cast<double>(g_ipc_phase_us[i].exchange(0, std::memory_order_relaxed)) /
+                (samples != 0 ? samples : 1);
+    }
+    /* Lo que cuesta leer el reloj, para descontarlo: cada fase lleva una
+     * lectura (una llamada al kernel). */
+    const unsigned long long clock_begin = Common::VitaMicros();
+    for (u32 i = 0; i < 15; i++) {
+        (void)Common::VitaMicros();
+    }
+    const double clock_us = static_cast<double>(Common::VitaMicros() - clock_begin) / 16.0;
+    return fmt::format("ipc fases us por llamada: leer {:.1f} contexto {:.1f} servicio {:.1f} "
+                       "escribir {:.1f} soltar {:.1f} final {:.1f} ({} muestras, reloj {:.2f} us "
+                       "por lectura)",
+                       us[0], us[1], us[2], us[3], us[4], us[5], samples, clock_us);
+}
 #endif
 
 Result ServerSession::HandleSyncRequest(std::shared_ptr<Thread> thread) {
+#ifdef __PSVITA__
+    IpcPhases phases{hle_handler != nullptr && (++g_ipc_phase_tick & 7u) == 0};
+#endif
     // The ServerSession received a sync request, this means that there's new data available
     // from its ClientSession, so wake up any threads that may be waiting on a svcReplyAndReceive or
     // similar.
@@ -119,12 +174,21 @@ Result ServerSession::HandleSyncRequest(std::shared_ptr<Thread> thread) {
         ASSERT(current_process);
         kernel.memory.ReadBlock(*current_process, thread->GetCommandBufferAddress(), cmd_buf.data(),
                                 cmd_buf.size() * sizeof(u32));
+#ifdef __PSVITA__
+        phases.Mark(0);
+#endif
 
         auto context =
             std::make_shared<Kernel::HLERequestContext>(kernel, SharedFrom(this), thread);
         context->PopulateFromIncomingCommandBuffer(cmd_buf.data(), current_process);
+#ifdef __PSVITA__
+        phases.Mark(1);
+#endif
 
         hle_handler->HandleSyncRequest(*context);
+#ifdef __PSVITA__
+        phases.Mark(2);
+#endif
 
         ASSERT(thread->status == Kernel::ThreadStatus::Running ||
                thread->status == Kernel::ThreadStatus::WaitHleEvent);
@@ -136,7 +200,13 @@ Result ServerSession::HandleSyncRequest(std::shared_ptr<Thread> thread) {
             kernel.memory.WriteBlock(*current_process, thread->GetCommandBufferAddress(),
                                      cmd_buf.data(), cmd_buf.size() * sizeof(u32));
         }
+#ifdef __PSVITA__
+        phases.Mark(3);
+#endif
     }
+#ifdef __PSVITA__
+    phases.Mark(4); // el contexto y el proceso, soltados al cerrar el bloque
+#endif
 
     if (thread->status == ThreadStatus::Running) {
 #ifdef __PSVITA__

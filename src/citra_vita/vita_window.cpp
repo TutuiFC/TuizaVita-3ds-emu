@@ -811,6 +811,18 @@ void EmuWindow_Vita::DrawStatsOverlay() {
                 stats_gpu_end_ms = static_cast<double>(VideoCore::GxStats::scene_end_us.exchange(
                                        0, std::memory_order_relaxed)) *
                                    per_frame;
+                stats_gpu_flush_ms = static_cast<double>(
+                                         VideoCore::GxStats::present_flush_us.exchange(
+                                             0, std::memory_order_relaxed)) *
+                                     per_frame;
+                stats_gpu_fence_ms = static_cast<double>(
+                                         VideoCore::GxStats::present_fence_us.exchange(
+                                             0, std::memory_order_relaxed)) *
+                                     per_frame;
+                stats_gpu_writeback_ms =
+                    static_cast<double>(VideoCore::GxStats::present_writeback_us.exchange(
+                        0, std::memory_order_relaxed)) *
+                    per_frame;
             }
             stats_gpu_wait_percent = interval_us > 0.0 ? wait / interval_us * 100.0 : 0.0;
             stats_gpu_irq_waits =
@@ -1486,7 +1498,8 @@ void EmuWindow_Vita::DrawStatsOverlay() {
                     fmt::format("{} | ocupado {:.0f}% ({:.1f} ms/fot) | juego esperando {:.0f}% "
                                 "({:.1f} ms/fot) | esperas irq {} sinc {} pres {} | cola max {} | "
                                 "dentro: presentar {:.1f} abrir escena {:.1f} cerrar escena "
-                                "{:.1f} ms/fot",
+                                "{:.1f} ms/fot | presentar por partes: preparar {:.1f} (valla "
+                                "{:.1f} volcar {:.1f}) pantallas {:.1f} ms/fot",
                                 VideoCore::GPU::async_enabled.load(std::memory_order_relaxed)
                                     ? "ON"
                                     : "off",
@@ -1496,7 +1509,9 @@ void EmuWindow_Vita::DrawStatsOverlay() {
                                 stats_gpu_wait_percent * stats_frame_ms / 100.0,
                                 stats_gpu_irq_waits, stats_gpu_syncs, stats_gpu_present_waits,
                                 stats_gpu_queue_max, stats_gpu_present_ms, stats_gpu_begin_ms,
-                                stats_gpu_end_ms)
+                                stats_gpu_end_ms, stats_gpu_flush_ms, stats_gpu_fence_ms,
+                                stats_gpu_writeback_ms,
+                                stats_gpu_present_ms - stats_gpu_flush_ms)
                         .c_str());
                 Common::VitaNote("lote fases", Gxm::RasterizerGXM::TakeBatchProfile().c_str());
                 Common::VitaNote("esperas gpu", stats_gpu_waits.c_str());

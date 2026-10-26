@@ -245,6 +245,12 @@ public:
      */
     static std::atomic<u32> cache_pipeline;
     /**
+     * Uniformes copiados directamente al buffer de GXM en vez de con
+     * sceGxmSetUniformDataF (0.4.0.0, ver PutUniform). Clave
+     * "uniformes_directos=" de ajustes.txt, a 0 lo apaga.
+     */
+    static std::atomic<u32> direct_uniforms;
+    /**
      * Tamano maximo, en KB de Cg, de un shader de vertices que se compila en
      * partida (0.3.4.9). Estaba fijo en 23: un programa de mas (26 KB, la piel
      * de los Pokemon de Zafiro Alfa) se quedaba SIEMPRE en la CPU, 88-92 ms de

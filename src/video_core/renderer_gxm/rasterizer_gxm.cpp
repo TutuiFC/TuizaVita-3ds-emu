@@ -75,6 +75,7 @@ std::atomic<u32> RasterizerGXM::wbuffer_on_gpu{1};
 std::atomic<u32> RasterizerGXM::memo_by_value{1};
 std::atomic<u32> RasterizerGXM::vs_layout_cache{1};
 std::atomic<u32> RasterizerGXM::cache_pipeline{1};
+std::atomic<u32> RasterizerGXM::direct_uniforms{1};
 std::atomic<u32> RasterizerGXM::vs_compile_limit_kb{23};
 std::atomic<u32> RasterizerGXM::state_shadow_enabled{1};
 std::atomic<u32> RasterizerGXM::resolution_scale{2};
@@ -124,6 +125,34 @@ unsigned long long g_copy_calls = 0;
  * la GPU), copiar los flujos de vertices, rebasar los indices, y los bytes
  * copiados. Son 46-53 us por lote en Zafiro, Smash y Pokemon X.
  */
+/**
+ * LO DE ANTES DE RESERVAR (0.4.0.0). En Mario 3D Land la fase "datos" son
+ * ~36 us por lote y sus partes medidas (reservar, copiar, indices) solo
+ * ~12: el resto es lo que va entre phase(2) y la reserva -- comprobar los
+ * flujos, hallar la superficie, cerrar la escena si cambia y subir las
+ * tablas de luz --, que no se cronometraba.
+ */
+/**
+ * UNIFORMES Y DIBUJO POR PARTES (0.4.0.0). En Mario 3D Land, de los ~41 us
+ * de "estado" solo 11 son escena y texturas: el resto va despues, en la
+ * tabla de luz y los uniformes de fragmentos (luces, niebla, colores: una
+ * docena de sceGxmSetUniformDataF por lote). Y "uniforms" junta los flujos,
+ * los uniformes de vertices, la caja negra y sceGxmDraw.
+ */
+unsigned long long g_fs_uniforms_us = 0;
+unsigned long long g_draw_streams_us = 0;
+unsigned long long g_draw_vs_uniforms_us = 0;
+unsigned long long g_draw_blackbox_us = 0;
+unsigned long long g_draw_call_us = 0;
+u32 g_draw_parts_samples = 0;
+unsigned long long g_pre_check_us = 0;
+unsigned long long g_pre_surface_us = 0;
+unsigned long long g_pre_endscene_us = 0;
+unsigned long long g_pre_lut_us = 0;
+unsigned long long g_pre_misc_us = 0;
+u32 g_pre_samples = 0;
+u32 g_pre_endscenes = 0;
+u32 g_pre_luts = 0;
 unsigned long long g_data_reserve_us = 0;
 unsigned long long g_data_copy_us = 0;
 unsigned long long g_data_index_us = 0;
@@ -1343,6 +1372,69 @@ void CopyTiledGuest(u8* guest, u8* linear, u32 width, u32 height, u32 linear_str
 
 } // Anonymous namespace
 
+namespace {
+/**
+ * UNIFORMES SIN LA LIBRERIA (0.4.0.0). Cada lote rellenaba los uniformes de
+ * fragmentos con hasta una docena de sceGxmSetUniformDataF (luces, niebla,
+ * colores) y los de vertices con cinco. Para un parametro F32 la libreria
+ * solo copia los floats a su sitio del buffer, y ese sitio no cambia: se
+ * averigua UNA vez al crear el programa, escribiendo con la propia libreria
+ * en un buffer de prueba y mirando donde caen. Si caen seguidos y tal cual,
+ * el lote copia con memcpy; si no (otro tipo, huecos, fuera del buffer de
+ * prueba), ese parametro sigue por la libreria.
+ */
+struct UniformSlot {
+    /// En floats desde el principio del buffer por defecto; -1: la libreria.
+    s16 offset = -1;
+};
+
+UniformSlot ProbeUniform(const SceGxmProgramParameter* param, u32 count) {
+    UniformSlot slot;
+    if (param == nullptr || count == 0 || count > 512 ||
+        sceGxmProgramParameterGetType(param) != SCE_GXM_PARAMETER_TYPE_F32) {
+        return slot;
+    }
+    constexpr u32 kProbeFloats = 4096;
+    constexpr u32 kSentinel = 0x7FBADBADu;
+    static u32 probe[kProbeFloats];
+    static float values[512];
+    for (u32 i = 0; i < kProbeFloats; i++) {
+        probe[i] = kSentinel;
+    }
+    for (u32 i = 0; i < count; i++) {
+        values[i] = 1.0f + static_cast<float>(i);
+    }
+    if (sceGxmSetUniformDataF(probe, param, 0, count, values) != 0) {
+        return slot;
+    }
+    u32 first = 0;
+    while (first < kProbeFloats && probe[first] == kSentinel) {
+        first++;
+    }
+    if (first + count > kProbeFloats || first > 0x7FFFu ||
+        std::memcmp(&probe[first], values, count * sizeof(float)) != 0) {
+        return slot;
+    }
+    for (u32 i = first + count; i < kProbeFloats; i++) {
+        if (probe[i] != kSentinel) {
+            return slot;
+        }
+    }
+    slot.offset = static_cast<s16>(first);
+    return slot;
+}
+
+inline void PutUniform(void* buffer, const SceGxmProgramParameter* param, UniformSlot slot,
+                       u32 count, const float* data) {
+    if (slot.offset >= 0 &&
+        RasterizerGXM::direct_uniforms.load(std::memory_order_relaxed) != 0) {
+        std::memcpy(static_cast<float*>(buffer) + slot.offset, data, count * sizeof(float));
+        return;
+    }
+    sceGxmSetUniformDataF(buffer, param, 0, count, data);
+}
+} // Anonymous namespace
+
 /**
  * Cache de programas de fragmentos: uno por configuracion TEV y mezcla.
  *
@@ -1429,6 +1521,12 @@ struct RasterizerGXM::PipelineCache {
         const SceGxmProgramParameter* light_spot_direction = nullptr;
         const SceGxmProgramParameter* light_dist_atten = nullptr;
         const SceGxmProgramParameter* lighting_global_ambient = nullptr;
+        /// Ver PutUniform (0.4.0.0).
+        UniformSlot const_color_slot, combiner_buffer_color_slot, alphatest_ref_slot,
+            blend_const_alpha_slot, blend_const_color_slot, fog_lut_slot, fog_color_slot,
+            tex_border_color_slot, light_specular_0_slot, light_specular_1_slot,
+            light_diffuse_slot, light_ambient_slot, light_position_slot,
+            light_spot_direction_slot, light_dist_atten_slot, lighting_global_ambient_slot;
         const SceShaccCgCompileOutput* output = nullptr;
         SceGxmShaderPatcherId id{};
         bool registered = false;
@@ -2009,6 +2107,22 @@ struct RasterizerGXM::PipelineCache {
         entry->light_dist_atten = sceGxmProgramFindParameterByName(gxp, "light_dist_atten");
         entry->lighting_global_ambient =
             sceGxmProgramFindParameterByName(gxp, "lighting_global_ambient");
+        entry->const_color_slot = ProbeUniform(entry->const_color, 24);
+        entry->combiner_buffer_color_slot = ProbeUniform(entry->combiner_buffer_color, 4);
+        entry->alphatest_ref_slot = ProbeUniform(entry->alphatest_ref, 1);
+        entry->blend_const_alpha_slot = ProbeUniform(entry->blend_const_alpha, 1);
+        entry->blend_const_color_slot = ProbeUniform(entry->blend_const_color, 3);
+        entry->fog_lut_slot = ProbeUniform(entry->fog_lut, 256);
+        entry->fog_color_slot = ProbeUniform(entry->fog_color, 3);
+        entry->tex_border_color_slot = ProbeUniform(entry->tex_border_color, 12);
+        entry->light_specular_0_slot = ProbeUniform(entry->light_specular_0, 32);
+        entry->light_specular_1_slot = ProbeUniform(entry->light_specular_1, 32);
+        entry->light_diffuse_slot = ProbeUniform(entry->light_diffuse, 32);
+        entry->light_ambient_slot = ProbeUniform(entry->light_ambient, 32);
+        entry->light_position_slot = ProbeUniform(entry->light_position, 32);
+        entry->light_spot_direction_slot = ProbeUniform(entry->light_spot_direction, 32);
+        entry->light_dist_atten_slot = ProbeUniform(entry->light_dist_atten, 32);
+        entry->lighting_global_ambient_slot = ProbeUniform(entry->lighting_global_ambient, 4);
         for (u32 i = 0; i < 3; i++) {
             entry->sampler_units[i] =
                 entry->samplers[i] != nullptr
@@ -2272,6 +2386,9 @@ struct RasterizerGXM::HwShaderCache {
         const SceGxmProgramParameter* uniform_default = nullptr;
         /// "vs_wbuf": solo en los programas hechos para W-buffer (0.3.4.2).
         const SceGxmProgramParameter* uniform_wbuf = nullptr;
+        /// Ver PutUniform (0.4.0.0).
+        UniformSlot uniform_f_slot, uniform_i_slot, uniform_b_slot, uniform_default_slot,
+            uniform_wbuf_slot;
         /// "vs_in<registro>", o null si el programa no lee ese registro de un
         /// flujo (lo elimina el compilador o sale de otro sitio).
         std::array<const SceGxmProgramParameter*, 16> inputs{};
@@ -2692,6 +2809,11 @@ private:
         program.uniform_b = sceGxmProgramFindParameterByName(program.gxp, "vs_b");
         program.uniform_default = sceGxmProgramFindParameterByName(program.gxp, "vs_default");
         program.uniform_wbuf = sceGxmProgramFindParameterByName(program.gxp, "vs_wbuf");
+        program.uniform_f_slot = ProbeUniform(program.uniform_f, 96 * 4);
+        program.uniform_i_slot = ProbeUniform(program.uniform_i, 16);
+        program.uniform_b_slot = ProbeUniform(program.uniform_b, 16);
+        program.uniform_default_slot = ProbeUniform(program.uniform_default, 16 * 4);
+        program.uniform_wbuf_slot = ProbeUniform(program.uniform_wbuf, 2);
         for (u32 reg = 0; reg < 16; reg++) {
             const std::string name = fmt::format("vs_in{}", reg);
             program.inputs[reg] = sceGxmProgramFindParameterByName(program.gxp, name.c_str());
@@ -5638,6 +5760,7 @@ void RasterizerGXM::FlushForPresent() {
      * fotograma mas de margen deja solapar la CPU con la GPU.
      */
     const u32 older = present_fences[2];
+    const unsigned long long fence_begin = Common::VitaMicros();
     if (presents_seen >= 3) {
         if (older != 0) {
             WaitFence(older, GpuWait::Frame);
@@ -5646,6 +5769,9 @@ void RasterizerGXM::FlushForPresent() {
             WaitGpu(GpuWait::Frame);
         }
     }
+    const unsigned long long fence_end = Common::VitaMicros();
+    VideoCore::GxStats::present_fence_us.fetch_add(fence_end - fence_begin,
+                                                   std::memory_order_relaxed);
     present_fences[2] = present_fences[1];
     present_fences[1] = present_fences[0];
     present_fences[0] = frame_first_fence;
@@ -5681,6 +5807,8 @@ void RasterizerGXM::FlushForPresent() {
             WriteBack(*surface, kWritebackPresent);
         }
     }
+    VideoCore::GxStats::present_writeback_us.fetch_add(Common::VitaMicros() - fence_end,
+                                                       std::memory_order_relaxed);
 }
 
 RasterizerGXM::Surface* RasterizerGXM::CurrentSurface() {
@@ -6839,7 +6967,9 @@ bool RasterizerGXM::SetupDrawState(Surface* surface, const Entry* pipeline,
         }
     }
     if (timed) {
-        state_texture_us += Common::VitaMicros() - mark;
+        const unsigned long long now = Common::VitaMicros();
+        state_texture_us += now - mark;
+        mark = now;
     }
     if (pipeline->lighting_lut != nullptr) {
         // La version vigente: ver UpdateLightingLut.
@@ -6876,22 +7006,25 @@ bool RasterizerGXM::SetupDrawState(Surface* surface, const Entry* pipeline,
                 }
                 memo.colors_dirty = false;
             }
-            sceGxmSetUniformDataF(uniform_buffer, pipeline->const_color, 0, 24,
-                                  memo.const_colors.data());
+            PutUniform(uniform_buffer, pipeline->const_color, pipeline->const_color_slot, 24,
+                       memo.const_colors.data());
         }
         if (pipeline->combiner_buffer_color != nullptr) {
             const auto raw = pica.regs.internal.texturing.tev_combiner_buffer_color;
             const f32 color[4] = {static_cast<f32>(raw.r) / 255.0f, static_cast<f32>(raw.g) / 255.0f,
                                   static_cast<f32>(raw.b) / 255.0f, static_cast<f32>(raw.a) / 255.0f};
-            sceGxmSetUniformDataF(uniform_buffer, pipeline->combiner_buffer_color, 0, 4, color);
+            PutUniform(uniform_buffer, pipeline->combiner_buffer_color,
+                       pipeline->combiner_buffer_color_slot, 4, color);
         }
         if (pipeline->alphatest_ref != nullptr) {
             const f32 reference = static_cast<f32>(merger.alpha_test.ref);
-            sceGxmSetUniformDataF(uniform_buffer, pipeline->alphatest_ref, 0, 1, &reference);
+            PutUniform(uniform_buffer, pipeline->alphatest_ref, pipeline->alphatest_ref_slot, 1,
+                       &reference);
         }
         if (pipeline->blend_const_alpha != nullptr) {
             const f32 constant = static_cast<f32>(merger.blend_const.a) / 255.0f;
-            sceGxmSetUniformDataF(uniform_buffer, pipeline->blend_const_alpha, 0, 1, &constant);
+            PutUniform(uniform_buffer, pipeline->blend_const_alpha,
+                       pipeline->blend_const_alpha_slot, 1, &constant);
         }
         if (pipeline->blend_const_color != nullptr) {
             const auto& constant = merger.blend_const;
@@ -6900,7 +7033,8 @@ bool RasterizerGXM::SetupDrawState(Surface* surface, const Entry* pipeline,
                 return static_cast<f32>(inverted ? 255u - value : value) / 255.0f;
             };
             const f32 color[3] = {channel(constant.r), channel(constant.g), channel(constant.b)};
-            sceGxmSetUniformDataF(uniform_buffer, pipeline->blend_const_color, 0, 3, color);
+            PutUniform(uniform_buffer, pipeline->blend_const_color,
+                       pipeline->blend_const_color_slot, 3, color);
         }
         if (pipeline->fog_lut != nullptr) {
             // 128 entradas de dos floats: valor y pendiente (misma LUT que usa
@@ -6913,14 +7047,15 @@ bool RasterizerGXM::SetupDrawState(Surface* surface, const Entry* pipeline,
                 }
                 memo.fog_dirty = false;
             }
-            sceGxmSetUniformDataF(uniform_buffer, pipeline->fog_lut, 0, 256, memo.fog_lut.data());
+            PutUniform(uniform_buffer, pipeline->fog_lut, pipeline->fog_lut_slot, 256,
+                       memo.fog_lut.data());
         }
         if (pipeline->fog_color != nullptr) {
             const auto& fog = pica.regs.internal.texturing.fog_color;
             const f32 color[4] = {static_cast<f32>(fog.r) / 255.0f,
                                   static_cast<f32>(fog.g) / 255.0f,
                                   static_cast<f32>(fog.b) / 255.0f, 1.0f};
-            sceGxmSetUniformDataF(uniform_buffer, pipeline->fog_color, 0, 3, color);
+            PutUniform(uniform_buffer, pipeline->fog_color, pipeline->fog_color_slot, 3, color);
         }
         if (pipeline->tex_border_color != nullptr) {
             /**
@@ -6942,7 +7077,8 @@ bool RasterizerGXM::SetupDrawState(Surface* surface, const Entry* pipeline,
                 borders[i * 4 + 2] = static_cast<f32>((raw >> 16) & 0xFF) / 255.0f;
                 borders[i * 4 + 3] = static_cast<f32>((raw >> 24) & 0xFF) / 255.0f;
             }
-            sceGxmSetUniformDataF(uniform_buffer, pipeline->tex_border_color, 0, 12, borders);
+            PutUniform(uniform_buffer, pipeline->tex_border_color,
+                       pipeline->tex_border_color_slot, 12, borders);
         }
         if (pipeline->lit) {
             /**
@@ -6991,22 +7127,24 @@ bool RasterizerGXM::SetupDrawState(Surface* surface, const Entry* pipeline,
                 put_color(lighting_regs.global_ambient, memo.global_ambient.data());
                 memo.lights_dirty = false;
             }
-            const auto put = [&](const SceGxmProgramParameter* param,
+            const auto put = [&](const SceGxmProgramParameter* param, UniformSlot slot,
                                  const std::array<f32, 32>& values) {
                 if (param != nullptr) {
-                    sceGxmSetUniformDataF(uniform_buffer, param, 0, 32, values.data());
+                    PutUniform(uniform_buffer, param, slot, 32, values.data());
                 }
             };
-            put(pipeline->light_specular_0, memo.specular_0);
-            put(pipeline->light_specular_1, memo.specular_1);
-            put(pipeline->light_diffuse, memo.diffuse);
-            put(pipeline->light_ambient, memo.ambient);
-            put(pipeline->light_position, memo.position);
-            put(pipeline->light_spot_direction, memo.spot_direction);
-            put(pipeline->light_dist_atten, memo.dist_atten);
+            put(pipeline->light_specular_0, pipeline->light_specular_0_slot, memo.specular_0);
+            put(pipeline->light_specular_1, pipeline->light_specular_1_slot, memo.specular_1);
+            put(pipeline->light_diffuse, pipeline->light_diffuse_slot, memo.diffuse);
+            put(pipeline->light_ambient, pipeline->light_ambient_slot, memo.ambient);
+            put(pipeline->light_position, pipeline->light_position_slot, memo.position);
+            put(pipeline->light_spot_direction, pipeline->light_spot_direction_slot,
+                memo.spot_direction);
+            put(pipeline->light_dist_atten, pipeline->light_dist_atten_slot, memo.dist_atten);
             if (pipeline->lighting_global_ambient != nullptr) {
-                sceGxmSetUniformDataF(uniform_buffer, pipeline->lighting_global_ambient, 0, 4,
-                                      memo.global_ambient.data());
+                PutUniform(uniform_buffer, pipeline->lighting_global_ambient,
+                           pipeline->lighting_global_ambient_slot, 4,
+                           memo.global_ambient.data());
             }
         }
     } else {
@@ -7018,6 +7156,9 @@ bool RasterizerGXM::SetupDrawState(Surface* surface, const Entry* pipeline,
         static bool noted_fs_uniforms = false;
         NoteOnce(noted_fs_uniforms, "gxm fs",
                  "sin buffer de uniformes de fragmentos: el lote se dibuja sin ellos");
+    }
+    if (timed) {
+        g_fs_uniforms_us += Common::VitaMicros() - mark;
     }
 
     return true;
@@ -8081,6 +8222,14 @@ bool RasterizerGXM::AccelerateDrawBatch(bool is_indexed) {
         g_vs_part_samples++;
     }
     phase(2);
+    unsigned long long pre_mark = profile ? Common::VitaMicros() : 0;
+    const auto pre_lap = [&](unsigned long long& slot) {
+        if (profile) {
+            const unsigned long long now = Common::VitaMicros();
+            slot += now - pre_mark;
+            pre_mark = now;
+        }
+    };
     const VSInputs& inputs = layout.inputs;
     const auto& input_attribute = layout.input_attribute;
     const HwShaderCache::Program* const program = layout.program;
@@ -8121,21 +8270,27 @@ bool RasterizerGXM::AccelerateDrawBatch(bool is_indexed) {
     }
     const u32 index_bytes = is_indexed ? ((num_vertices * 2u + 15u) & ~15u) : 0u;
     total_bytes += index_bytes;
+    pre_lap(g_pre_check_us);
 
     Surface* surface = CurrentSurface();
     if (surface == nullptr) {
         return HwVsReject("superficie");
     }
+    pre_lap(g_pre_surface_us);
 
     // ---- 2. El trabajo. A partir de aqui solo quedan fallos de GXM ----
 
     if (open_surface != nullptr && open_surface != surface) {
         EndScene();
+        g_pre_endscenes += profile ? 1 : 0;
     }
+    pre_lap(g_pre_endscene_us);
     // Sin espera a la GPU desde 0.1.9.4: ver DrawBatchOnGpu.
+    g_pre_luts += profile && pipeline->lighting_lut != nullptr && pica.lighting.lut_dirty != 0;
     if (pipeline->lighting_lut != nullptr && !UpdateLightingLut()) {
         return HwVsReject("tablas luz");
     }
+    pre_lap(g_pre_lut_us);
     if (index_capacity == 0) {
         Allocation buffer = Allocate(Pool::Host, kMaxVerticesPerDraw * sizeof(u16));
         if (!buffer.Valid()) {
@@ -8148,6 +8303,8 @@ bool RasterizerGXM::AccelerateDrawBatch(bool is_indexed) {
             sequential[i] = static_cast<u16>(i);
         }
     }
+    pre_lap(g_pre_misc_us);
+    g_pre_samples += profile ? 1 : 0;
     unsigned long long data_mark = profile ? Common::VitaMicros() : 0;
     const auto data_lap = [&](unsigned long long& slot) {
         if (profile) {
@@ -8296,9 +8453,18 @@ bool RasterizerGXM::AccelerateDrawBatch(bool is_indexed) {
         return HwVsReject("estado");
     }
     phase(4);
+    unsigned long long draw_mark = profile ? Common::VitaMicros() : 0;
+    const auto draw_lap = [&](unsigned long long& slot) {
+        if (profile) {
+            const unsigned long long now = Common::VitaMicros();
+            slot += now - draw_mark;
+            draw_mark = now;
+        }
+    };
     for (u32 stream = 0; stream < stream_count; stream++) {
         sceGxmSetVertexStream(context, stream, stream_data[stream]);
     }
+    draw_lap(g_draw_streams_us);
 
     /**
      * Los uniforms de la PICA, tal cual: los flotantes son floats de 32 bits
@@ -8326,8 +8492,8 @@ bool RasterizerGXM::AccelerateDrawBatch(bool is_indexed) {
         const auto& uniforms = pica.vs_setup.uniforms;
         if (program->uniform_f != nullptr) {
             static_assert(sizeof(uniforms.f) == 96 * 4 * sizeof(float));
-            sceGxmSetUniformDataF(vertex_uniforms, program->uniform_f, 0, 96 * 4,
-                                  reinterpret_cast<const float*>(uniforms.f.data()));
+            PutUniform(vertex_uniforms, program->uniform_f, program->uniform_f_slot, 96 * 4,
+                       reinterpret_cast<const float*>(uniforms.f.data()));
         }
         if (program->uniform_i != nullptr) {
             float ints[16];
@@ -8337,14 +8503,14 @@ bool RasterizerGXM::AccelerateDrawBatch(bool is_indexed) {
                 ints[i * 4 + 2] = static_cast<float>(uniforms.i[i].z);
                 ints[i * 4 + 3] = static_cast<float>(uniforms.i[i].w);
             }
-            sceGxmSetUniformDataF(vertex_uniforms, program->uniform_i, 0, 16, ints);
+            PutUniform(vertex_uniforms, program->uniform_i, program->uniform_i_slot, 16, ints);
         }
         if (program->uniform_b != nullptr) {
             float bools[16];
             for (u32 i = 0; i < 16; i++) {
                 bools[i] = uniforms.b[i] ? 1.0f : 0.0f;
             }
-            sceGxmSetUniformDataF(vertex_uniforms, program->uniform_b, 0, 16, bools);
+            PutUniform(vertex_uniforms, program->uniform_b, program->uniform_b_slot, 16, bools);
         }
         if (program->uniform_default != nullptr) {
             float defaults[16 * 4]{};
@@ -8358,16 +8524,19 @@ bool RasterizerGXM::AccelerateDrawBatch(bool is_indexed) {
                 defaults[reg * 4 + 2] = value.z.ToFloat32();
                 defaults[reg * 4 + 3] = value.w.ToFloat32();
             }
-            sceGxmSetUniformDataF(vertex_uniforms, program->uniform_default, 0, 16 * 4, defaults);
+            PutUniform(vertex_uniforms, program->uniform_default, program->uniform_default_slot,
+                       16 * 4, defaults);
         }
         if (program->uniform_wbuf != nullptr) {
             const auto& depth = regs.rasterizer;
             const float wbuf[2] = {
                 Pica::f24::FromRaw(depth.viewport_depth_range).ToFloat32(),
                 Pica::f24::FromRaw(depth.viewport_depth_near_plane).ToFloat32()};
-            sceGxmSetUniformDataF(vertex_uniforms, program->uniform_wbuf, 0, 2, wbuf);
+            PutUniform(vertex_uniforms, program->uniform_wbuf, program->uniform_wbuf_slot, 2,
+                       wbuf);
         }
     }
+    draw_lap(g_draw_vs_uniforms_us);
 
     {
         BlackBox::DrawInfo info;
@@ -8385,8 +8554,11 @@ bool RasterizerGXM::AccelerateDrawBatch(bool is_indexed) {
         }
         BlackBox::Record(info);
     }
+    draw_lap(g_draw_blackbox_us);
     const int rc = sceGxmDraw(context, primitive, SCE_GXM_INDEX_FORMAT_U16, draw_indices,
                               num_vertices);
+    draw_lap(g_draw_call_us);
+    g_draw_parts_samples += profile ? 1 : 0;
     if (rc < 0) {
         // Estado ya puesto pero nada dibujado: la ruta de la CPU lo repite.
         static bool noted_draw = false;
@@ -8555,6 +8727,27 @@ std::string RasterizerGXM::TakeBatchProfile() {
         g_vs_part_samples == 0
             ? 0.0
             : static_cast<double>(g_vs_build_part_us) / g_vs_part_samples);
+    {
+        const double n = g_pre_samples == 0 ? 1.0 : static_cast<double>(g_pre_samples);
+        text += fmt::format("\ndatos antes de reservar: us por lote: comprobar {:.1f} superficie "
+                            "{:.1f} cerrar escena {:.1f} ({} de {}) luz {:.1f} ({} subidas) "
+                            "resto {:.1f}",
+                            g_pre_check_us / n, g_pre_surface_us / n, g_pre_endscene_us / n,
+                            g_pre_endscenes, g_pre_samples, g_pre_lut_us / n, g_pre_luts,
+                            g_pre_misc_us / n);
+        const double m = g_draw_parts_samples == 0 ? 1.0 : static_cast<double>(g_draw_parts_samples);
+        text += fmt::format("\nestado y dibujo por partes: us por lote: uniformes fs {:.1f} | "
+                            "flujos {:.1f} uniformes vs {:.1f} caja negra {:.1f} sceGxmDraw {:.1f}",
+                            g_fs_uniforms_us / m, g_draw_streams_us / m,
+                            g_draw_vs_uniforms_us / m, g_draw_blackbox_us / m,
+                            g_draw_call_us / m);
+        g_fs_uniforms_us = g_draw_streams_us = g_draw_vs_uniforms_us = 0;
+        g_draw_blackbox_us = g_draw_call_us = 0;
+        g_draw_parts_samples = 0;
+        g_pre_check_us = g_pre_surface_us = g_pre_endscene_us = g_pre_lut_us = 0;
+        g_pre_misc_us = 0;
+        g_pre_samples = g_pre_endscenes = g_pre_luts = 0;
+    }
     text += fmt::format("\nsubidas: repetidas {} de {} ({} KB de {} KB)", g_upload_repeats,
                         g_upload_streams, g_upload_repeat_bytes / 1024, g_upload_bytes / 1024);
     g_data_reserve_us = 0;

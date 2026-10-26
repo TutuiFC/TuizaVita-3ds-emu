@@ -8,6 +8,7 @@
 #include <array>
 #include <chrono>
 #include <condition_variable>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <deque>
@@ -2287,6 +2288,135 @@ bool CgWorkerOnHeavyJob() {
 CgActivity GetCgActivity() {
     return CgActivity{g_worker_busy_since.load(std::memory_order_relaxed),
                       g_jobs_queued.load(std::memory_order_relaxed)};
+}
+
+namespace {
+/// Una compilacion del banco: sin cache, sin marcas, sin lista negra.
+std::string BenchCompile(bool vertex, const std::string& source, int opt, int fastmath,
+                         int fastprecision, int fastint, int nostdlib) {
+    if (!EnsureCgReady()) {
+        return "sin compilador";
+    }
+    const std::lock_guard lock{g_cg_mutex};
+    g_alloc_calls = 0;
+    g_alloc_total = 0;
+    g_alloc_reused = 0;
+    g_source.fileName = "banco.cg";
+    g_source.text = source.c_str();
+    g_source.size = static_cast<SceUInt32>(source.size());
+    SceShaccCgCompileOptions options{};
+    sceShaccCgInitializeCompileOptions(&options);
+    options.mainSourceFile = "banco.cg";
+    options.targetProfile = vertex ? SCE_SHACCCG_PROFILE_VP : SCE_SHACCCG_PROFILE_FP;
+    options.entryFunctionName = "main";
+    if (opt >= 0) {
+        options.optimizationLevel = opt;
+    }
+    options.useFastmath = fastmath;
+    options.useFastprecision = fastprecision;
+    options.useFastint = fastint;
+    options.noStdlib = nostdlib;
+    SceKernelThreadInfo before{};
+    before.size = sizeof(before);
+    sceKernelGetThreadInfo(sceKernelGetThreadId(), &before);
+    g_compile_budget = FreeHeap() - kEmulatorReserve;
+    g_compile_bytes = 0;
+    g_compile_over_budget = false;
+    const unsigned long long begin = Common::VitaMicros();
+    g_tracking = true;
+    const SceShaccCgCompileOutput* output = sceShaccCgCompileProgram(&options, &g_callbacks, 0);
+    g_tracking = false;
+    const unsigned long long wall_ms = (Common::VitaMicros() - begin) / 1000;
+    FlushSmallFree();
+    g_compile_budget = static_cast<std::size_t>(-1);
+    SceKernelThreadInfo after{};
+    after.size = sizeof(after);
+    sceKernelGetThreadInfo(sceKernelGetThreadId(), &after);
+    std::string diagnostic = "-";
+    bool internal = false;
+    if (output != nullptr) {
+        for (int i = 0; i < output->diagnosticCount; i++) {
+            const char* message = output->diagnostics[i].message;
+            if (message == nullptr) {
+                continue;
+            }
+            internal = internal || std::strstr(message, "internal error") != nullptr;
+            if (diagnostic == "-") {
+                diagnostic = message;
+            }
+        }
+    }
+    const bool ok = output != nullptr && output->programData != nullptr;
+    const std::string text = fmt::format(
+        "{} | reloj {} ms, CPU {} ms | {} bytes de binario | {} reservas, {} MB pedidos | {}",
+        ok ? "OK" : "FALLO", wall_ms, (after.runClocks - before.runClocks) / 1000,
+        ok ? output->programSize : 0, g_alloc_calls, g_alloc_total >> 20, diagnostic);
+    if (output != nullptr) {
+        sceShaccCgDestroyCompileOutput(output);
+    }
+    if (internal) {
+        RecoverFromInternalError();
+    }
+    return text;
+}
+} // Anonymous namespace
+
+void RunCgBenchIfAny() {
+    static constexpr char kDir[] = "ux0:/data/azahar/banco_cg/";
+    const std::string order_path = std::string(kDir) + "hacer.txt";
+    std::FILE* order = std::fopen(order_path.c_str(), "r");
+    if (order == nullptr) {
+        return;
+    }
+    std::vector<std::string> lines;
+    char line[512];
+    while (std::fgets(line, sizeof(line), order) != nullptr) {
+        std::string text = line;
+        while (!text.empty() && (text.back() == '\n' || text.back() == '\r')) {
+            text.pop_back();
+        }
+        if (!text.empty() && text[0] != '#') {
+            lines.push_back(text);
+        }
+    }
+    std::fclose(order);
+    std::remove(order_path.c_str());
+    Common::VitaNote("banco cg", fmt::format("{} compilaciones", lines.size()).c_str());
+    std::FILE* out = std::fopen((std::string(kDir) + "resultados.txt").c_str(), "a");
+    // Que no la pare nadie: el banco es lo unico que corre.
+    sceKernelChangeThreadPriority(sceKernelGetThreadId(), 64);
+    for (const std::string& spec : lines) {
+        char file[256] = {};
+        char profile[8] = {};
+        int opt = -1, fastmath = 0, fastprecision = 0, fastint = 0, nostdlib = 0;
+        std::sscanf(spec.c_str(), "%255s %7s O=%d fastmath=%d fastprecision=%d fastint=%d "
+                                  "nostdlib=%d",
+                    file, profile, &opt, &fastmath, &fastprecision, &fastint, &nostdlib);
+        std::string source;
+        if (std::FILE* in = std::fopen((std::string(kDir) + file).c_str(), "rb")) {
+            char chunk[4096];
+            std::size_t got = 0;
+            while ((got = std::fread(chunk, 1, sizeof(chunk), in)) > 0) {
+                source.append(chunk, got);
+            }
+            std::fclose(in);
+        }
+        const std::string result =
+            source.empty() ? std::string("no se pudo leer")
+                           : BenchCompile(std::strcmp(profile, "fp") != 0, source, opt,
+                                          fastmath, fastprecision, fastint, nostdlib);
+        Common::VitaNote("banco cg", fmt::format("{} -> {}", spec, result).c_str());
+        if (out != nullptr) {
+            std::fprintf(out, "%s -> %s\n", spec.c_str(), result.c_str());
+            std::fflush(out);
+        }
+    }
+    if (out != nullptr) {
+        std::fprintf(out, "== fin\n");
+        std::fclose(out);
+    }
+    sceKernelDelayThread(1000 * 1000);
+    sceKernelExitProcess(0);
 }
 
 } // namespace Gxm

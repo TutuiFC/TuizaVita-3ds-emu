@@ -27,6 +27,15 @@ namespace Gxm {
  */
 bool EnsureCgReady();
 
+/**
+ * BANCO DEL COMPILADOR (0.4.0.0). Si existe ux0:/data/azahar/banco_cg/hacer.txt,
+ * compila lo que pide cada linea ("fichero.cg vp|fp O=n fastmath=n
+ * fastprecision=n fastint=n nostdlib=n"), apunta tiempo de reloj y de CPU en
+ * banco_cg/resultados.txt, borra hacer.txt y cierra Azahar. Para probar desde
+ * el PC que forma del Cg compila mas deprisa sin tener que jugar.
+ */
+void RunCgBenchIfAny();
+
 /// Estado corto para el overlay y crash.txt.
 const char* CgStatus();
 

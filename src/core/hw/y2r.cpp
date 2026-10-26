@@ -19,8 +19,99 @@
 #include "core/hle/service/cam/y2r_u.h"
 #include "core/hw/y2r.h"
 #include "core/memory.h"
+#ifdef __PSVITA__
+#include <fmt/format.h>
+#include "common/vita_diag.h"
+#endif
 
 namespace HW::Y2R {
+
+using namespace Service::Y2R;
+
+#ifdef __PSVITA__
+namespace {
+/**
+ * DONDE SE VAN LOS ~10 MS DE CADA IMAGEN (0.4.0.0, diagnostico). En la intro
+ * de Kirby Triple Deluxe, ya sin esperar a la GPU (0.3.9.9), StartConversion
+ * sigue costando 9-12 ms por imagen, unas cinco veces lo que deberia con la
+ * conversion en NEON. La configuracion de cada tipo de imagen una vez, y las
+ * fases de una de cada cuatro conversiones, sumadas y escritas cada 64. Solo
+ * el hilo de emulacion convierte, asi que basta con globales sueltas.
+ */
+unsigned long long g_phase_total[4] = {};
+unsigned long long g_phase_now[4] = {};
+unsigned long long g_phase_mark = 0;
+bool g_phase_timed = false;
+u32 g_phase_samples = 0;
+u32 g_phase_tick = 0;
+u32 g_seen[8] = {};
+u32 g_seen_count = 0;
+
+/// Cierra la fase 'index' (0 recibir, 1 convertir, 2 colocar, 3 enviar).
+void Phase(u32 index) {
+    if (g_phase_timed) {
+        const unsigned long long now = Common::VitaMicros();
+        g_phase_now[index] += now - g_phase_mark;
+        g_phase_mark = now;
+    }
+}
+
+void NoteConfig(const ConversionConfiguration& cvt) {
+    const u32 key = cvt.input_line_width | (u32{cvt.input_lines} << 12) |
+                    (static_cast<u32>(cvt.input_format) << 24) |
+                    (static_cast<u32>(cvt.output_format) << 27) |
+                    (static_cast<u32>(cvt.rotation) << 29) |
+                    (static_cast<u32>(cvt.block_alignment) << 31);
+    for (u32 i = 0; i < g_seen_count; i++) {
+        if (g_seen[i] == key) {
+            return;
+        }
+    }
+    if (g_seen_count == 8) {
+        return;
+    }
+    g_seen[g_seen_count++] = key;
+    Common::VitaNote(
+        "y2r",
+        fmt::format("{}x{} entrada {} salida {} giro {} bloques8x8 {} | origen Y {:#010x} "
+                    "(unidad {} hueco {}) YUYV {:#010x} | destino {:#010x} (unidad {} hueco {})",
+                    cvt.input_line_width, cvt.input_lines,
+                    static_cast<u32>(cvt.input_format), static_cast<u32>(cvt.output_format),
+                    static_cast<u32>(cvt.rotation),
+                    cvt.block_alignment == BlockAlignment::Block8x8 ? 1 : 0,
+                    cvt.src_Y.address, cvt.src_Y.transfer_unit, cvt.src_Y.gap,
+                    cvt.src_YUYV.address, cvt.dst.address, cvt.dst.transfer_unit,
+                    cvt.dst.gap)
+            .c_str());
+}
+
+struct PhaseReport {
+    ~PhaseReport() {
+        if (!g_phase_timed) {
+            return;
+        }
+        Phase(3);
+        g_phase_timed = false;
+        for (u32 i = 0; i < 4; i++) {
+            g_phase_total[i] += g_phase_now[i];
+            g_phase_now[i] = 0;
+        }
+        if (++g_phase_samples < 64) {
+            return;
+        }
+        Common::VitaNote("y2r", fmt::format("us por imagen: recibir {} convertir {} colocar {} "
+                                             "enviar {} (64 muestras)",
+                                             g_phase_total[0] / 64, g_phase_total[1] / 64,
+                                             g_phase_total[2] / 64, g_phase_total[3] / 64)
+                                     .c_str());
+        for (u32 i = 0; i < 4; i++) {
+            g_phase_total[i] = 0;
+        }
+        g_phase_samples = 0;
+    }
+};
+} // Anonymous namespace
+#endif
 
 using namespace Service::Y2R;
 
@@ -169,6 +260,14 @@ template <InputFormat input_format>
 static void ConvertYUV(const u8* input_Y, const u8* input_U, const u8* input_V, ImageTile output[],
                        unsigned int width, unsigned int height,
                        const CoefficientSet& coefficients) {
+#ifdef __PSVITA__
+    Phase(0); // ReceiveData acaba de traer la franja
+    struct EndConvert {
+        ~EndConvert() {
+            Phase(1);
+        }
+    } const end_convert;
+#endif
 #if defined(__ARM_NEON)
     ConvertYUVToRGBNeon<input_format>(input_Y, input_U, input_V, output, width, height,
                                       coefficients);
@@ -441,6 +540,12 @@ MICROPROFILE_DEFINE(Y2R_PerformConversion, "Y2R", "PerformConversion", MP_RGB(18
  */
 void PerformConversion(Memory::MemorySystem& memory, ConversionConfiguration cvt) {
     MICROPROFILE_SCOPE(Y2R_PerformConversion);
+#ifdef __PSVITA__
+    NoteConfig(cvt);
+    g_phase_timed = (++g_phase_tick & 3u) == 0;
+    g_phase_mark = g_phase_timed ? Common::VitaMicros() : 0;
+    const PhaseReport phase_report;
+#endif
 
     ASSERT(cvt.input_line_width % 8 == 0);
     ASSERT(cvt.block_alignment != BlockAlignment::Block8x8 || cvt.input_lines % 8 == 0);
@@ -472,6 +577,9 @@ void PerformConversion(Memory::MemorySystem& memory, ConversionConfiguration cvt
         // Total size in pixels of incoming data required for this strip.
         const std::size_t row_data_size = row_height * cvt.input_line_width;
 
+#ifdef __PSVITA__
+        Phase(3); // lo de antes de la franja cuenta como enviar (la anterior)
+#endif
         u8* input_Y = data_buffer.get();
         u8* input_U = input_Y + 8 * cvt.input_line_width;
         u8* input_V = input_U + 8 * cvt.input_line_width / 2;
@@ -573,6 +681,9 @@ void PerformConversion(Memory::MemorySystem& memory, ConversionConfiguration cvt
             }
         }
 
+#ifdef __PSVITA__
+        Phase(2);
+#endif
         switch (cvt.output_format) {
         case OutputFormat::RGBA8:
             SendData<OutputFormat::RGBA8>(memory, reinterpret_cast<u32*>(data_buffer.get()),
