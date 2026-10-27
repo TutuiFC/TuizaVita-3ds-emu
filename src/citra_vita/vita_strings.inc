@@ -135,6 +135,10 @@ TR(kSetLabel18, "Asynchronous shaders", "Shaders asíncronos", "Shaders asíncro
    "Shaders asynchrones", "Asynchrone Shader", "Shader asincroni", "Shaders assíncronos")
 TR(kSetLabel19, "Graphics engine", "Motor gráfico", "Motor gràfic", "Moteur graphique",
    "Grafik-Engine", "Motore grafico", "Motor gráfico")
+TR(kSetLabel20, "Native engine (experimental)", "Motor nativo (experimental)",
+   "Motor natiu (experimental)", "Moteur natif (expérimental)",
+   "Nativer Kern (experimentell)", "Motore nativo (sperimentale)",
+   "Motor nativo (experimental)")
 
 // Tres lineas de ayuda por fila: que hace, que se gana, que se pierde.
 TR(kSetHelp0a,
@@ -583,6 +587,30 @@ TR(kSetHelp19c,
    "Gilt beim Spielstart. Wird nicht gespeichert: nach Neustart wieder GXM.",
    "Si applica all'avvio del gioco. Non si salva: torna a GXM riaprendo l'app.",
    "Aplicado ao iniciar o jogo. Não é salvo: volta ao GXM ao reabrir o app.")
+TR(kSetHelp20a,
+   "Runs the game's code directly on the Vita CPU, with a kernel module (aznative).",
+   "Ejecuta el código del juego directamente en la CPU de la Vita, con un módulo de kernel.",
+   "Executa el codi del joc directament a la CPU de la Vita, amb un mòdul de kernel.",
+   "Exécute le code du jeu directement sur le CPU de la Vita, avec un module noyau.",
+   "Führt den Spielcode direkt auf der Vita-CPU aus, mit einem Kernel-Modul.",
+   "Esegue il codice del gioco direttamente sulla CPU della Vita, con un modulo kernel.",
+   "Executa o código do jogo direto na CPU do Vita, com um módulo de kernel.")
+TR(kSetHelp20b,
+   "Much faster in CPU-heavy games. Needs 'Enable unsafe homebrew' in HENkaku.",
+   "Mucho más rápido en juegos que tiran de CPU. Requiere 'Enable unsafe homebrew' en HENkaku.",
+   "Molt més ràpid en jocs que exigeixen CPU. Cal 'Enable unsafe homebrew' a HENkaku.",
+   "Bien plus rapide dans les jeux gourmands en CPU. Exige 'Enable unsafe homebrew'.",
+   "Viel schneller in CPU-lastigen Spielen. Braucht 'Enable unsafe homebrew' in HENkaku.",
+   "Molto più veloce nei giochi pesanti per la CPU. Serve 'Enable unsafe homebrew'.",
+   "Muito mais rápido em jogos pesados de CPU. Requer 'Enable unsafe homebrew' no HENkaku.")
+TR(kSetHelp20c,
+   "EXPERIMENTAL: if a game crashes or freezes, turn it OFF. The app restarts to load it.",
+   "EXPERIMENTAL: si un juego se cuelga o se cierra, apágalo. La app se reinicia para cargarlo.",
+   "EXPERIMENTAL: si un joc es penja o es tanca, apaga'l. L'app es reinicia per carregar-lo.",
+   "EXPÉRIMENTAL : si un jeu plante, désactivez-le. L'app redémarre pour le charger.",
+   "EXPERIMENTELL: Wenn ein Spiel abstürzt, AUS stellen. Die App startet zum Laden neu.",
+   "SPERIMENTALE: se un gioco si blocca, spegnilo. L'app si riavvia per caricarlo.",
+   "EXPERIMENTAL: se um jogo travar, desligue. O app reinicia para carregá-lo.")
 
 // Valores de algunas filas.
 TR(kValUnlimited, "Unlimited", "Sin límite", "Sense límit", "Illimitée", "Unbegrenzt",

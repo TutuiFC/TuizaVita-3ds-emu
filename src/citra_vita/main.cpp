@@ -813,12 +813,14 @@ void SaveUserSettings() {
     sceIoClose(fd);
 }
 
-constexpr int kSettingsRows = 20;
+// 21 desde 0.4.2.1: el motor nativo (experimental) tiene su fila.
+constexpr int kSettingsRows = 21;
 
 void DrawSettings(vita2d_pgf* font, int row) {
     constexpr int kFirstY = 100;
-    // 16 desde la fila 19 (0.2.1.1): con mas la ultima pisaba la ayuda.
-    constexpr int kRowStep = 16;
+    // 16 desde la fila 19 (0.2.1.1): con mas la ultima pisaba la ayuda. 15
+    // desde la 20 (0.4.2.1), por lo mismo.
+    constexpr int kRowStep = 15;
     constexpr int kValueX = 330;
 
     vita2d_start_drawing();
@@ -849,7 +851,8 @@ void DrawSettings(vita2d_pgf* font, int row) {
         g_user.unlimited_speed ? T(I18n::kValUnlimited) : T(I18n::kValRefresh),
         g_user.gpu_scale == 4 ? T(I18n::kVal2x) : g_user.gpu_scale == 1 ? "0.5x" : "1x",
         g_user.async_shaders ? "ON" : "OFF",
-        gxm ? "GXM" : T(I18n::kValSoftware)};
+        gxm ? "GXM" : T(I18n::kValSoftware),
+        g_user.jit_nativo ? "ON" : "OFF"};
 
     for (int i = 0; i < kSettingsRows; i++) {
         const int y = kFirstY + i * kRowStep;
@@ -889,7 +892,14 @@ void DrawSettings(vita2d_pgf* font, int row) {
 
 /// La ventana de ajustes. Vuelve al cerrarla, con los ajustes aplicados y
 /// guardados.
+/// Los argumentos de main(), para Core::Native::LoadModuleIfMissing (aqui desde
+/// 0.4.2.1: tambien los usa la ventana de ajustes).
+int g_argc = 0;
+char** g_argv = nullptr;
+
 void RunSettingsMenu(vita2d_pgf* font) {
+    // Para cargar el modulo del motor nativo si se enciende aqui (0.4.2.1).
+    const bool native_before = g_user.jit_nativo;
     // L+R en partida cambia la resolucion sin pasar por aqui: partir del valor
     // real, no del ultimo que se guardo.
     g_user.half_resolution =
@@ -994,6 +1004,9 @@ void RunSettingsMenu(vita2d_pgf* font) {
             case 18:
                 g_user.async_shaders = !g_user.async_shaders;
                 break;
+            case 20:
+                g_user.jit_nativo = !g_user.jit_nativo;
+                break;
             case 19: {
                 // Motor grafico del siguiente juego (antes, SELECT en el menu de
                 // inicio). El renderer se construye en System::Load.
@@ -1016,6 +1029,11 @@ void RunSettingsMenu(vita2d_pgf* font) {
     ApplyUserSettings();
     SaveUserSettings();
     NoteUserSettings();
+    if (g_user.jit_nativo && !native_before) {
+        // Recien encendido: el modulo se carga ya (y la app se relanza si hace
+        // falta, con los ajustes ya guardados), no al proximo arranque.
+        Core::Native::LoadModuleIfMissing(g_argc, g_argv);
+    }
 }
 
 /// "Cargando shaders" con barra de progreso, antes de empezar el juego (0.2.0.4).
@@ -2316,9 +2334,7 @@ void StartKeepAwake() {
     pthread_attr_destroy(&attr);
 }
 
-/// Los argumentos de main(), para Core::Native::LoadModuleIfMissing.
-int g_argc = 0;
-char** g_argv = nullptr;
+// g_argc y g_argv: ver antes de RunSettingsMenu.
 
 /// Cuerpo real del programa. main() lo envuelve para poder enseñar por pantalla
 /// cualquier excepcion en vez de morir con un abort() mudo.

@@ -192,4 +192,8 @@ vita_create_vpk(azahar.vpk ${VITA_TITLEID} azahar.self
     FILE ${CMAKE_CURRENT_SOURCE_DIR}/livearea/bg.png sce_sys/livearea/contents/bg.png
     FILE ${CMAKE_CURRENT_SOURCE_DIR}/livearea/startup.png sce_sys/livearea/contents/startup.png
     FILE ${CMAKE_CURRENT_SOURCE_DIR}/livearea/template.xml sce_sys/livearea/contents/template.xml
+    # El modulo de kernel del motor nativo (0.4.2.1, version 0x00130000): queda en
+    # ux0:app/AZHR00001/aznative.skprx, que es donde LoadModuleIfMissing lo busca
+    # primero. Fuente: Azaharvita2versiones/nativo/kernel.
+    FILE ${CMAKE_CURRENT_SOURCE_DIR}/nativo/aznative.skprx aznative.skprx
 )
