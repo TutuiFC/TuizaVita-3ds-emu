@@ -38,6 +38,19 @@ extern std::atomic<bool> enabled;
 /// La FCRAM del invitado, en memoria nuestra. Rehace la tabla (todo limpio).
 void SetRange(const u8* base, std::size_t size);
 
+/// La VRAM del invitado (0.4.1.1): se sigue igual que la FCRAM.
+void SetVramRange(const u8* base, std::size_t size);
+
+/**
+ * No fiarse mas de la zona de este puntero en esta partida (0.4.1.1): quien
+ * descubra que alli se escribio sin aviso (la CPU puede escribir la VRAM sin
+ * pasar por la cache, sin vaciar nada).
+ */
+void DistrustRegionOf(const void* pointer);
+
+/// El puntero es de la VRAM del invitado.
+[[nodiscard]] bool InVram(const void* pointer);
+
 /// De donde viene cada aviso (0.4.0.9, para crash.txt).
 enum Source : u32 {
     kSourceWrite,      ///< WriteBlock/ZeroBlock: lo escribe el sistema.
@@ -49,6 +62,11 @@ enum Source : u32 {
     kSourceGpuCopy,    ///< Transferencia o copia de textura de la GPU.
     kSources,
 };
+/// Lo que dice CleanSince en 'culprit' cuando no hay pagina culpable (0.4.1.4).
+constexpr u32 kCulpritOutside = kSources;        ///< Fuera de la FCRAM y la VRAM.
+constexpr u32 kCulpritFloor = kSources + 1;      ///< Todo dado por cambiado (MarkAll).
+constexpr u32 kCulpritDistrusted = kSources + 2; ///< Zona sin confianza (el vigia).
+constexpr u32 kCulprits = kSources + 3;
 
 /// Estos bytes (puntero nuestro) pueden haber cambiado: epoca nueva.
 void MarkHost(const void* pointer, std::size_t size, u32 source = kSourceWrite);
@@ -64,9 +82,12 @@ void MarkAll();
 
 /// Ninguna pagina del tramo ha recibido un aviso despues de 'epoch'. Si no,
 /// y 'culprit' no es nulo, la fuente del aviso de la primera pagina que lo
-/// tiene (kSources si fue MarkAll o el tramo no es de la FCRAM).
+/// tiene, o uno de los kCulprit* si no hay pagina culpable.
 [[nodiscard]] bool CleanSince(const void* pointer, std::size_t size, u32 epoch,
                               u32* culprit = nullptr);
+
+/// Veces que se dio todo por cambiado (MarkAll), para crash.txt (0.4.1.2).
+[[nodiscard]] u32 MarkAlls();
 
 /// Avisos recibidos (para crash.txt).
 [[nodiscard]] u32 Marks();

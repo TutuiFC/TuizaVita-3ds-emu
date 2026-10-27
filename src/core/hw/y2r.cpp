@@ -21,7 +21,11 @@
 #include "core/hw/y2r.h"
 #include "core/memory.h"
 #ifdef __PSVITA__
+#include <cstdio>
+#include <new>
 #include <fmt/format.h>
+#include <psp2/io/fcntl.h>
+#include <psp2/io/stat.h>
 #include "common/vita_diag.h"
 #endif
 
@@ -315,6 +319,59 @@ static inline void StoreEight(u8* out, uint8x8_t r, uint8x8_t g, uint8x8_t b, u8
     }
 }
 
+/**
+ * LAS CUENTAS, MAS CORTAS (0.4.1.4). El banco de Y2R (RunBenchIfAny) midio 5,3 ms
+ * por imagen de 400x240 SOLO de convertir, con todo en la cache: ~24 ciclos por
+ * pixel, porque GCC guardaba y recargaba de la pila mas de 600 bytes de
+ * registros NEON. Dos cambios, con el mismo resultado bit a bit:
+ *  - ((x >> 3) + k) >> 5 es (x + 8k) >> 8 para cualquier entero x: floor(x/8) + k
+ *    es entero, y lo que (x/8 + k) tiene de mas es menor que 1, que no cambia
+ *    la division por 32. Asi la constante de cada canal va ya dentro de la
+ *    parte de la croma y queda un solo desplazamiento con saturacion.
+ *  - La croma, con su constante, se cuenta una vez por par de filas en YUV420
+ *    (lo que piden los videos): las dos filas de un par la comparten.
+ * Los coeficientes van en carriles de registros NEON (vmlal_lane), no como
+ * escalares que GCC recargaba. Y las primeras kFusedChecks imagenes se siguen
+ * comparando con el camino de siempre (ver PerformConversion).
+ */
+struct ChromaTerms {
+    int32x4_t r_lo, r_hi, g_lo, g_hi, b_lo, b_hi;
+};
+
+/// La croma de ocho pixeles (cada muestra en dos carriles) con la constante de
+/// cada canal ya sumada; k14 lleva c[1]..c[4] en sus carriles 0..3.
+static inline ChromaTerms ChromaFor(uint8x8_t u8x, uint8x8_t v8x, int16x4_t k14, int32x4_t kr,
+                                    int32x4_t kg, int32x4_t kb) {
+    const int16x8_t u = vreinterpretq_s16_u16(vmovl_u8(u8x));
+    const int16x8_t v = vreinterpretq_s16_u16(vmovl_u8(v8x));
+    const int16x4_t ul = vget_low_s16(u);
+    const int16x4_t uh = vget_high_s16(u);
+    const int16x4_t vl = vget_low_s16(v);
+    const int16x4_t vh = vget_high_s16(v);
+    ChromaTerms t;
+    t.r_lo = vmlal_lane_s16(kr, vl, k14, 0);
+    t.r_hi = vmlal_lane_s16(kr, vh, k14, 0);
+    t.g_lo = vmlsl_lane_s16(vmlsl_lane_s16(kg, vl, k14, 1), ul, k14, 2);
+    t.g_hi = vmlsl_lane_s16(vmlsl_lane_s16(kg, vh, k14, 1), uh, k14, 2);
+    t.b_lo = vmlal_lane_s16(kb, ul, k14, 3);
+    t.b_hi = vmlal_lane_s16(kb, uh, k14, 3);
+    return t;
+}
+
+/// Ocho pixeles: la luma (c[0] en el carril 0 de k0) sobre la croma ya contada.
+static inline void LumaApply(uint8x8_t y8, const ChromaTerms& t, int16x4_t k0, uint8x8_t& r8,
+                             uint8x8_t& g8, uint8x8_t& b8) {
+    const int16x8_t y = vreinterpretq_s16_u16(vmovl_u8(y8));
+    const int16x4_t yl = vget_low_s16(y);
+    const int16x4_t yh = vget_high_s16(y);
+    r8 = vqmovn_u16(vcombine_u16(vqshrun_n_s32(vmlal_lane_s16(t.r_lo, yl, k0, 0), 8),
+                                 vqshrun_n_s32(vmlal_lane_s16(t.r_hi, yh, k0, 0), 8)));
+    g8 = vqmovn_u16(vcombine_u16(vqshrun_n_s32(vmlal_lane_s16(t.g_lo, yl, k0, 0), 8),
+                                 vqshrun_n_s32(vmlal_lane_s16(t.g_hi, yh, k0, 0), 8)));
+    b8 = vqmovn_u16(vcombine_u16(vqshrun_n_s32(vmlal_lane_s16(t.b_lo, yl, k0, 0), 8),
+                                 vqshrun_n_s32(vmlal_lane_s16(t.b_hi, yh, k0, 0), 8)));
+}
+
 template <InputFormat input_format, OutputFormat output_format>
 static void ConvertStripTiled(const u8* input_Y, const u8* input_U, const u8* input_V,
                               unsigned int width, const CoefficientSet& c, u8 alpha,
@@ -322,18 +379,33 @@ static void ConvertStripTiled(const u8* input_Y, const u8* input_U, const u8* in
     constexpr u32 bpp = output_format == OutputFormat::RGBA8  ? 4
                         : output_format == OutputFormat::RGB8 ? 3
                                                               : 2;
+    // Las dos filas de un par comparten la croma (ver LAS CUENTAS, MAS CORTAS).
+    constexpr bool kSharedChroma = input_format == InputFormat::YUV420_Indiv8 ||
+                                   input_format == InputFormat::YUV420_Indiv16;
     // Primer pixel en Z de las filas 0-1, 2-3, 4-5 y 6-7 (ver morton_lut).
     static constexpr u8 kPairBase[4] = {0, 8, 32, 40};
+    const int16x4_t k0 = vdup_n_s16(c[0]);
+    const int16x4_t k14 = vld1_s16(c.data() + 1);
+    const int32x4_t kr = vdupq_n_s32((c[5] + 0x18) * 8);
+    const int32x4_t kg = vdupq_n_s32((c[6] + 0x18) * 8);
+    const int32x4_t kb = vdupq_n_s32((c[7] + 0x18) * 8);
     for (unsigned int x = 0; x < width; x += 8) {
         u8* const tile = out + (x / 8) * 64 * bpp;
         for (unsigned int pair = 0; pair < 4; pair++) {
             uint8x8_t y8, u8x, v8x, r0, g0, b0, r1, g1, b1;
             LoadEight<input_format>(input_Y, input_U, input_V, width, pair * 2, x, y8, u8x,
                                     v8x);
-            ConvertEightRGB(y8, u8x, v8x, c, r0, g0, b0);
-            LoadEight<input_format>(input_Y, input_U, input_V, width, pair * 2 + 1, x, y8,
-                                    u8x, v8x);
-            ConvertEightRGB(y8, u8x, v8x, c, r1, g1, b1);
+            const ChromaTerms t0 = ChromaFor(u8x, v8x, k14, kr, kg, kb);
+            LumaApply(y8, t0, k0, r0, g0, b0);
+            if constexpr (kSharedChroma) {
+                y8 = vld1_u8(input_Y + (pair * 2 + 1) * width + x);
+                LumaApply(y8, t0, k0, r1, g1, b1);
+            } else {
+                LoadEight<input_format>(input_Y, input_U, input_V, width, pair * 2 + 1, x, y8,
+                                        u8x, v8x);
+                const ChromaTerms t1 = ChromaFor(u8x, v8x, k14, kr, kg, kb);
+                LumaApply(y8, t1, k0, r1, g1, b1);
+            }
             const uint16x4x2_t rz = vzip_u16(vreinterpret_u16_u8(r0), vreinterpret_u16_u8(r1));
             const uint16x4x2_t gz = vzip_u16(vreinterpret_u16_u8(g0), vreinterpret_u16_u8(g1));
             const uint16x4x2_t bz = vzip_u16(vreinterpret_u16_u8(b0), vreinterpret_u16_u8(b1));
@@ -989,4 +1061,112 @@ void PerformConversion(Memory::MemorySystem& memory, ConversionConfiguration cvt
     }
 #endif
 }
+
+#if defined(__ARM_NEON) && defined(__PSVITA__)
+/**
+ * EL BANCO DE Y2R (0.4.1.4). En la intro de Kirby Triple Deluxe y en el video
+ * de Smash, "colocar" (traer la franja y convertirla ya en su sitio) cuesta
+ * 7,5-8 ms por imagen de 400x240 YUV420 a RGB8: ~35 ciclos por pixel, cuando
+ * las cuentas NEON son unos pocos. Esto lo mide aislado en la consola, con la
+ * misma forma que esos dos juegos (origen con unidad 400 y hueco 112, destino
+ * en bloques de 8x8 con unidad 9600 y hueco 2688): la imagen entera en frio y
+ * en caliente, y sus partes. Se pide con ux0:/data/azahar/banco_mem/y2r.txt
+ * (se borra al empezar) y las lineas van a banco_mem/resultados.txt.
+ */
+void RunBenchIfAny() {
+    constexpr const char* kFlag = "ux0:/data/azahar/banco_mem/y2r.txt";
+    SceIoStat flag{};
+    if (sceIoGetstat(kFlag, &flag) < 0) {
+        return;
+    }
+    sceIoRemove(kFlag);
+    std::FILE* out = std::fopen("ux0:/data/azahar/banco_mem/resultados.txt", "a");
+    if (out == nullptr) {
+        return;
+    }
+    constexpr unsigned kW = 400;
+    constexpr unsigned kH = 240;
+    constexpr std::size_t kYStride = 512;    // unidad 400 + hueco 112
+    constexpr std::size_t kCStride = 256;    // la croma, con su hueco
+    constexpr std::size_t kDstStride = 12288; // unidad 9600 + hueco 2688 por franja
+    constexpr std::size_t kSet = 1024 * 1024; // un juego de origen y destino
+    constexpr std::size_t kSets = 12;         // 12 MB: no cabe en la cache
+    std::unique_ptr<u8[]> pool(new (std::nothrow) u8[kSet * kSets]);
+    std::unique_ptr<u8[]> strip(new (std::nothrow) u8[kW * 8 * 4]);
+    if (pool == nullptr || strip == nullptr) {
+        std::fprintf(out, "y2r banco: sin memoria\n");
+        std::fclose(out);
+        return;
+    }
+    u32 seed = 0x12345678u;
+    for (std::size_t i = 0; i < kSet * kSets; i++) {
+        seed = seed * 1664525u + 1013904223u;
+        pool[i] = static_cast<u8>(seed >> 24);
+    }
+    ConversionConfiguration cvt{};
+    cvt.input_format = InputFormat::YUV420_Indiv8;
+    cvt.output_format = OutputFormat::RGB8;
+    cvt.input_line_width = kW;
+    cvt.input_lines = kH;
+    cvt.alpha = 0xFF;
+    cvt.coefficients = {{0x100, 0x166, 0xB6, 0x58, 0x1C5, -0x166F, 0x10EE, -0x1C5B}};
+    const auto set_at = [&](std::size_t k) { return pool.get() + (k % kSets) * kSet; };
+    // Origen Y 0..122880, U desde 128 KB, V desde 192 KB, destino desde 256 KB.
+    const auto receive = [&](const u8* base, unsigned s) {
+        u8* const in_y = strip.get();
+        u8* const in_u = in_y + 8 * kW;
+        u8* const in_v = in_u + 8 * kW / 2;
+        for (unsigned r = 0; r < 8; r++) {
+            std::memcpy(in_y + r * kW, base + (s * 8 + r) * kYStride, kW);
+        }
+        for (unsigned r = 0; r < 4; r++) {
+            std::memcpy(in_u + r * (kW / 2), base + 128 * 1024 + (s * 4 + r) * kCStride, kW / 2);
+            std::memcpy(in_v + r * (kW / 2), base + 192 * 1024 + (s * 4 + r) * kCStride, kW / 2);
+        }
+    };
+    const auto convert = [&](u8* dst, unsigned s) {
+        u8* const in_y = strip.get();
+        FusedStrip<InputFormat::YUV420_Indiv8>(in_y, in_y + 8 * kW, in_y + 8 * kW + 4 * kW, cvt,
+                                               dst + s * kDstStride);
+    };
+    const auto image = [&](std::size_t k, bool do_receive, bool do_convert) {
+        u8* const base = set_at(k);
+        for (unsigned s = 0; s < kH / 8; s++) {
+            if (do_receive) {
+                receive(base, s);
+            }
+            if (do_convert) {
+                convert(base + 256 * 1024, s);
+            }
+        }
+    };
+    const auto time = [&](bool cold, bool do_receive, bool do_convert) {
+        constexpr unsigned kRuns = 24;
+        image(0, do_receive, do_convert); // calentar codigo
+        const unsigned long long begin = Common::VitaMicros();
+        for (unsigned run = 0; run < kRuns; run++) {
+            image(cold ? run + 1 : 0, do_receive, do_convert);
+        }
+        return static_cast<double>(Common::VitaMicros() - begin) / kRuns;
+    };
+    for (const OutputFormat format : {OutputFormat::RGB8, OutputFormat::RGBA8}) {
+        cvt.output_format = format;
+        const char* name = format == OutputFormat::RGB8 ? "RGB8" : "RGBA8";
+        const double full_cold = time(true, true, true);
+        const double full_warm = time(false, true, true);
+        const double conv_warm = time(false, false, true);
+        const double conv_cold = time(true, false, true);
+        const double recv_cold = time(true, true, false);
+        std::fprintf(out,
+                     "y2r 400x240 YUV420 a %s: imagen entera fria %.0f us, caliente %.0f us | "
+                     "solo convertir caliente %.0f us, con destino frio %.0f us | solo traer "
+                     "frio %.0f us\n",
+                     name, full_cold, full_warm, conv_warm, conv_cold, recv_cold);
+    }
+    std::fprintf(out, "== fin y2r\n");
+    std::fclose(out);
+}
+#else
+void RunBenchIfAny() {}
+#endif
 } // namespace HW::Y2R

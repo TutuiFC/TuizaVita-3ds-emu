@@ -801,6 +801,8 @@ private:
      * la escena que lo leyo, y no a toda la GPU como sceGxmFinish.
      */
     volatile unsigned int* fence_address = nullptr;
+    /// La de la fase de vertices de cada escena (0.4.1.3, solo para medir).
+    volatile unsigned int* vertex_fence_address = nullptr;
     u32 fence_sent = 0;
     /// Cuando se envio cada valla (las ultimas 64), para medir la cola de la
     /// GPU al presentar (0.4.0.5, ver FlushForPresent).
@@ -979,6 +981,20 @@ private:
     /// Comparar al menos una vez cada tantas presentaciones aunque ninguna
     /// pagina haya avisado (0.4.0.8): por si un juego no vaciara la cache.
     static constexpr u32 kVcacheRecheckPresents = 60;
+    /// El rango de indices recordado de un buffer (0.4.1.7, ver AccelerateDrawBatch).
+    struct IndexRangeEntry {
+        const u8* data = nullptr;
+        u32 count = 0;
+        bool is_u16 = false;
+        u32 min_index = 0;
+        u32 max_index = 0;
+        u32 verified = 0;
+        u32 verified_present = 0;
+    };
+    static constexpr u32 kIndexRanges = 512;
+    std::array<IndexRangeEntry, kIndexRanges> index_ranges{};
+    /// Cuenta de aciertos de confianza, para el vigia (0.4.1.1).
+    u32 vcache_watch_tick = 0;
     static constexpr u32 kVcacheArenaBytes = 2u * 1024u * 1024u;
     static constexpr u32 kVcacheEntries = 4096;
     std::array<Allocation, 2> vcache_gpu;

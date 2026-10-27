@@ -5,6 +5,8 @@
 #include "video_core/shader/generator/cg_fs_shader_gen.h"
 
 #include <array>
+#include <cctype>
+#include <string_view>
 #include <fmt/format.h>
 #include "common/logging/log.h"
 #include "video_core/pica/regs_framebuffer.h"
@@ -12,6 +14,83 @@
 #include "video_core/pica/regs_texturing.h"
 
 namespace Pica::Shader::Generator::GXM {
+
+namespace {
+/// Cambia todas las apariciones de 'from' por 'to'.
+std::string ReplaceAll(std::string s, std::string_view from, std::string_view to) {
+    std::size_t pos = 0;
+    while ((pos = s.find(from, pos)) != std::string::npos) {
+        s.replace(pos, from.size(), to);
+        pos += to.size();
+    }
+    return s;
+}
+
+/**
+ * EL COMBINADOR EN MEDIA PRECISION (0.4.1.9, ajuste fs_media=). El experimento
+ * fs_plano.txt de 0.4.1.5 midio que el 80-90 % del chip en Mario 3D Land y
+ * Zafiro es ejecutar el shader de fragmentos, y las etapas TEV trabajan con
+ * colores de 8 bits por canal: half (11 bits de mantisa) los representa de
+ * sobra y el chip de la Vita hace mas cuentas half por ciclo. Esto pasa a half
+ * el tramo TEV ya generado -- sus variables, sus constantes y su redondeo --,
+ * y al final vuelve a float con un byteround en float, asi que la prueba de
+ * alfa, la niebla y la salida siguen viendo valores exactos de la rejilla de
+ * 8 bits. Dentro del combinador puede salir un escalon de 8 bits distinto en
+ * algun pixel (redondeos de half cerca de .5), nada mas. La iluminacion y las
+ * coordenadas siguen en float.
+ */
+std::string HalfTev(std::string s) {
+    s = ReplaceAll(s, "combiner_output", "combiner_h");
+    s = ReplaceAll(s, "float4 combiner_buffer", "half4 combiner_buffer");
+    s = ReplaceAll(s, "float4 next_combiner_buffer", "half4 next_combiner_buffer");
+    s = ReplaceAll(s, "float4 combiner_h", "half4 combiner_h");
+    s = ReplaceAll(s, "float3 color_results_", "half3 color_results_");
+    s = ReplaceAll(s, "float alpha_results_", "half alpha_results_");
+    s = ReplaceAll(s, "float3 color_output_", "half3 color_output_");
+    s = ReplaceAll(s, "float alpha_output_", "half alpha_output_");
+    s = ReplaceAll(s, "byteround(float4(", "hbyteround(half4(");
+    s = ReplaceAll(s, "byteround1(", "hbyteround1(");
+    s = ReplaceAll(s, "float3(", "half3(");
+    s = ReplaceAll(s, "float4(", "half4(");
+    // Los literales con punto (1.0, 0.5, 2.0...) llevan sufijo h: sin el, Cg
+    // los toma como float y sube la cuenta entera a float.
+    std::string out;
+    out.reserve(s.size() + 64);
+    const auto ident = [](char c) {
+        return std::isalnum(static_cast<unsigned char>(c)) != 0 || c == '_' || c == '.' ||
+               c == ']';
+    };
+    const auto digit = [](char c) { return std::isdigit(static_cast<unsigned char>(c)) != 0; };
+    std::size_t i = 0;
+    while (i < s.size()) {
+        if (digit(s[i]) && (i == 0 || !ident(s[i - 1]))) {
+            std::size_t j = i;
+            while (j < s.size() && digit(s[j])) {
+                j++;
+            }
+            if (j + 1 < s.size() && s[j] == '.' && digit(s[j + 1])) {
+                std::size_t k = j + 1;
+                while (k < s.size() && digit(s[k])) {
+                    k++;
+                }
+                out.append(s, i, k - i);
+                if (k >= s.size() || s[k] != 'h') {
+                    out += 'h';
+                }
+                i = k;
+                continue;
+            }
+            out.append(s, i, j - i);
+            i = j;
+            continue;
+        }
+        out += s[i];
+        i++;
+    }
+    return out;
+}
+} // Anonymous namespace
+
 
 namespace {
 
@@ -132,6 +211,24 @@ public:
             return out;
         }
 
+        if (g_fs_flat_test.load(std::memory_order_relaxed)) {
+            // Ver g_fs_flat_test: las mismas entradas, un color fijo.
+            out += "void main(float4 primary_color : COLOR0, float2 tc0 : TEXCOORD0, "
+                   "float2 tc1 : TEXCOORD1, float2 tc2 : TEXCOORD2, ";
+            std::string touch = "primary_color + float4(tc0, tc1) + float4(tc2, 0.0, 0.0)";
+            if (config.lighting.enable) {
+                out += "float4 normquat : TEXCOORD3, float3 view : TEXCOORD4, ";
+                touch += " + normquat + float4(view, 0.0)";
+            }
+            if (IsProjected()) {
+                out += "float tc0_w : TEXCOORD5, ";
+                touch += " + float4(tc0_w, 0.0, 0.0, 0.0)";
+            }
+            out += "out float4 gl_FragColor : COLOR)\n{\n";
+            out += "    gl_FragColor = float4(0.8, 0.2, 0.8, 1.0) + 0.0001 * (" + touch + ");\n}\n";
+            return out;
+        }
+
         WriteInterface();
         WriteUniforms();
 
@@ -183,6 +280,7 @@ public:
         if (config.lighting.enable) {
             WriteLighting();
         }
+        const std::size_t tev_begin = out.size();
         out += "    float4 combiner_buffer = float4(0.0, 0.0, 0.0, 0.0);\n";
         out += "    float4 next_combiner_buffer = tev_combiner_buffer_color;\n";
         out += "    float4 combiner_output = float4(0.0, 0.0, 0.0, 0.0);\n";
@@ -195,6 +293,13 @@ public:
 
         for (u32 index = 0; index < config.texture.tev_stages.size(); index++) {
             WriteTevStage(index);
+        }
+        if (half_tev) {
+            // Ver HalfTev: el tramo en half y de vuelta a float, redondeado.
+            const std::string tev = HalfTev(out.substr(tev_begin));
+            out.resize(tev_begin);
+            out += tev;
+            out += "    float4 combiner_output = byteround(float4(combiner_h));\n";
         }
 
         WriteAlphaTestCondition(config.framebuffer.alpha_test_func);
@@ -256,6 +361,14 @@ private:
         out += "float byteround1(float x) {\n";
         out += "    return floor(x * 255.0 + 0.5) / 255.0;\n";
         out += "}\n\n";
+        if (half_tev) {
+            out += "half4 hbyteround(half4 x) {\n";
+            out += "    return floor(x * 255.0h + 0.5h) / 255.0h;\n";
+            out += "}\n\n";
+            out += "half hbyteround1(half x) {\n";
+            out += "    return floor(x * 255.0h + 0.5h) / 255.0h;\n";
+            out += "}\n\n";
+        }
         if (config.lighting.enable) {
             WriteLightingHelpers();
         }
@@ -310,21 +423,30 @@ private:
          * una variable nueva conviene no usar nombres de una sola palabra
          * corriente; con el prefijo 'lut_' no hay duda.
          */
-        out += "float LookupLightingLUT(float lut_row, int index, float delta) {\n";
-        out += "    float2 uv = float2(((float)index + 0.5) / 256.0, (lut_row + 0.5) / 24.0);\n";
+        /**
+         * SIN ENTEROS (0.4.2.0). El indice era int: float -> int para el
+         * clamp, int -> float para el delta y otra vez para la coordenada, en
+         * cada lectura de tabla y en cada pixel iluminado (tres a seis por
+         * shader). floor y clamp ya dejan un entero exacto en float (de -128
+         * a 255), asi que las mismas cuentas en float dan los mismos bits; el
+         * negativo va a 256 + indice igual que antes, y el delta se saca del
+         * indice sin envolver, tambien igual que antes.
+         */
+        out += "float LookupLightingLUT(float lut_row, float index, float delta) {\n";
+        out += "    float2 uv = float2((index + 0.5) / 256.0, (lut_row + 0.5) / 24.0);\n";
         out += "    float2 lut_entry = tex2D(lighting_lut, uv).rg;\n";
         out += "    return lut_entry.x + lut_entry.y * delta;\n";
         out += "}\n\n";
         out += "float LookupLightingLUTUnsigned(float lut_row, float pos) {\n";
-        out += "    int index = (int)clamp(floor(pos * 256.0), 0.0, 255.0);\n";
-        out += "    float delta = pos * 256.0 - (float)index;\n";
+        out += "    float index = clamp(floor(pos * 256.0), 0.0, 255.0);\n";
+        out += "    float delta = pos * 256.0 - index;\n";
         out += "    return LookupLightingLUT(lut_row, index, delta);\n";
         out += "}\n\n";
         out += "float LookupLightingLUTSigned(float lut_row, float pos) {\n";
-        out += "    int index = (int)clamp(floor(pos * 128.0), -128.0, 127.0);\n";
-        out += "    float delta = pos * 128.0 - (float)index;\n";
-        out += "    if (index < 0) index += 256;\n";
-        out += "    return LookupLightingLUT(lut_row, index, delta);\n";
+        out += "    float index = clamp(floor(pos * 128.0), -128.0, 127.0);\n";
+        out += "    float delta = pos * 128.0 - index;\n";
+        out += "    float wrapped = index < 0.0 ? index + 256.0 : index;\n";
+        out += "    return LookupLightingLUT(lut_row, wrapped, delta);\n";
         out += "}\n\n";
     }
 
@@ -861,8 +983,16 @@ private:
                  * cercano, que es el k original. Se nota justo donde se usa la
                  * prueba de alfa: en los bordes de texto e iconos, que es donde
                  * el alfa cae cerca del valor de referencia.
+                 *
+                 * Y SIN int() (0.4.2.0). El mismo redondeo con floor, que para
+                 * un valor positivo es lo mismo que truncar, y la referencia ya
+                 * llega como entero exacto en float (static_cast<f32> de los 8
+                 * bits del registro): la comparacion de dos enteros en float es
+                 * exacta. El banco del compilador midio que las conversiones a
+                 * int son carisimas en la USSE: un shader con prueba de alfa
+                 * paso de 77 a 61 instrucciones solo con esto.
                  */
-                return fmt::format("int(combiner_output.a * 255.0 + 0.5) {} int(alphatest_ref)",
+                return fmt::format("floor(combiner_output.a * 255.0 + 0.5) {} alphatest_ref",
                                    ops[index]);
             }
             default:
@@ -1038,13 +1168,20 @@ private:
         // Direccional: la posicion ES la direccion, ya en espacio del ojo.
         // Posicional: hay que restarle la posicion del fragmento, y 'view' es
         // justo el vector del fragmento al ojo, o sea menos esa posicion.
+        /**
+         * LA DIRECCIONAL, YA NORMALIZADA (0.4.2.0). Su vector es el mismo para
+         * todo el lote: la CPU lo sube normalizado y con su longitud en w (ver
+         * memo.position en SetupDrawState), en vez de normalizarlo aqui en
+         * cada pixel.
+         */
         if (light.directional) {
             out += fmt::format("    light_vector = light_position[{}].xyz;\n", num);
+            out += fmt::format("    light_distance = light_position[{}].w;\n", num);
         } else {
             out += fmt::format("    light_vector = light_position[{}].xyz + view;\n", num);
+            out += "    light_distance = length(light_vector);\n";
+            out += "    light_vector = normalize(light_vector);\n";
         }
-        out += "    light_distance = length(light_vector);\n";
-        out += "    light_vector = normalize(light_vector);\n";
         out += fmt::format("    spot_dir = light_spot_direction[{}].xyz;\n", num);
         out += "    half_vector = normalize(view) + light_vector;\n";
 
@@ -1285,6 +1422,8 @@ private:
     const char** reason = nullptr;
     bool alpha_from_blend_const = false;
     bool color_from_blend_const = false;
+    /// Ver HalfTev: se lee una vez por shader.
+    const bool half_tev = g_fs_half_tev.load(std::memory_order_relaxed);
     std::string out;
     bool uses_tex0 = false;
     bool uses_tex1 = false;
@@ -1294,6 +1433,9 @@ private:
 };
 
 } // Anonymous namespace
+
+std::atomic<bool> g_fs_flat_test{false};
+std::atomic<bool> g_fs_half_tev{false};
 
 std::optional<std::string> GenerateFragmentShader(const FSConfig& config,
                                                   const char** out_reason,

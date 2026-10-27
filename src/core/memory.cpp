@@ -508,6 +508,7 @@ MemorySystem::Impl::Impl(Core::System& system_)
       dsp_mem(std::make_shared<BackingMemImpl<Region::DSP>>(*this)) {
     // Ver Common::WriteEpochs (0.4.0.8): sus paginas son las de esta FCRAM.
     Common::WriteEpochs::SetRange(fcram.get(), fcram_size);
+    Common::WriteEpochs::SetVramRange(vram.get(), Memory::VRAM_SIZE);
 }
 
 MemorySystem::MemorySystem(Core::System& system) : impl(std::make_unique<Impl>(system)) {}
@@ -1427,9 +1428,36 @@ void MemorySystem::MarkWritten(const Kernel::Process& process, VAddr addr, u32 s
     if (size == 0) {
         return;
     }
-    // Un tramo enorme (vaciar "todo"): mas barato darlo todo por cambiado.
-    if (size > 32u * 1024u * 1024u) {
-        Common::WriteEpochs::MarkAll();
+    /**
+     * UN TRAMO GRANDE, POR LAS ZONAS DEL PROCESO (0.4.1.4). Antes, por encima
+     * de 32 MB se daba TODO por cambiado (MarkAll), y Super Mario 3D Land lo
+     * hacia unas 20 veces por segundo (9580 en una partida): cada vez se
+     * volvian a copiar todos sus vertices, tambien los que estan en la VRAM,
+     * que ese vaciado no toca. Ahora se recorren las zonas mapeadas del
+     * proceso (unas decenas, no una pagina a pagina) y solo se avisa de lo
+     * que de verdad cae dentro del tramo.
+     */
+    if (size > 1u * 1024u * 1024u) {
+        const u64 end = u64{addr} + size;
+        const auto& vmas = process.vm_manager.vma_map;
+        auto it = vmas.upper_bound(addr);
+        if (it != vmas.begin()) {
+            --it;
+        }
+        for (; it != vmas.end() && it->second.base < end; ++it) {
+            const Kernel::VirtualMemoryArea& vma = it->second;
+            if (vma.type != Kernel::VMAType::BackingMemory) {
+                continue;
+            }
+            const u64 lo = std::max<u64>(addr, vma.base);
+            const u64 hi = std::min<u64>(end, u64{vma.base} + vma.size);
+            const u8* const host = vma.backing_memory.GetPtr();
+            if (lo >= hi || host == nullptr) {
+                continue;
+            }
+            Common::WriteEpochs::MarkHost(host + (lo - vma.base),
+                                          static_cast<std::size_t>(hi - lo), source);
+        }
         return;
     }
     auto& page_table = *process.vm_manager.page_table;

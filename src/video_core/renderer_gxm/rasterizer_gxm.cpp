@@ -19,6 +19,7 @@
 #include <psp2/io/stat.h>
 #include <psp2/kernel/modulemgr.h>
 #include <psp2/kernel/threadmgr.h>
+#include <pthread.h>
 #include <psp2/shacccg.h>
 #include <vita2d.h>
 #include "common/logging/log.h"
@@ -167,15 +168,200 @@ unsigned long long g_present_wait_sum_us = 0;
 unsigned long long g_present_drains = 0;
 /// Aciertos de la cache de subidas sin comparar (0.4.0.8, ver CachedVertexUpload).
 unsigned long long g_vcache_trusted = 0;
+/// Flujos que el vigia encontro cambiados sin aviso (0.4.1.1).
+unsigned long long g_vcache_violations = 0;
 /**
  * Por que se copia un flujo en vez de servirlo de la zona (0.4.1.0): la fuente
  * del aviso que ensucio su pagina (indices de Common::WriteEpochs::Source; el
  * de kSources es "todo" o fuera de la FCRAM), la comprobacion periodica, o que
  * no estaba (nuevo, o su zona ya se reciclo).
  */
-constexpr u32 kVcacheWhyRecheck = Common::WriteEpochs::kSources + 1;
-constexpr u32 kVcacheWhyNew = Common::WriteEpochs::kSources + 2;
-std::array<unsigned long long, Common::WriteEpochs::kSources + 3> g_vcache_why{};
+constexpr u32 kVcacheWhyRecheck = Common::WriteEpochs::kCulprits;
+constexpr u32 kVcacheWhyNew = Common::WriteEpochs::kCulprits + 1;
+std::array<unsigned long long, Common::WriteEpochs::kCulprits + 2> g_vcache_why{};
+/**
+ * LAS CONSUMIDAS SE OLVIDAN (0.4.1.4). Una superficie con el volcado aplazado
+ * que alguien lee (textura, copia, vaciado) pasa a volcarse en TODAS las
+ * presentaciones, y antes era para siempre: en Smash una de 256x320 de la
+ * VRAM se volcaba en cada fotograma ("volcados por: presentar 348" por
+ * ventana, 6,1 ms por fotograma esperando a la GPU y copiando) sin que nadie
+ * mas la volviera a pedir. Tras estas presentaciones sin que otro la pida,
+ * vuelve a volcarse solo cada present_writeback_every, como las demas.
+ */
+constexpr u32 kConsumedForgetPresents = 120;
+/// Rellenos pendientes que ApplyLazyFills escribe en el invitado, y sus KB
+/// (0.4.1.5): en Zafiro "rellenos" de TextureFromCopy paso de 4 a 8 us.
+unsigned long long g_lazy_applied = 0;
+unsigned long long g_lazy_applied_kb = 0;
+
+/**
+ * EL COPIADOR DE VERTICES (0.4.1.6). En Zafiro el juego y el hilo de la GPU van
+ * en serie (el juego espera a que se traduzca su lista entera), asi que cada
+ * microsegundo de un lote es fotograma. De los ~120 us de un lote, ~37 son
+ * copiar ~11 KB de vertices a memoria SIN cache de la GPU, y esa escritura no
+ * se acelera ni con NEON ni con prefetch (esta medido: el muro es escribir sin
+ * cache). Lo que si se puede es hacerla EN OTRO NUCLEO mientras este sigue con
+ * el lote: despues de la fase "datos" vienen "estado" (~35 us) y "uniforms"
+ * (~20 us), que no tocan esos bytes. Asi que las copias (y el rebase de los
+ * indices) se encargan aqui, un hilo en el nucleo 2 las hace, y el lote espera
+ * a que esten justo antes de sceGxmDraw (y antes de cerrar la escena), que es
+ * cuando la GPU puede empezar a leerlas. El hilo hace dsb antes de dar cada
+ * tanda por hecha: es OTRO nucleo escribiendo memoria sin cache que va a leer
+ * la GPU, y el dsb que hace GXM al mandar la escena es del nucleo 1.
+ * APAGADO POR DEFECTO (0.4.2.0): medido en la consola, el lote le esperaba
+ * 4195 veces por ventana en Mario 3D Land y 3353 en Zafiro, 82-90 us de media:
+ * despertar un hilo de otro nucleo con un semaforo tarda mas que las copias de
+ * un lote, y el lote acaba esperando mas que lo que copiaba. Solo con
+ * ux0:/data/azahar/con_copiador.txt.
+ */
+struct CopyJob {
+    void* dst;
+    const void* src;
+    u32 count;  ///< Bytes (copia) o indices (rebase).
+    u8 kind;    ///< 0 copiar, 1 rebase de u16, 2 rebase de u8.
+    u16 base;   ///< min_index del rebase.
+    u16 limit;  ///< El indice rebasado mas alto que vale (ver RebaseIndicesU16).
+};
+constexpr u32 kCopyJobs = 256;
+constexpr u32 kCopierMinBytes = 512;
+constexpr int kCopierPriority = 120;
+std::array<CopyJob, kCopyJobs> g_copy_jobs{};
+std::atomic<u32> g_copy_head{0}; ///< Lo escribe el hilo de la GPU.
+std::atomic<u32> g_copy_tail{0}; ///< Lo escribe el copiador: hechos hasta aqui.
+SceUID g_copier_sema = -1;
+bool g_copier_on = false;
+u32 g_copy_kicked = 0; ///< Hasta donde se le ha avisado.
+/// Para crash.txt: trabajos, KB, y lo que el lote espero al copiador.
+unsigned long long g_copier_jobs = 0;
+unsigned long long g_copier_kb = 0;
+unsigned long long g_copier_waits = 0;
+unsigned long long g_copier_wait_us = 0;
+/// La cache del rango de indices (0.4.1.7): aciertos y fallos.
+unsigned long long g_index_range_hits = 0;
+unsigned long long g_index_range_misses = 0;
+
+void RebaseIndicesU16(const u16* in, u32 count, u16 base, u16 limit, u16* out);
+void RebaseIndicesU8(const u8* in, u32 count, u16 base, u16 limit, u16* out);
+
+void RunCopyJob(const CopyJob& job) {
+    switch (job.kind) {
+    case 0:
+        std::memcpy(job.dst, job.src, job.count);
+        break;
+    case 1:
+        RebaseIndicesU16(static_cast<const u16*>(job.src), job.count, job.base, job.limit,
+                         static_cast<u16*>(job.dst));
+        break;
+    default:
+        RebaseIndicesU8(static_cast<const u8*>(job.src), job.count, job.base, job.limit,
+                        static_cast<u16*>(job.dst));
+        break;
+    }
+}
+
+void* CopierMain(void*) {
+    Common::VitaPinThreadToUserCore(2, "copiador de vertices");
+    Common::VitaSetThreadPriority(kCopierPriority, "copiador de vertices");
+    u32 tail = 0;
+    while (true) {
+        const u32 head = g_copy_head.load(std::memory_order_acquire);
+        if (tail == head) {
+            sceKernelWaitSema(g_copier_sema, 1, nullptr);
+            continue;
+        }
+        while (tail != head) {
+            RunCopyJob(g_copy_jobs[tail % kCopyJobs]);
+            tail++;
+        }
+        __asm__ volatile("dsb" ::: "memory");
+        g_copy_tail.store(tail, std::memory_order_release);
+    }
+    return nullptr;
+}
+
+void StartCopier() {
+    static bool tried = false;
+    if (tried) {
+        return;
+    }
+    tried = true;
+    SceIoStat off{};
+    if (sceIoGetstat("ux0:/data/azahar/con_copiador.txt", &off) < 0) {
+        Common::VitaNote("gxm copiador", "apagado (sin con_copiador.txt)");
+        return;
+    }
+    g_copier_sema = sceKernelCreateSema("azahar_copiador", 0, 0, 0x7FFFFFFF, nullptr);
+    if (g_copier_sema < 0) {
+        Common::VitaNote("gxm copiador", "sin semaforo: apagado");
+        return;
+    }
+    pthread_attr_t attr;
+    pthread_attr_init(&attr);
+    pthread_attr_setstacksize(&attr, 64 * 1024);
+    pthread_t thread;
+    if (pthread_create(&thread, &attr, &CopierMain, nullptr) == 0) {
+        pthread_detach(thread);
+        g_copier_on = true;
+        Common::VitaNote("gxm copiador", "en marcha en el nucleo 2");
+    } else {
+        Common::VitaNote("gxm copiador", "no se pudo crear su hilo: apagado");
+    }
+    pthread_attr_destroy(&attr);
+}
+
+/// Espera a que el copiador haya hecho todo lo encargado (lo pide la GPU).
+void CopierWait() {
+    if (!g_copier_on) {
+        return;
+    }
+    const u32 head = g_copy_head.load(std::memory_order_relaxed);
+    if (g_copy_tail.load(std::memory_order_acquire) == head) {
+        return;
+    }
+    if (g_copy_kicked != head) {
+        g_copy_kicked = head;
+        sceKernelSignalSema(g_copier_sema, 1);
+    }
+    const unsigned long long begin = Common::VitaMicros();
+    while (g_copy_tail.load(std::memory_order_acquire) != head) {
+    }
+    g_copier_waits++;
+    g_copier_wait_us += Common::VitaMicros() - begin;
+}
+
+/// Encarga un trabajo; si el anillo esta lleno, espera al copiador.
+void CopierPush(const CopyJob& job) {
+    const u32 head = g_copy_head.load(std::memory_order_relaxed);
+    if (head - g_copy_tail.load(std::memory_order_acquire) >= kCopyJobs) {
+        CopierWait();
+    }
+    g_copy_jobs[head % kCopyJobs] = job;
+    g_copy_head.store(head + 1, std::memory_order_release);
+    g_copier_jobs++;
+}
+
+/// Copiar: en este hilo si es poco o el copiador esta apagado.
+void CopierCopy(void* dst, const void* src, u32 bytes) {
+    if (!g_copier_on || bytes < kCopierMinBytes) {
+        std::memcpy(dst, src, bytes);
+        return;
+    }
+    g_copier_kb += bytes / 1024;
+    CopierPush(CopyJob{dst, src, bytes, 0, 0, 0});
+}
+
+/// Despierta al copiador si hay trabajo nuevo (una vez por lote).
+void CopierKick() {
+    if (!g_copier_on) {
+        return;
+    }
+    const u32 head = g_copy_head.load(std::memory_order_relaxed);
+    if (g_copy_kicked != head && g_copy_tail.load(std::memory_order_acquire) != head) {
+        g_copy_kicked = head;
+        sceKernelSignalSema(g_copier_sema, 1);
+    }
+}
+unsigned long long g_consumed_forgotten = 0;
 /// Fallos de la cache por huella de fragmentos (0.4.0.8): cuantos, cuantos eran
 /// de una configuracion ya conocida y cuantos pisaban otra huella en su hueco.
 unsigned long long g_fp_misses = 0;
@@ -982,6 +1168,9 @@ struct RasterizerGXM::Surface {
     /// Alguien ha leido su memoria (textura, copia, vaciado) con un volcado
     /// aplazado: desde entonces se vuelca en todas las presentaciones.
     bool consumed = false;
+    /// Presentaciones seguidas sin que nadie mas que la presentacion la pida
+    /// (0.4.1.4, ver kConsumedForgetPresents).
+    u32 consumed_idle = 0;
     /// Rellenos de color del invitado que todavia no se han pintado: los hace
     /// la siguiente escena (0.1.9.6, ver AccelerateFill). Cada uno es una
     /// franja de filas y los cuatro bytes del pixel tal como van en
@@ -3117,25 +3306,33 @@ void IndexRangeU8(const u8* in, u32 count, u32& min_index, u32& max_index) {
  */
 
 /// out[i] = in[i] - base, en 16 bits (como static_cast<u16>).
-void RebaseIndicesU16(const u16* in, u32 count, u16 base, u16* out) {
+/**
+ * CON TOPE (0.4.1.7): ningun indice rebasado pasa de 'limit' (el ultimo vertice
+ * copiado). Con un rango exacto no cambia nada; con uno recordado que se
+ * hubiera quedado viejo (ver EL RANGO DE LOS INDICES, RECORDADO), la GPU lee
+ * un vertice equivocado de los copiados en vez de memoria de fuera del tramo.
+ */
+void RebaseIndicesU16(const u16* in, u32 count, u16 base, u16 limit, u16* out) {
     const uint16x8_t sub = vdupq_n_u16(base);
+    const uint16x8_t top = vdupq_n_u16(limit);
     u32 i = 0;
     for (; i + 8 <= count; i += 8) {
-        vst1q_u16(out + i, vsubq_u16(vld1q_u16(in + i), sub));
+        vst1q_u16(out + i, vminq_u16(vsubq_u16(vld1q_u16(in + i), sub), top));
     }
     for (; i < count; i++) {
-        out[i] = static_cast<u16>(in[i] - base);
+        out[i] = std::min<u16>(static_cast<u16>(in[i] - base), limit);
     }
 }
 
-void RebaseIndicesU8(const u8* in, u32 count, u16 base, u16* out) {
+void RebaseIndicesU8(const u8* in, u32 count, u16 base, u16 limit, u16* out) {
     const uint16x8_t sub = vdupq_n_u16(base);
+    const uint16x8_t top = vdupq_n_u16(limit);
     u32 i = 0;
     for (; i + 8 <= count; i += 8) {
-        vst1q_u16(out + i, vsubq_u16(vmovl_u8(vld1_u8(in + i)), sub));
+        vst1q_u16(out + i, vminq_u16(vsubq_u16(vmovl_u8(vld1_u8(in + i)), sub), top));
     }
     for (; i < count; i++) {
-        out[i] = static_cast<u16>(in[i] - base);
+        out[i] = std::min<u16>(static_cast<u16>(in[i] - base), limit);
     }
 }
 
@@ -3672,11 +3869,31 @@ bool RasterizerGXM::EnsureInitialized() {
     // (vita2d y el sistema no la usan). La GPU solo puede escribir ahi.
     fence_address = sceGxmGetNotificationRegion() + 400;
     *fence_address = 0;
+    /**
+     * La valla de la fase de vertices (0.4.1.3) solo con
+     * ux0:/data/azahar/fases_gpu.txt (0.4.1.5): es para medir, y con ella
+     * Zafiro salio un poco mas lento, asi que las partidas normales no la
+     * llevan.
+     */
+    {
+        SceIoStat phases{};
+        if (sceIoGetstat("ux0:/data/azahar/fases_gpu.txt", &phases) >= 0) {
+            vertex_fence_address = sceGxmGetNotificationRegion() + 401;
+            *vertex_fence_address = 0;
+        }
+    }
     // Ver gxm_caja_negra.h: lo mandado a la GPU, en el volcado si se cuelga.
-    BlackBox::Start(fence_address);
+    BlackBox::Start(fence_address, vertex_fence_address);
+    // Ver EL COPIADOR DE VERTICES (0.4.1.6).
+    StartCopier();
     {
         SceIoStat flag{};
         g_dump_vs = sceIoGetstat(kDumpVsFlagPath, &flag) >= 0;
+        // Ver Pica::Shader::Generator::GXM::g_fs_flat_test (0.4.1.5, experimento).
+        if (sceIoGetstat("ux0:/data/azahar/fs_plano.txt", &flag) >= 0) {
+            Pica::Shader::Generator::GXM::g_fs_flat_test.store(true, std::memory_order_relaxed);
+            Common::VitaNote("gxm fs", "fs_plano.txt: EXPERIMENTO, fragmentos de un color");
+        }
         if (g_dump_vs) {
             Common::VitaNote("gxm vs", "volcar_vs.txt: el codigo de cada programa de "
                                        "vertices va a vs_fuentes");
@@ -3808,12 +4025,17 @@ void RasterizerGXM::EndScene() {
                              SCE_GXM_STENCIL_OP_KEEP, SCE_GXM_STENCIL_OP_KEEP, 0xFF, 0x00);
     {
         const Common::ScopedVitaStage stage{"gxm cerrar escena"};
+        CopierWait();
         fence_sent++;
         fence_sent_us[fence_sent & 63u] = Common::VitaMicros();
         SceGxmNotification done{};
         done.address = fence_address;
         done.value = fence_sent;
-        TimedEndScene(context, nullptr, &done);
+        SceGxmNotification vertices_done{};
+        vertices_done.address = vertex_fence_address;
+        vertices_done.value = fence_sent;
+        TimedEndScene(context, vertex_fence_address != nullptr ? &vertices_done : nullptr,
+                      &done);
         BlackBox::CloseScene(fence_sent);
         open_surface->last_fence = fence_sent;
     }
@@ -3962,6 +4184,10 @@ std::string RasterizerGXM::TakeGpuWaitSummary(double frames) {
 }
 
 void RasterizerGXM::WriteBack(Surface& surface, u32 site) {
+    if (site != kWritebackPresent) {
+        // Alguien mas que la presentacion la quiere (ver kConsumedForgetPresents).
+        surface.consumed_idle = 0;
+    }
     if (!surface.dirty) {
         return;
     }
@@ -4004,6 +4230,9 @@ void RasterizerGXM::WriteBack(Surface& surface, u32 site) {
         linear = scale_scratch.data();
         linear_stride = row_bytes;
     }
+    // Ver Common::WriteEpochs (0.4.1.1): el volcado escribe la memoria del invitado.
+    Common::WriteEpochs::MarkHost(guest, surface.guest_stride * surface.height,
+                                  Common::WriteEpochs::kSourceGpuCopy);
     CopyTiledGuest(guest, linear, surface.width, surface.height, linear_stride, surface.bpp,
                    true);
 }
@@ -4478,6 +4707,7 @@ void RasterizerGXM::MaterializeCopy(ScreenCopy& copy) {
     }
     ApplyLazyFills(copy.dst, copy.dst_size);
     u8* const dst = memory.GetPhysicalPointer(copy.dst);
+    Common::WriteEpochs::MarkHost(dst, copy.dst_size, Common::WriteEpochs::kSourceGpuCopy);
     const u8* const src = static_cast<const u8*>(copy.color_buffer.Data());
     const u32 src_stride = copy.stride * copy.bpp;
     const u32 out_bpp = Pica::BytesPerPixel(copy.output_format);
@@ -4882,7 +5112,11 @@ bool RasterizerGXM::BlitToCopy(ScreenCopy& copy, Surface& source, u32 first_row,
     SceGxmNotification done{};
     done.address = fence_address;
     done.value = fence_sent;
-    TimedEndScene(context, nullptr, &done);
+    SceGxmNotification vertices_done{};
+    vertices_done.address = vertex_fence_address;
+    vertices_done.value = fence_sent;
+    TimedEndScene(context, vertex_fence_address != nullptr ? &vertices_done : nullptr,
+                  &done);
     BlackBox::CloseScene(fence_sent);
     copy.fence = fence_sent;
     gpu_pending = true;
@@ -5345,7 +5579,11 @@ void RasterizerGXM::ApplyLazyFills(PAddr addr, u32 size) {
         if (addr >= fill.start + fill.bytes || fill.start >= addr + size) {
             return false;
         }
+        Common::WriteEpochs::MarkHost(memory.GetPhysicalPointer(fill.start), fill.bytes,
+                                      Common::WriteEpochs::kSourceGpuFill);
         FillPattern(memory.GetPhysicalPointer(fill.start), fill.bytes, fill.texel, fill.bpp);
+        g_lazy_applied++;
+        g_lazy_applied_kb += fill.bytes / 1024;
         return true;
     });
 }
@@ -5371,6 +5609,8 @@ void RasterizerGXM::TrimLazyFills(PAddr addr, u32 size) {
             continue;
         }
         if (fill_end > end && (end - fill.start) % fill.bpp != 0) {
+            Common::WriteEpochs::MarkHost(memory.GetPhysicalPointer(fill.start), fill.bytes,
+                                          Common::WriteEpochs::kSourceGpuFill);
             FillPattern(memory.GetPhysicalPointer(fill.start), fill.bytes, fill.texel, fill.bpp);
             continue;
         }
@@ -6019,6 +6259,11 @@ void RasterizerGXM::FlushForPresent() {
     const bool due = every == 1 || presents_seen % every == 0;
     for (auto& surface : surfaces) {
         if (!surface->copied) {
+            if (surface->consumed && ++surface->consumed_idle >= kConsumedForgetPresents) {
+                surface->consumed = false;
+                surface->consumed_idle = 0;
+                g_consumed_forgotten++;
+            }
             if (surface->dirty && !due && !surface->consumed) {
                 surface->present_skipped = true;
                 continue;
@@ -7337,9 +7582,23 @@ bool RasterizerGXM::SetupDrawState(Surface* surface, const Entry* pipeline,
                     put_color(light.diffuse, memo.diffuse.data() + i * 4);
                     put_color(light.ambient, memo.ambient.data() + i * 4);
                     // La posicion son tres medios flotantes de 16 bits.
-                    memo.position[i * 4 + 0] = Pica::f16::FromRaw(light.x).ToFloat32();
-                    memo.position[i * 4 + 1] = Pica::f16::FromRaw(light.y).ToFloat32();
-                    memo.position[i * 4 + 2] = Pica::f16::FromRaw(light.z).ToFloat32();
+                    const f32 px = Pica::f16::FromRaw(light.x).ToFloat32();
+                    const f32 py = Pica::f16::FromRaw(light.y).ToFloat32();
+                    const f32 pz = Pica::f16::FromRaw(light.z).ToFloat32();
+                    if (light.config.directional) {
+                        // Ver LA DIRECCIONAL, YA NORMALIZADA (cg_fs_shader_gen.cpp).
+                        const f32 length = std::sqrt(px * px + py * py + pz * pz);
+                        const f32 inverse = length > 0.0f ? 1.0f / length : 0.0f;
+                        memo.position[i * 4 + 0] = px * inverse;
+                        memo.position[i * 4 + 1] = py * inverse;
+                        memo.position[i * 4 + 2] = pz * inverse;
+                        memo.position[i * 4 + 3] = length;
+                    } else {
+                        memo.position[i * 4 + 0] = px;
+                        memo.position[i * 4 + 1] = py;
+                        memo.position[i * 4 + 2] = pz;
+                        memo.position[i * 4 + 3] = 0.0f;
+                    }
                     // La direccion del foco va en fijo 1.1.11 (de ahi el 2047).
                     memo.spot_direction[i * 4 + 0] = static_cast<f32>(light.spot_x) / 2047.0f;
                     memo.spot_direction[i * 4 + 1] = static_cast<f32>(light.spot_y) / 2047.0f;
@@ -7731,27 +7990,63 @@ const u8* RasterizerGXM::CachedVertexUpload(const u8* src, u32 bytes) {
         if (presents_seen - entry.verified_present >= kVcacheRecheckPresents) {
             g_vcache_why[kVcacheWhyRecheck]++;
         } else if (Common::WriteEpochs::CleanSince(src, bytes, entry.verified, &culprit)) {
+            const u8* const gpu =
+                static_cast<const u8*>(vcache_gpu[entry.arena].Data()) + entry.offset;
+            /**
+             * EL VIGIA (0.4.1.1). La VRAM la puede escribir la CPU de la 3DS sin
+             * cache y sin avisar a nadie, y un juego podria hasta fiarse de que
+             * la cache se vacie sola. Uno de cada 32 aciertos de confianza
+             * compara 32 bytes (cada vez en otro sitio del flujo) con la copia de
+             * la GPU: si no coinciden, esa zona de memoria deja de ser de
+             * confianza el resto de la partida y el flujo se vuelve a copiar.
+             */
+            // Con copias del copiador a medias la copia de la GPU puede no estar
+            // aun: el vigia solo mira con el copiador al dia (0.4.1.6).
+            if ((++vcache_watch_tick & 31u) == 0 && bytes >= 32 &&
+                g_copy_tail.load(std::memory_order_acquire) ==
+                    g_copy_head.load(std::memory_order_relaxed)) {
+                const u32 at = ((vcache_watch_tick >> 5) * 4096u) % (bytes - 31u) & ~15u;
+                if (std::memcmp(src + at, gpu + at, 32) != 0) {
+                    Common::WriteEpochs::DistrustRegionOf(src);
+                    g_vcache_violations++;
+                    static bool noted = false;
+                    if (!noted) {
+                        noted = true;
+                        NoteFmt("gxm vertices",
+                                "vertices cambiados sin aviso ({} bytes, {}): esa zona ya "
+                                "no se usa sin copiar",
+                                bytes,
+                                Common::WriteEpochs::InVram(src) ? "VRAM" : "FCRAM");
+                    }
+                    goto copy_again;
+                }
+            }
             vcache_pending |= 1u << entry.arena;
             g_vcache_hits++;
             g_vcache_trusted++;
             g_vcache_hit_bytes += bytes;
-            return static_cast<const u8*>(vcache_gpu[entry.arena].Data()) + entry.offset;
+            return gpu;
         } else {
-            g_vcache_why[std::min<u32>(culprit, Common::WriteEpochs::kSources)]++;
+            g_vcache_why[std::min<u32>(culprit, Common::WriteEpochs::kCulprits - 1)]++;
         }
     } else {
         g_vcache_why[kVcacheWhyNew]++;
     }
+copy_again:
     u32 arena = vcache_current;
     u32 offset = (vcache_used[arena] + 15u) & ~15u;
     if (offset + bytes > kVcacheArenaBytes) {
         const u32 other = arena ^ 1u;
-        if (((vcache_pending >> other) & 1u) != 0) {
-            // La escena abierta lee la otra: este flujo, por el anillo.
+        /**
+         * La escena abierta lee la otra, o (0.4.1.5) el chip todavia no ha
+         * acabado con ella: este flujo, por el anillo, sin esperar. En Zafiro,
+         * que vacia ~44 MB por fotograma y lo vuelve a copiar todo, esperar
+         * aqui era 1,3 ms por fotograma del hilo de la GPU parado.
+         */
+        if (((vcache_pending >> other) & 1u) != 0 || !FenceDone(vcache_fence[other])) {
             g_vcache_busy++;
             return nullptr;
         }
-        WaitFence(vcache_fence[other], GpuWait::VertexRing);
         vcache_gen[other]++;
         vcache_used[other] = 0;
         vcache_current = other;
@@ -7760,7 +8055,7 @@ const u8* RasterizerGXM::CachedVertexUpload(const u8* src, u32 bytes) {
         g_vcache_switches++;
     }
     u8* const gpu = static_cast<u8*>(vcache_gpu[arena].Data()) + offset;
-    std::memcpy(gpu, src, bytes);
+    CopierCopy(gpu, src, bytes);
     vcache_used[arena] = offset + bytes;
     vcache_pending |= 1u << arena;
     entry = VertexCacheEntry{src, bytes, offset, vcache_gen[arena], arena, epoch_now,
@@ -8202,11 +8497,40 @@ bool RasterizerGXM::AccelerateDrawBatch(bool is_indexed) {
         if (index_data == nullptr) {
             return HwVsReject("indices");
         }
-        if (index_u16) {
-            IndexRangeU16(reinterpret_cast<const u16*>(index_data), num_vertices, min_index,
-                          max_index);
+        /**
+         * EL RANGO DE LOS INDICES, RECORDADO (0.4.1.7). Recorrer los indices
+         * del lote para hallar el minimo y el maximo eran ~5 us por lote de
+         * memoria fria, y casi todos los buffers de indices son los mismos
+         * fotograma tras fotograma. Se recuerda por direccion, cuenta y
+         * tipo, y vale mientras sus paginas no reciban un aviso de escritura
+         * (Common::WriteEpochs, como la cache de vertices) y como mucho
+         * kVcacheRecheckPresents presentaciones. Si alguna vez saliera viejo,
+         * el rebase con tope evita leer fuera de lo copiado.
+         */
+        const u32 index_bytes = num_vertices * (index_u16 ? 2u : 1u);
+        const u32 range_slot =
+            static_cast<u32>((reinterpret_cast<uintptr_t>(index_data) >> 1) ^
+                             (static_cast<uintptr_t>(num_vertices) * 0x9E3779B1u)) %
+            kIndexRanges;
+        IndexRangeEntry& range = index_ranges[range_slot];
+        const u32 range_epoch = Common::WriteEpochs::Now();
+        if (range.data == index_data && range.count == num_vertices &&
+            range.is_u16 == index_u16 &&
+            presents_seen - range.verified_present < kVcacheRecheckPresents &&
+            Common::WriteEpochs::CleanSince(index_data, index_bytes, range.verified)) {
+            min_index = range.min_index;
+            max_index = range.max_index;
+            g_index_range_hits++;
         } else {
-            IndexRangeU8(index_data, num_vertices, min_index, max_index);
+            if (index_u16) {
+                IndexRangeU16(reinterpret_cast<const u16*>(index_data), num_vertices,
+                              min_index, max_index);
+            } else {
+                IndexRangeU8(index_data, num_vertices, min_index, max_index);
+            }
+            range = IndexRangeEntry{index_data, num_vertices, index_u16, min_index,
+                                    max_index, range_epoch, presents_seen};
+            g_index_range_misses++;
         }
     } else {
         // Sin indices se usa el buffer de indices secuenciales, que tiene
@@ -8810,7 +9134,7 @@ bool RasterizerGXM::AccelerateDrawBatch(bool is_indexed) {
                 stream_data[stream] = cached;
                 continue;
             }
-            std::memcpy(space, stream_source[stream], stream_bytes[stream]);
+            CopierCopy(space, stream_source[stream], stream_bytes[stream]);
             stream_data[stream] = space;
             space += (stream_bytes[stream] + 15u) & ~15u;
         }
@@ -8820,14 +9144,22 @@ bool RasterizerGXM::AccelerateDrawBatch(bool is_indexed) {
     if (is_indexed) {
         // Rebasados a 0: los flujos empiezan en min_index.
         auto* out = reinterpret_cast<u16*>(space);
-        if (index_u16) {
+        const u16 limit = static_cast<u16>(vertex_range - 1);
+        if (g_copier_on && num_vertices * 2u >= kCopierMinBytes) {
+            CopierPush(CopyJob{out, index_data, num_vertices,
+                               static_cast<u8>(index_u16 ? 1 : 2),
+                               static_cast<u16>(min_index), limit});
+        } else if (index_u16) {
             RebaseIndicesU16(reinterpret_cast<const u16*>(index_data), num_vertices,
-                             static_cast<u16>(min_index), out);
+                             static_cast<u16>(min_index), limit, out);
         } else {
-            RebaseIndicesU8(index_data, num_vertices, static_cast<u16>(min_index), out);
+            RebaseIndicesU8(index_data, num_vertices, static_cast<u16>(min_index), limit,
+                            out);
         }
         draw_indices = out;
     }
+    // Ver EL COPIADOR DE VERTICES: que empiece ya, mientras aqui sigue el lote.
+    CopierKick();
     data_lap(g_data_index_us);
 
     phase(3);
@@ -8937,6 +9269,8 @@ bool RasterizerGXM::AccelerateDrawBatch(bool is_indexed) {
         }
     }
     draw_lap(g_draw_vs_uniforms_us);
+    // Ver EL COPIADOR DE VERTICES: la GPU puede leer desde sceGxmDraw.
+    CopierWait();
 
     {
         BlackBox::DrawInfo info;
@@ -9060,6 +9394,10 @@ std::string RasterizerGXM::TakeCopySummary() {
     if (!any) {
         text += " -";
     }
+    if (g_consumed_forgotten != 0) {
+        text += fmt::format(" (consumidas olvidadas {})", g_consumed_forgotten);
+        g_consumed_forgotten = 0;
+    }
     auto& tex = TextureCache::rejects;
     text += fmt::format(
         " | sin textura: tipo {} tam {} mem {} rep {} sin gpu {}, apagadas servidas {}",
@@ -9148,13 +9486,27 @@ std::string RasterizerGXM::TakeBatchProfile() {
         g_pre_misc_us = 0;
         g_pre_samples = g_pre_endscenes = g_pre_luts = 0;
     }
+    text += fmt::format("\nrellenos pendientes: escritos al texturizar {} ({} KB)",
+                        g_lazy_applied, g_lazy_applied_kb);
+    g_lazy_applied = 0;
+    g_lazy_applied_kb = 0;
+    text += fmt::format(" | copiador: {} trabajos, {} KB, el lote espero {} veces "
+                        "({} us de media)",
+                        g_copier_jobs, g_copier_kb, g_copier_waits,
+                        g_copier_waits == 0 ? 0 : g_copier_wait_us / g_copier_waits);
+    g_copier_jobs = g_copier_kb = g_copier_waits = g_copier_wait_us = 0;
+    text += fmt::format(" | rango de indices recordado {} de {}", g_index_range_hits,
+                        g_index_range_hits + g_index_range_misses);
+    g_index_range_hits = g_index_range_misses = 0;
     text += fmt::format("\nsubidas: repetidas {} de {} ({} KB de {} KB)", g_upload_repeats,
                         g_upload_streams, g_upload_repeat_bytes / 1024, g_upload_bytes / 1024);
     text += fmt::format(" | cache: aciertos {} copias {} ({} KB sin copiar), cambios de zona {}, "
-                        "zona ocupada {} | sin leer {} (avisos de escritura {})",
+                        "zona ocupada {} | sin leer {} (avisos de escritura {}, cambios sin "
+                        "aviso {})",
                         g_vcache_hits, g_vcache_misses, g_vcache_hit_bytes / 1024,
                         g_vcache_switches, g_vcache_busy, g_vcache_trusted,
-                        Common::WriteEpochs::Marks() - g_epoch_marks_seen);
+                        Common::WriteEpochs::Marks() - g_epoch_marks_seen,
+                        g_vcache_violations);
     g_epoch_marks_seen = Common::WriteEpochs::Marks();
     g_vcache_trusted = 0;
     {
@@ -9163,9 +9515,12 @@ std::string RasterizerGXM::TakeBatchProfile() {
         u32 kib[Common::WriteEpochs::kSources];
         Common::WriteEpochs::TakeSourceStats(calls, kib);
         const auto& w = g_vcache_why;
+        text += fmt::format(" | todo por cambiado {} veces", Common::WriteEpochs::MarkAlls());
         text += fmt::format(" | copiado por: escrituras {} gsp vaciar {} gsp guardar {} gx {} "
-                            "svc {} rellenos {} copias {} todo {} cada 60 {} nuevo {}",
-                            w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7], w[8], w[9]);
+                            "svc {} rellenos {} copias {} fuera {} todo {} sin confianza {} "
+                            "cada 60 {} nuevo {}",
+                            w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7], w[8], w[9], w[10],
+                            w[11]);
         g_vcache_why.fill(0);
         text += fmt::format(" | avisos por fuente (llamadas/KB): escrituras {}/{} "
                             "gsp vaciar {}/{} gsp guardar {}/{} gx {}/{} svc {}/{} "

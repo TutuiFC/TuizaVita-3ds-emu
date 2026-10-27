@@ -64,7 +64,9 @@ namespace Service::Y2R {
 extern std::atomic<bool> g_y2r_async;
 } // namespace Service::Y2R
 #include "video_core/pica/pica_core.h"
+#include "core/hw/y2r.h"
 #include "video_core/renderer_gxm/gxm_cg.h"
+#include "video_core/shader/generator/cg_fs_shader_gen.h"
 #include "audio_core/hle/hle.h"
 #include "video_core/renderer_gxm/rasterizer_gxm.h"
 #include "video_core/shader/generator/cg_vs_shader_gen.h"
@@ -485,6 +487,11 @@ struct UserSettings {
     /// 0.4.0.8: los vertices de la cache de subidas sin comparar si ninguna
     /// de sus paginas ha avisado (Common::WriteEpochs). Solo ajustes.txt.
     bool vertex_epochs = true;
+    /// 0.4.1.1: shaders de vertices a O2 (Gxm::g_vs_o2). Solo ajustes.txt.
+    bool vs_o2 = false;
+    /// 0.4.1.9: fragmentos con fastprecision y combinador en half. Solo ajustes.txt.
+    bool fs_fast = false;
+    bool fs_half = false;
     bool jit_nativo = false;
     /// 0.3.9.8: el motor nativo tambien en el nucleo 1 (ver
     /// Core::Native::both_cores). Experimental, solo ajustes.txt.
@@ -631,6 +638,10 @@ void ApplyUserSettings() {
     Gxm::RasterizerGXM::exact_vs_uniforms.store(g_user.exact_vs_uniforms ? 1u : 0u,
                                                 std::memory_order_relaxed);
     Common::WriteEpochs::enabled.store(g_user.vertex_epochs, std::memory_order_relaxed);
+    Gxm::g_vs_o2.store(g_user.vs_o2, std::memory_order_relaxed);
+    Gxm::g_fs_fast.store(g_user.fs_fast, std::memory_order_relaxed);
+    Pica::Shader::Generator::GXM::g_fs_half_tev.store(g_user.fs_half,
+                                                      std::memory_order_relaxed);
     Core::Native::enabled = g_user.jit_nativo;
     Core::Native::both_cores = g_user.native_both_cores;
     if (g_user.jit_nativo) {
@@ -728,6 +739,9 @@ void LoadUserSettings() {
     read_bool("valla_exacta=", g_user.present_marks);
     read_bool("uniformes_justos=", g_user.exact_vs_uniforms);
     read_bool("vertices_por_vaciados=", g_user.vertex_epochs);
+    read_bool("vs_o2=", g_user.vs_o2);
+    read_bool("fs_rapidos=", g_user.fs_fast);
+    read_bool("fs_media=", g_user.fs_half);
     read_bool("jit_nativo=", g_user.jit_nativo);
     read_bool("nativo_dos_nucleos=", g_user.native_both_cores);
     if (read_int("vs_tope_kb=", value)) {
@@ -752,7 +766,7 @@ int FormatUserSettings(char* buffer, std::size_t size) {
         "dsp_hilo=%d\njit_perfil=%d\nvolcado_cada2=%d\ncopia_textura_gpu=%d\n"
         "jit_tabla_enlaces=%d\njit_saltos_cro=%d\njit_reusar_base=%d\nidioma_menu=%d\n"
         "wbuffer_gpu=%d\nmemo_valor=%d\nestado_sombra=%d\nvs_tope_kb=%d\nvs_cache_disp=%d\ncache_pipeline=%d\njit_nativo=%d\n"
-        "nativo_dos_nucleos=%d\nuniformes_directos=%d\ncache_subidas=%d\ny2r_hilo=%d\nvalla_exacta=%d\nuniformes_justos=%d\nvertices_por_vaciados=%d\n",
+        "nativo_dos_nucleos=%d\nuniformes_directos=%d\ncache_subidas=%d\ny2r_hilo=%d\nvalla_exacta=%d\nuniformes_justos=%d\nvertices_por_vaciados=%d\nvs_o2=%d\n",
         g_user.volume_percent, g_user.language, g_user.half_resolution ? 1 : 0,
         g_user.jit_reg_cache ? 1 : 0, g_user.jit_vfp_data ? 1 : 0, g_user.gxm_no_finish ? 1 : 0,
         g_user.gxm_present_direct ? 1 : 0, g_user.jit_direct_link ? 1 : 0,
@@ -771,7 +785,7 @@ int FormatUserSettings(char* buffer, std::size_t size) {
         g_user.native_both_cores ? 1 : 0, g_user.direct_uniforms ? 1 : 0,
         g_user.vertex_upload_cache ? 1 : 0, g_user.y2r_async ? 1 : 0,
         g_user.present_marks ? 1 : 0, g_user.exact_vs_uniforms ? 1 : 0,
-        g_user.vertex_epochs ? 1 : 0);
+        g_user.vertex_epochs ? 1 : 0, g_user.vs_o2 ? 1 : 0);
 }
 
 /// Los ajustes con los que se juega, a crash.txt en una linea (0.1.8.7): sin
@@ -2368,6 +2382,8 @@ void Run(vita2d_pgf* font) {
     menu.SetGames(roms);
     // Ver Gxm::RunCgBenchIfAny (0.4.0.0): solo con banco_cg/hacer.txt.
     Gxm::RunCgBenchIfAny();
+    // Ver HW::Y2R::RunBenchIfAny (0.4.1.4): solo con banco_mem/y2r.txt.
+    HW::Y2R::RunBenchIfAny();
     Gxm::RunMemBenchIfAny();
     RunPilotIfAny(font, roms);
     // Las caratulas que falten, en otro hilo (0.3.4.1). Ver vita_covers.h.

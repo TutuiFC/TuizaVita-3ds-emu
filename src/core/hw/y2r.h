@@ -14,4 +14,6 @@ struct ConversionConfiguration;
 
 namespace HW::Y2R {
 void PerformConversion(Memory::MemorySystem& memory, Service::Y2R::ConversionConfiguration cvt);
+/// El banco de la conversion (0.4.1.4): solo con ux0:/data/azahar/banco_mem/y2r.txt.
+void RunBenchIfAny();
 } // namespace HW::Y2R

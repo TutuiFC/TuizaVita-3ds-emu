@@ -4,11 +4,24 @@
 
 #pragma once
 
+#include <atomic>
 #include <optional>
 #include <string>
 #include "video_core/shader/generator/pica_fs_config.h"
 
 namespace Pica::Shader::Generator::GXM {
+
+/**
+ * EXPERIMENTO, NO PARA JUGAR (0.4.1.5): con esto puesto (el rasterizador lo
+ * pone si existe ux0:/data/azahar/fs_plano.txt) cada shader de fragmentos es
+ * un color fijo que solo toca sus entradas. La imagen sale de un color, pero
+ * el tiempo de chip que queda dice cuanto de la fase de pixeles es el
+ * shader y cuanto rasterizar, ocultar, mezclar y mover baldosas.
+ */
+extern std::atomic<bool> g_fs_flat_test;
+
+/// El combinador TEV en half (0.4.1.9, ajuste fs_media=; ver HalfTev en el .cpp).
+extern std::atomic<bool> g_fs_half_tev;
 
 /**
  * Generador del shader de fragmentos de la PICA en Cg para el backend GXM.

@@ -188,6 +188,8 @@ private:
         u64 key = 0;
         PAddr address = 0;
         u32 span = 0;
+        /// Niveles de mipmap subidos (0.4.1.8, ver LOS MIPMAPS, DE VERDAD).
+        u32 levels = 1;
         /// Marca de tiempo logica del ultimo uso, para la expulsion LRU.
         u64 last_use = 0;
         /// Hash (XXH3) de los bytes del invitado con los que se decodifico.
@@ -226,7 +228,8 @@ private:
                        const std::vector<u32>& changed, bool min_linear, bool mag_linear,
                        SceGxmTextureAddrMode wrap_s, SceGxmTextureAddrMode wrap_t);
     void SetupTexture(Entry& entry, u32 width, u32 height, bool min_linear, bool mag_linear,
-                      SceGxmTextureAddrMode wrap_s, SceGxmTextureAddrMode wrap_t);
+                      SceGxmTextureAddrMode wrap_s, SceGxmTextureAddrMode wrap_t,
+                      u32 levels = 1, bool swizzled = false);
 
     /// Manda la memoria de la entrada a la lista de espera y la deja libre.
     void Retire(Entry& entry);
@@ -262,6 +265,8 @@ private:
     /// Banda de 8 lineas en RAM para decodificar por filas de mosaicos (ver
     /// Get). Se reutiliza: como mucho 1024 x 8 texeles, 32 KB.
     std::vector<u32> band;
+    /// La imagen entera en RAM antes de pasarla en orden Z (0.4.2.0).
+    std::vector<u32> staging;
     /// Filas cambiadas en la revalidacion en curso (ver Get).
     std::vector<u32> changed_bands;
     /**

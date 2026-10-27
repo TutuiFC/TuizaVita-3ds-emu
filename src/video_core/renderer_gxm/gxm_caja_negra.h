@@ -67,7 +67,10 @@ struct DrawInfo {
 
 /// Arranca el hilo de la caja (una vez). 'fence' es la valla que escribe la GPU
 /// al acabar cada escena.
-void Start(const volatile unsigned int* fence);
+/// vertex_fence (0.4.1.3): la valla que la GPU escribe al acabar la fase de
+/// vertices de cada escena, para partir su tiempo de chip en dos.
+void Start(const volatile unsigned int* fence,
+           const volatile unsigned int* vertex_fence = nullptr);
 
 /// El anillo de vertices, para ver si algun flujo o indice se sale de el.
 void NoteVertexRing(const void* base, u32 size);

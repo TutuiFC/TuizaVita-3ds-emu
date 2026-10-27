@@ -36,6 +36,11 @@ bool EnsureCgReady();
  */
 void RunCgBenchIfAny();
 
+/// Los shaders de vertices a O2 (0.4.1.1, ver gxm_cg.cpp). Ajuste "vs_o2=".
+extern std::atomic<bool> g_vs_o2;
+/// Fragmentos compilados con useFastprecision (0.4.1.9, ajuste fs_rapidos=).
+extern std::atomic<bool> g_fs_fast;
+
 /// El banco de memoria (0.4.0.9, gxm_banco_memoria.cpp): solo con banco_mem/hacer.txt.
 void RunMemBenchIfAny();
 

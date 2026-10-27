@@ -1134,7 +1134,7 @@ void StoreBadSource(const BadSource& bad) {
 }
 
 /// Ver g_tracking: descarga el compilador roto y devuelve lo que perdio.
-void RecoverFromInternalError() {
+void RecoverFromInternalError(bool counts = true) {
     if (g_module < 0) {
         return;
     }
@@ -1150,7 +1150,8 @@ void RecoverFromInternalError() {
      */
     constexpr u32 kVsRecoveries = 6;
     constexpr u32 kMaxRecoveries = 16;
-    if (g_generation + 1 >= kVsRecoveries && !g_poisoned) {
+    // Un error a O2 que se reintenta a O1 no cuenta (0.4.1.1).
+    if (counts && g_generation + 1 >= kVsRecoveries && !g_poisoned) {
         g_poisoned = true;
         Common::VitaNote("gxm shader", "demasiados errores internos: no se traducen mas "
                                        "shaders de vertices en esta sesion");
@@ -1404,9 +1405,103 @@ std::string CurrentGameCachePrefix() {
     return g_game_prefix;
 }
 
+
+/**
+ * LOS DE VERTICES EN O2 (0.4.1.1). El banco del compilador (27-10) compilo a O2
+ * los siete shaders de vertices que tenemos guardados de Zafiro Alfa y Super
+ * Mario 3D Land, incluido el que da "fatal internal error" a O3 (e1): todos
+ * bien, con binarios un 23-35 % mas pequenos que a O1 y algo mas rapidos de
+ * compilar. Y el chip de la Vita tarda en proporcion al tamano del programa
+ * de vertices (Mario 3D Land: 3,1 ms + 0,07 us por KB de trabajo, r2 1,00).
+ *
+ * Su binario lleva OTRA identidad en la cache (las dos huellas con kVsO2Salt):
+ * los O1 de antes no se usan y cada uno se recompila una vez a O2. Si alguno
+ * diera error interno a O2, va a la lista de cg_o2_malos.bin y desde entonces
+ * se compila a O1 (en la misma compilacion, tras recargar el compilador), en
+ * vez de acabar en la lista negra y por la CPU como en 0.4.0.1 con O3.
+ *
+ * APAGADO POR DEFECTO (0.4.1.2). En Super Mario 3D Land, jugando, los
+ * programas reales salieron MAS grandes a O2 ("KB de trabajo vs" por
+ * superficie 162.825 -> 219.738) y el chip tardo un 6 % mas por superficie:
+ * los del banco eran de otra version del traductor. Los binarios O1 siguen en
+ * la cache con su identidad, asi que apagarlo no recompila nada.
+ */
+std::atomic<bool> g_vs_o2{false};
+constexpr u64 kVsO2Salt = 0x4F32A5C3D1E07B69ull;
+constexpr char kO2BadPath[] = "ux0:/data/azahar/shadercache/cg_o2_malos.bin";
+std::mutex g_o2_bad_mutex;
+std::unordered_set<u64> g_o2_bad;
+bool g_o2_bad_loaded = false;
+
+bool IsO2Bad(u64 hash_city) {
+    const std::lock_guard lock{g_o2_bad_mutex};
+    if (!g_o2_bad_loaded) {
+        g_o2_bad_loaded = true;
+        if (std::FILE* in = std::fopen(kO2BadPath, "rb")) {
+            u64 hash = 0;
+            while (std::fread(&hash, sizeof(hash), 1, in) == 1) {
+                g_o2_bad.insert(hash);
+            }
+            std::fclose(in);
+        }
+    }
+    return g_o2_bad.count(hash_city) != 0;
+}
+
+void AddO2Bad(u64 hash_city) {
+    (void)IsO2Bad(hash_city);
+    const std::lock_guard lock{g_o2_bad_mutex};
+    if (!g_o2_bad.insert(hash_city).second) {
+        return;
+    }
+    if (std::FILE* out = std::fopen(kO2BadPath, "ab")) {
+        std::fwrite(&hash_city, sizeof(hash_city), 1, out);
+        std::fclose(out);
+    }
+}
+
+/// Este fuente de vertices se compila (y se busca en la cache) a O2.
+bool VsUsesO2(SceShaccCgTargetProfile profile, u64 hash_city) {
+    return profile == SCE_SHACCCG_PROFILE_VP && g_vs_o2.load(std::memory_order_relaxed) &&
+           !IsO2Bad(hash_city);
+}
+
+/// La identidad en la cache de un binario a O2 (ver kVsO2Salt).
+void SaltForO2(u64& hash_city, u64& hash_fnv) {
+    hash_city ^= kVsO2Salt;
+    hash_fnv ^= kVsO2Salt;
+}
+
+/**
+ * FRAGMENTOS CON fastprecision (0.4.1.9, ajuste fs_rapidos=). El 80-90 % del
+ * chip en Mario 3D Land y Zafiro es el shader de fragmentos (experimento
+ * fs_plano de 0.4.1.5). Con esto el compilador puede usar media precision
+ * donde lo vea seguro. Su binario lleva otra identidad en la cache, como los
+ * de O2: se recompila cada uno una vez.
+ */
+std::atomic<bool> g_fs_fast{false};
+constexpr u64 kFsFastSalt = 0x7A11F0E5C3B2D194ull;
+
+bool FsUsesFast(SceShaccCgTargetProfile profile) {
+    return profile == SCE_SHACCCG_PROFILE_FP && g_fs_fast.load(std::memory_order_relaxed);
+}
+
+void SaltForFast(u64& hash_city, u64& hash_fnv) {
+    hash_city ^= kFsFastSalt;
+    hash_fnv ^= kFsFastSalt;
+}
+
 bool CgCacheContains(SceShaccCgTargetProfile profile, const std::string& source) {
-    const std::string path =
-        CachePath(Common::ComputeHash64(source.data(), source.size()), profile);
+    u64 hash = Common::ComputeHash64(source.data(), source.size());
+    if (VsUsesO2(profile, hash)) {
+        u64 unused = 0;
+        SaltForO2(hash, unused);
+    }
+    if (FsUsesFast(profile)) {
+        u64 unused = 0;
+        SaltForFast(hash, unused);
+    }
+    const std::string path = CachePath(hash, profile);
     const std::lock_guard lock{g_preload_mutex};
     return g_preloaded.count(path) != 0 || g_card_files.count(path) != 0;
 }
@@ -1572,6 +1667,12 @@ const SceShaccCgCompileOutput* LoadCgCache(SceShaccCgTargetProfile profile, cons
     key.source_size = static_cast<u32>(source_size);
     key.hash_city = Common::ComputeHash64(source, source_size);
     key.hash_fnv = Fnv1a64(source, source_size);
+    if (VsUsesO2(profile, key.hash_city)) {
+        SaltForO2(key.hash_city, key.hash_fnv);
+    }
+    if (FsUsesFast(profile)) {
+        SaltForFast(key.hash_city, key.hash_fnv);
+    }
     const unsigned long long begin_us = Common::VitaMicros();
     const std::string path = CachePath(key.hash_city, profile);
     const SceShaccCgCompileOutput* cached = nullptr;
@@ -1608,8 +1709,11 @@ const SceShaccCgCompileOutput* LoadCgCacheIndexed(u64 key, u32* variant) {
     want.source_size = record.source_size;
     want.hash_city = record.hash_city;
     want.hash_fnv = record.hash_fnv;
+    if (VsUsesO2(SCE_SHACCCG_PROFILE_VP, record.hash_city)) {
+        SaltForO2(want.hash_city, want.hash_fnv);
+    }
     const SceShaccCgCompileOutput* output =
-        LoadCached(want, CachePath(record.hash_city, SCE_SHACCCG_PROFILE_VP));
+        LoadCached(want, CachePath(want.hash_city, SCE_SHACCCG_PROFILE_VP));
     if (output != nullptr) {
         *variant = record.variant;
     }
@@ -1655,8 +1759,31 @@ void AddVsIndex(u64 key, const std::string& source, u32 variant) {
     sceIoWrite(g_vs_index_fd, &record, sizeof(record));
 }
 
+namespace {
+const SceShaccCgCompileOutput* CompileCgOnce(SceShaccCgTargetProfile profile, const char* name,
+                                             const char* source, bool& retry_at_o1);
+} // Anonymous namespace
+
+/**
+ * Compila (o lee de la cache) y, si un shader de vertices dio error interno a
+ * O2, lo vuelve a intentar a O1 en el acto (0.4.1.1, ver g_vs_o2): para
+ * entonces ya esta en la lista de O2 malos y el compilador recargado.
+ */
 const SceShaccCgCompileOutput* CompileCg(SceShaccCgTargetProfile profile, const char* name,
                                          const char* source) {
+    bool retry_at_o1 = false;
+    const SceShaccCgCompileOutput* output = CompileCgOnce(profile, name, source, retry_at_o1);
+    if (output == nullptr && retry_at_o1) {
+        bool again = false;
+        output = CompileCgOnce(profile, name, source, again);
+    }
+    return output;
+}
+
+namespace {
+const SceShaccCgCompileOutput* CompileCgOnce(SceShaccCgTargetProfile profile, const char* name,
+                                             const char* source, bool& retry_at_o1) {
+    retry_at_o1 = false;
     // Cache en la tarjeta (0.1.5.8): si este codigo fuente ya se compilo
     // alguna vez, el binario se lee de disco. Ver CacheHeader. Sin el cerrojo
     // del compilador (0.1.9.6): no hay que esperar a que acabe otra compilacion.
@@ -1668,6 +1795,15 @@ const SceShaccCgCompileOutput* CompileCg(SceShaccCgTargetProfile profile, const 
     key.source_size = static_cast<u32>(source_size);
     key.hash_city = Common::ComputeHash64(source, source_size);
     key.hash_fnv = Fnv1a64(source, source_size);
+    const u64 plain_hash_city = key.hash_city;
+    const bool o2 = VsUsesO2(profile, key.hash_city);
+    if (o2) {
+        SaltForO2(key.hash_city, key.hash_fnv);
+    }
+    const bool fast = FsUsesFast(profile);
+    if (fast) {
+        SaltForFast(key.hash_city, key.hash_fnv);
+    }
     const std::string cache_path = CachePath(key.hash_city, profile);
     {
         const unsigned long long begin_us = Common::VitaMicros();
@@ -1754,7 +1890,12 @@ const SceShaccCgCompileOutput* CompileCg(SceShaccCgTargetProfile profile, const 
      * de vertices a la CPU y el juego a 3 fps. No vale el riesgo.
      */
     if (profile == SCE_SHACCCG_PROFILE_VP) {
-        options.optimizationLevel = 1;
+        // Ver g_vs_o2 (0.4.1.1).
+        options.optimizationLevel = o2 ? 2 : 1;
+    }
+    if (fast) {
+        // Ver g_fs_fast (0.4.1.9).
+        options.useFastprecision = 1;
     }
     // Nada en O0: los de vertices desde 0.2.1.6 (uno colgo la GPU en 0.2.1.3),
     // los de fragmentos desde 0.3.7.8 (ver PurgeUnoptimizedPrograms).
@@ -1876,7 +2017,15 @@ const SceShaccCgCompileOutput* CompileCg(SceShaccCgTargetProfile profile, const 
             sceShaccCgDestroyCompileOutput(output);
         }
         ClearCompilingMarker();
-        if (internal) {
+        if (internal && o2) {
+            // Ver g_vs_o2 (0.4.1.1): no a la lista negra, sino a O1.
+            AddO2Bad(plain_hash_city);
+            Common::VitaNote("gxm shader", fmt::format("{}: error interno a O2, se "
+                                                     "compila a O1", name)
+                                             .c_str());
+            RecoverFromInternalError(false);
+            retry_at_o1 = true;
+        } else if (internal) {
             /**
              * Ese codigo no se vuelve a mandar (ni en otra sesion) y el
              * compilador se recarga limpio para el siguiente. De 0.3.2.1 a
@@ -1962,6 +2111,7 @@ const SceShaccCgCompileOutput* CompileCg(SceShaccCgTargetProfile profile, const 
     }
     return copy;
 }
+} // Anonymous namespace
 
 void CgForgetInterruptedCompile() {
     ClearCompilingMarker();
@@ -2366,10 +2516,35 @@ std::string BenchCompile(bool vertex, const std::string& source, int opt, int fa
         }
     }
     const bool ok = output != nullptr && output->programData != nullptr;
+    /**
+     * LO QUE IMPORTA DEL BINARIO (0.4.2.0). Los bytes del programa no son lo
+     * que cuesta: el banco del 27-10 vio fastprecision y half dar binarios
+     * mas GRANDES. Lo que mide el chip es cuantas instrucciones tiene el
+     * programa principal y cuantos registros temporales usa (con mas, caben
+     * menos hilos a la vez y se tapan peor las lecturas de textura). Los
+     * campos de la cabecera SceGxmProgram, en sus desplazamientos (los de
+     * Vita3K, gxm/types.h).
+     */
+    std::string header = "-";
+    if (ok && output->programSize >= 72) {
+        const u8* const gxp = reinterpret_cast<const u8*>(output->programData);
+        const auto u16_at = [gxp](u32 at) {
+            u16 v;
+            std::memcpy(&v, gxp + at, sizeof(v));
+            return v;
+        };
+        const auto u32_at = [gxp](u32 at) {
+            u32 v;
+            std::memcpy(&v, gxp + at, sizeof(v));
+            return v;
+        };
+        header = fmt::format("instrucciones {} (secundario {}), temporales {}, PA {}, SA {}",
+                             u32_at(60), u32_at(68), u32_at(52), u16_at(48), u16_at(50));
+    }
     const std::string text = fmt::format(
-        "{} | reloj {} ms, CPU {} ms | {} bytes de binario | {} reservas, {} MB pedidos | {}",
+        "{} | reloj {} ms, CPU {} ms | {} bytes de binario | {} | {} reservas, {} MB pedidos | {}",
         ok ? "OK" : "FALLO", wall_ms, (after.runClocks - before.runClocks) / 1000,
-        ok ? output->programSize : 0, g_alloc_calls, g_alloc_total >> 20, diagnostic);
+        ok ? output->programSize : 0, header, g_alloc_calls, g_alloc_total >> 20, diagnostic);
     if (output != nullptr) {
         sceShaccCgDestroyCompileOutput(output);
     }

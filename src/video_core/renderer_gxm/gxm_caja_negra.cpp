@@ -95,6 +95,7 @@ struct Box {
 
 std::atomic<Box*> g_box{nullptr};
 const volatile unsigned int* g_fence = nullptr;
+const volatile unsigned int* g_vertex_fence = nullptr;
 
 // Solo los toca el hilo que dibuja.
 bool g_scene_open = false;
@@ -296,6 +297,15 @@ struct KindStats {
     u32 scenes = 0;
     unsigned long long chip_us = 0;
     u32 max_us = 0;
+    /**
+     * LAS DOS FASES (0.4.1.3). El SGX hace cada escena en dos: vertices (y
+     * reparto en baldosas) y luego pixeles. Con la valla de vertices se
+     * sabe cuanto lleva cada una: de poder empezar (escena cerrada y la
+     * fase de vertices anterior hecha) a acabar los vertices, y de ahi (o
+     * del fin de los pixeles de la anterior) a acabar los pixeles.
+     */
+    unsigned long long vertex_us = 0;
+    unsigned long long pixel_us = 0;
 };
 struct Window {
     KindStats kind[4];
@@ -332,18 +342,18 @@ void NoteWindow(const Window& w, double seconds) {
         r2 = vy > 0 ? cov * cov / (den * vy) : 0;
     }
     const double per = draw.scenes != 0 ? static_cast<double>(draw.scenes) : 1.0;
-    char line[512];
+    char line[640];
     std::snprintf(line, sizeof(line),
                   "ocupado %.0f ms/s (%.0f %%), %.0f escenas/s (%u perdidas) | superficie "
                   "%.0f/s media %.0f us max %u | copia %.0f/s media %.0f us | borrado %.0f/s "
                   "media %.0f us | por superficie: %.0f indices vs-gpu, %.0f KB de trabajo vs, "
                   "%.0f vertices vs-cpu, %.1f KB de fs | ajuste: %.0f us + %.2f us por KB vs, "
-                  "r2 %.2f",
+                  "r2 %.2f | fases por superficie: vertices %.0f us, pixeles %.0f us",
                   busy / 1000.0 / seconds, busy / 10000.0 / seconds, scenes / seconds, w.lost,
                   draw.scenes / seconds, avg(draw), draw.max_us, blit.scenes / seconds,
                   avg(blit), clear.scenes / seconds, avg(clear), w.vgpu_indices / per,
                   w.vs_work_kb / per, w.vcpu_vertices / per, w.fs_bytes / per / 1024.0,
-                  intercept, slope, r2);
+                  intercept, slope, r2, draw.vertex_us / per, draw.pixel_us / per);
     Common::VitaNote("gpu chip", line);
 }
 
@@ -352,6 +362,11 @@ void* TimerMain(void*) {
     u32 tail = 0;
     u32 seq = 0;
     unsigned long long last_done_us = 0;
+    // Las fases (ver KindStats): por donde van los vertices y cuando.
+    u32 vtail = 0;
+    unsigned long long last_vdone_us = 0;
+    static unsigned long long vstart_at[kTimed];
+    static unsigned long long vdone_at[kTimed];
     unsigned long long window_start = Common::VitaMicros();
     Window w{};
     int fill = 0;
@@ -359,11 +374,26 @@ void* TimerMain(void*) {
     while (true) {
         sceKernelDelayThread(250);
         const u32 done = g_fence != nullptr ? *g_fence : 0;
+        // Despues de la de pixeles: asi nunca va por detras de ella.
+        const u32 vdone = g_vertex_fence != nullptr ? *g_vertex_fence : done;
         const unsigned long long now = Common::VitaMicros();
         const u32 head = g_timed_head.load(std::memory_order_acquire);
         if (head - tail > kTimed) {
             w.lost += head - tail - kTimed / 2;
             tail = head - kTimed / 2;
+        }
+        if (static_cast<s32>(tail - vtail) > 0) {
+            vtail = tail;
+        }
+        while (vtail != head) {
+            const Submitted& sub = g_timed[vtail % kTimed];
+            if (static_cast<s32>(sub.fence - vdone) > 0) {
+                break;
+            }
+            vstart_at[vtail % kTimed] = std::max(sub.submit_us, last_vdone_us);
+            vdone_at[vtail % kTimed] = now;
+            last_vdone_us = now;
+            vtail++;
         }
         while (tail != head) {
             const Submitted& sub = g_timed[tail % kTimed];
@@ -372,10 +402,15 @@ void* TimerMain(void*) {
             }
             const unsigned long long start = std::max(sub.submit_us, last_done_us);
             const u32 chip = now > start ? static_cast<u32>(now - start) : 0;
+            const unsigned long long vstart = vstart_at[tail % kTimed];
+            const unsigned long long vend = vdone_at[tail % kTimed];
+            const unsigned long long pstart = std::max(vend, last_done_us);
             last_done_us = now;
             KindStats& k = w.kind[sub.kind & 3u];
             k.scenes++;
             k.chip_us += chip;
+            k.vertex_us += vend > vstart ? vend - vstart : 0;
+            k.pixel_us += now > pstart ? now - pstart : 0;
             k.max_us = std::max(k.max_us, chip);
             const u32 vs_kb = static_cast<u32>(sub.work.vs_work / 1024);
             if (sub.kind == static_cast<u32>(SceneKind::Draw)) {
@@ -569,8 +604,9 @@ void* BoxMain(void*) {
 
 } // Anonymous namespace
 
-void Start(const volatile unsigned int* fence) {
+void Start(const volatile unsigned int* fence, const volatile unsigned int* vertex_fence) {
     g_fence = fence;
+    g_vertex_fence = vertex_fence;
     static bool started = false;
     if (started) {
         return;

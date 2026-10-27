@@ -8,6 +8,7 @@
 #include <utility>
 #include <arm_neon.h>
 #include <fmt/format.h>
+#include <psp2/io/stat.h>
 #include "common/color.h"
 #include "common/hash.h"
 #include "common/logging/log.h"
@@ -255,6 +256,56 @@ bool DecodeTileFast(const u8* tile, TexturingRegs::TextureFormat format, u32 wid
         return true;
     default:
         return false;
+    }
+}
+
+
+/**
+ * EL ORDEN EN Z DE GXM (0.4.2.0). Una textura SWIZZLED de GXM (lados potencia de
+ * dos) guarda sus texeles en orden de Morton dentro de un cuadrado de lado el
+ * menor de los dos: en el indice, los bits pares son de y y los impares de x
+ * (el bit 0 es de y). Los bits de encima eligen el cuadrado siguiente a lo largo
+ * del lado mayor. Es lo que hace Vita3K al desenrollarlas
+ * (renderer/src/texture/format.cpp, swizzled_texture_to_linear_texture).
+ *
+ * POR QUE. Hasta ahora todas las texturas iban en LINEAL: el filtro bilineal
+ * lee 2x2 texeles y en lineal la fila de abajo esta a un ancho entero de
+ * distancia (otra linea de cache del chip); en Z los cuatro suelen caer en la
+ * misma. El experimento fs_plano midio que la fase de pixeles es el 80-90 % del
+ * chip en Mario 3D Land y Zafiro.
+ */
+u32 CompactEvenBits(u32 v) {
+    v &= 0x55555555u;
+    v = (v ^ (v >> 1)) & 0x33333333u;
+    v = (v ^ (v >> 2)) & 0x0F0F0F0Fu;
+    v = (v ^ (v >> 4)) & 0x00FF00FFu;
+    v = (v ^ (v >> 8)) & 0x0000FFFFu;
+    return v;
+}
+
+/// De una imagen lineal en RAM (con cache) a la GPU en orden Z: la memoria de
+/// la GPU se escribe en orden (sin cache, combinando escrituras) y lo que salta
+/// es la lectura, que si tiene cache.
+void WriteSwizzled(u32* dst, const u32* src, u32 width, u32 height) {
+    const u32 side = std::min(width, height);
+    u32 k = 0;
+    while ((1u << k) < side) {
+        k++;
+    }
+    const u32 square_mask = side * side - 1;
+    const u32 total = width * height;
+    const bool wide = width >= height;
+    for (u32 i = 0; i < total; i++) {
+        const u32 low = i & square_mask;
+        u32 x = CompactEvenBits(low >> 1);
+        u32 y = CompactEvenBits(low);
+        const u32 upper = (i >> (2 * k)) << k;
+        if (wide) {
+            x += upper;
+        } else {
+            y += upper;
+        }
+        dst[i] = src[static_cast<std::size_t>(y) * width + x];
     }
 }
 
@@ -691,6 +742,41 @@ const SceGxmTexture* TextureCache::Get(u32 unit, const Pica::RegsInternal& regs,
      * abajo.
      */
 
+    /**
+     * LOS MIPMAPS, DE VERDAD (0.4.1.8). Lo de arriba tenia razon sobre el
+     * rasterizador de software, pero la consola de verdad SI usa los niveles
+     * que el juego deja detras del nivel 0, y sin ellos la GPU de la Vita
+     * muestrea lo lejano de la textura a tamano completo: se ve con dientes
+     * y parpadeos, y cada pixel lejano lee texeles muy separados, que es lo
+     * peor que se le puede hacer a la cache de texturas del chip. Las fases
+     * del chip (0.4.1.3) dicen que en Mario 3D Land y Zafiro manda la de
+     * PIXELES. Asi que, con texturas potencia de dos y nivel minimo 0, se
+     * suben los niveles hasta max_level (y como mucho hasta 8x8, el mosaico
+     * de la PICA), cada uno volteado como el 0 y seguidos, que es como GXM
+     * los quiere en una textura lineal (filas de 8 texeles alineadas, que a
+     * partir de 8 de ancho ya lo estan). Se apaga con
+     * ux0:/data/azahar/sin_mipmaps.txt.
+     */
+    static const bool mipmaps_on = [] {
+        SceIoStat off{};
+        const bool on = sceIoGetstat("ux0:/data/azahar/sin_mipmaps.txt", &off) < 0;
+        Common::VitaNote("gxm textura", on ? "mipmaps: si" : "mipmaps: no (sin_mipmaps.txt)");
+        return on;
+    }();
+    u32 mip_levels = 1;
+    {
+        const u32 w = config->width;
+        const u32 h = config->height;
+        const bool pow2 = w >= 8 && h >= 8 && (w & (w - 1)) == 0 && (h & (h - 1)) == 0;
+        if (mipmaps_on && pow2 && config->lod.min_level == 0) {
+            const u32 max_level = config->lod.max_level;
+            while (mip_levels <= max_level && (w >> mip_levels) >= 8 &&
+                   (h >> mip_levels) >= 8) {
+                mip_levels++;
+            }
+        }
+    }
+
     SceGxmTextureAddrMode wrap_s{};
     SceGxmTextureAddrMode wrap_t{};
     if (!MapWrap(config->wrap_s.Value(), &wrap_s) || !MapWrap(config->wrap_t.Value(), &wrap_t)) {
@@ -729,6 +815,17 @@ const SceGxmTexture* TextureCache::Get(u32 unit, const Pica::RegsInternal& regs,
     bool want_shadow = false;
     if (const auto found = index.find(key); found != index.end()) {
         Entry& entry = entries[found->second];
+        /**
+         * Ver LOS MIPMAPS, DE VERDAD: los niveles no estan en la clave. En
+         * 0.4.1.8 una entrada con OTROS niveles se retiraba, y Mario 3D Land usa
+         * la misma textura con distinto max_level en distintos lotes: 168
+         * decodificaciones por ventana, 8,9 ms por fotograma. Ahora solo se
+         * rehace si le faltan niveles; con niveles de mas vale tal cual (los
+         * salio de leer esa misma memoria, y si cambia se revalida por hash).
+         */
+        if (entry.valid && entry.levels < mip_levels) {
+            Retire(entry);
+        }
         if (entry.stale) {
             // Sospechosa (ver InvalidateRange): se revalida por contenido. La
             // direccion y el tramo son los de la clave, asi que son los mismos
@@ -811,10 +908,20 @@ const SceGxmTexture* TextureCache::Get(u32 unit, const Pica::RegsInternal& regs,
     // Filas de mosaicos redondeando hacia ARRIBA. Con height/8, un alto que no
     // fuera multiplo de ocho dejaba la ultima fila fuera del tramo comprobado y
     // la decodificacion la leia igual.
-    const u32 span = static_cast<u32>(info.stride) * ((height + 7) / 8);
+    u32 span = static_cast<u32>(info.stride) * ((height + 7) / 8);
     if (span == 0) {
         rejects[kRejectSize].fetch_add(1, std::memory_order_relaxed);
         return nullptr;
+    }
+    // Con mipmaps, el tramo y lo que ocupa en la GPU son los de todos los niveles.
+    u32 mip_texels = width * height;
+    for (u32 level = 1; level < mip_levels; level++) {
+        Pica::Texture::TextureInfo level_info = info;
+        level_info.width = width >> level;
+        level_info.height = height >> level;
+        level_info.SetDefaultStride();
+        span += static_cast<u32>(level_info.stride) * (level_info.height / 8);
+        mip_texels += level_info.width * level_info.height;
     }
     // El tramo entero tiene que estar mapeado y contiguo: la decodificacion
     // recorre todos los texeles, no solo los que el juego llegue a muestrear.
@@ -824,7 +931,7 @@ const SceGxmTexture* TextureCache::Get(u32 unit, const Pica::RegsInternal& regs,
         return nullptr;
     }
 
-    const u32 needed = width * height * 4;
+    const u32 needed = mip_texels * 4;
     Entry& entry = MakeRoom(needed);
 
     // CDRAM primero: la CPU la escribe una vez y la GPU la lee en cada
@@ -872,12 +979,90 @@ const SceGxmTexture* TextureCache::Get(u32 unit, const Pica::RegsInternal& regs,
     auto* dest = static_cast<u32*>(buffer.Data());
     entry.band_hashes.clear();
     const bool tiled_rows = width % 8 == 0 && height % 8 == 0;
-    if (tiled_rows && want_shadow && needed <= kMaxShadowTexture &&
+    if (tiled_rows && mip_levels == 1 && want_shadow && needed <= kMaxShadowTexture &&
         shadow_bytes + needed <= kMaxShadowBytes) {
         entry.shadow.resize(static_cast<std::size_t>(width) * height);
         shadow_bytes += needed;
     }
-    if (tiled_rows) {
+    static const bool swizzle_on = [] {
+        SceIoStat off{};
+        const bool on = sceIoGetstat("ux0:/data/azahar/sin_swizzle.txt", &off) < 0;
+        Common::VitaNote("gxm textura", on ? "orden Z: si" : "orden Z: no (sin_swizzle.txt)");
+        return on;
+    }();
+    const bool pow2_size = (width & (width - 1)) == 0 && (height & (height - 1)) == 0;
+    const bool swizzled = swizzle_on && pow2_size && tiled_rows && entry.shadow.empty();
+    if (swizzled) {
+        // Ver EL ORDEN EN Z DE GXM: cada nivel a RAM (volteado, como siempre) y
+        // de ahi a la GPU en orden Z. Con un solo nivel se guardan las bandas
+        // igual que en el camino normal, para revalidar por filas.
+        band.resize(static_cast<std::size_t>(width) * 8);
+        staging.resize(static_cast<std::size_t>(width) * height);
+        if (mip_levels == 1) {
+            entry.band_hashes.resize(height / 8);
+        }
+        const u8* level_source = source;
+        u32* level_dest = dest;
+        for (u32 level = 0; level < mip_levels; level++) {
+            Pica::Texture::TextureInfo level_info = info;
+            level_info.width = width >> level;
+            level_info.height = height >> level;
+            level_info.SetDefaultStride();
+            const u32 level_w = level_info.width;
+            const u32 level_h = level_info.height;
+            for (u32 tile_y = 0; tile_y < level_h / 8; tile_y++) {
+                const u8* row_source = level_source + tile_y * level_info.stride;
+                if (mip_levels == 1) {
+                    entry.band_hashes[tile_y] =
+                        Common::ComputeHash64(row_source, level_info.stride);
+                }
+                DecodeTileRow(row_source, level_info, level_w, band.data());
+                for (u32 line = 0; line < 8; line++) {
+                    const u32 dest_y = level_h - 1 - (tile_y * 8 + line);
+                    std::memcpy(staging.data() + static_cast<std::size_t>(dest_y) * level_w,
+                                band.data() + static_cast<std::size_t>(line) * level_w,
+                                static_cast<std::size_t>(level_w) * 4);
+                }
+            }
+            WriteSwizzled(level_dest, staging.data(), level_w, level_h);
+            level_source += level_info.stride * (level_h / 8);
+            level_dest += static_cast<std::size_t>(level_w) * level_h;
+        }
+    } else if (mip_levels > 1) {
+        // Ver LOS MIPMAPS, DE VERDAD: nivel a nivel, como el camino normal
+        // pero sin bandas (se revalida por el hash del tramo entero).
+        band.resize(static_cast<std::size_t>(width) * 8);
+        const u8* level_source = source;
+        u32* level_dest = dest;
+        for (u32 level = 0; level < mip_levels; level++) {
+            Pica::Texture::TextureInfo level_info = info;
+            level_info.width = width >> level;
+            level_info.height = height >> level;
+            level_info.SetDefaultStride();
+            const u32 level_w = level_info.width;
+            const u32 level_h = level_info.height;
+            for (u32 tile_y = 0; tile_y < level_h / 8; tile_y++) {
+                DecodeTileRow(level_source + tile_y * level_info.stride, level_info, level_w,
+                              band.data());
+                for (u32 line = 0; line < 8; line++) {
+                    const u32 dest_y = level_h - 1 - (tile_y * 8 + line);
+                    std::memcpy(level_dest + static_cast<std::size_t>(dest_y) * level_w,
+                                band.data() + static_cast<std::size_t>(line) * level_w,
+                                static_cast<std::size_t>(level_w) * 4);
+                }
+            }
+            level_source += level_info.stride * (level_h / 8);
+            level_dest += static_cast<std::size_t>(level_w) * level_h;
+        }
+        static u32 mip_notes = 0;
+        if (mip_notes < 3) {
+            mip_notes++;
+            Common::VitaNote("gxm textura",
+                             fmt::format("con mipmaps: {}x{}, {} niveles, formato {}", width,
+                                         height, mip_levels, static_cast<u32>(format))
+                                 .c_str());
+        }
+    } else if (tiled_rows) {
         /**
          * EL CAMINO NORMAL: por filas de mosaicos, con una banda en RAM.
          *
@@ -938,7 +1123,9 @@ const SceGxmTexture* TextureCache::Get(u32 unit, const Pica::RegsInternal& regs,
     }
 
     entry.buffer = std::move(buffer);
-    SetupTexture(entry, width, height, min_linear, mag_linear, wrap_s, wrap_t);
+    entry.levels = mip_levels;
+    SetupTexture(entry, width, height, min_linear, mag_linear, wrap_s, wrap_t, mip_levels,
+                 swizzled);
     if (!entry.buffer.Valid()) {
         shadow_bytes -= static_cast<u32>(entry.shadow.size() * sizeof(u32));
         std::vector<u32>().swap(entry.shadow);
@@ -962,11 +1149,17 @@ const SceGxmTexture* TextureCache::Get(u32 unit, const Pica::RegsInternal& regs,
 
 void TextureCache::SetupTexture(Entry& entry, u32 width, u32 height, bool min_linear,
                                 bool mag_linear, SceGxmTextureAddrMode wrap_s,
-                                SceGxmTextureAddrMode wrap_t) {
+                                SceGxmTextureAddrMode wrap_t, u32 levels, bool swizzled) {
     // Los bytes van en orden R,G,B,A, que es lo que describe el nombre ABGR de
     // GXM (los nombres listan los canales del mas significativo al menos).
-    if (sceGxmTextureInitLinear(&entry.texture, entry.buffer.Data(),
-                                SCE_GXM_TEXTURE_FORMAT_U8U8U8U8_ABGR, width, height, 1) < 0) {
+    const int init = swizzled
+                         ? sceGxmTextureInitSwizzled(&entry.texture, entry.buffer.Data(),
+                                                     SCE_GXM_TEXTURE_FORMAT_U8U8U8U8_ABGR,
+                                                     width, height, levels)
+                         : sceGxmTextureInitLinear(&entry.texture, entry.buffer.Data(),
+                                                   SCE_GXM_TEXTURE_FORMAT_U8U8U8U8_ABGR, width,
+                                                   height, levels);
+    if (init < 0) {
         retired.push_back(std::move(entry.buffer));
         entry.buffer = Allocation{};
         return;
@@ -978,8 +1171,10 @@ void TextureCache::SetupTexture(Entry& entry, u32 width, u32 height, bool min_li
     // Un solo nivel, y que quede dicho: una entrada reutilizada podria traer el
     // filtro de mipmap encendido de su vida anterior, y entonces el chip iria a
     // buscar niveles que no existen.
-    sceGxmTextureSetMipFilter(&entry.texture, SCE_GXM_TEXTURE_MIP_FILTER_DISABLED);
-    sceGxmTextureSetMipmapCount(&entry.texture, 1);
+    // Con niveles (0.4.1.8), el filtro de mipmap encendido y su cuenta.
+    sceGxmTextureSetMipFilter(&entry.texture, levels > 1 ? SCE_GXM_TEXTURE_MIP_FILTER_ENABLED
+                                                         : SCE_GXM_TEXTURE_MIP_FILTER_DISABLED);
+    sceGxmTextureSetMipmapCount(&entry.texture, levels);
     sceGxmTextureSetUAddrMode(&entry.texture, wrap_s);
     sceGxmTextureSetVAddrMode(&entry.texture, wrap_t);
 }
