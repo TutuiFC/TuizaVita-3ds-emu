@@ -8,6 +8,7 @@
 #include <array>
 #include <chrono>
 #include <condition_variable>
+#include <cstddef>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -27,6 +28,7 @@
 #include <psp2/io/dirent.h>
 #include <psp2/io/fcntl.h>
 #include <psp2/io/stat.h>
+#include <psp2/rtc.h>
 #include "common/common_types.h"
 #include "common/hash.h"
 #include "common/logging/log.h"
@@ -170,8 +172,13 @@ constexpr std::size_t kSmallFreeBytes = 2u * 1024u * 1024u;
 std::array<void*, kSmallBytes / 16> g_small_free{};
 std::size_t g_small_free_bytes = 0;
 
+bool ArenaRelease(void* pointer);
+
 /// Un bloque que ya no usa nadie: a su lista si cabe, si no a newlib.
 void ReleaseBlock(void* pointer, std::size_t usable) {
+    if (ArenaRelease(pointer)) {
+        return;
+    }
     const std::size_t slot = usable / 16;
     if (g_tracking && slot >= 1 && slot <= g_small_free.size() &&
         g_small_free_bytes + usable <= kSmallFreeBytes) {
@@ -213,7 +220,176 @@ std::size_t g_quarantine_head = 0;
 std::size_t g_quarantine_count = 0;
 std::size_t g_quarantine_bytes = 0;
 
-void* CgAlloc(unsigned int size) {
+/**
+ * EL RESERVADOR PROPIO DEL COMPILADOR (0.4.2.3). Con el cronometro de 0.4.2.2
+ * (una de cada 64 reservas), en Kirby's Extra Epic Yarn con la cache vacia
+ * (29-10) reservar y liberar se llevaban ~143 s de los ~268 s que paso
+ * compilando: memalign y free de newlib, con el heap del emulador lleno de
+ * restos y su cerrojo de todo el proceso (si otro hilo lo tiene, el
+ * compilador espera). El banco, sin nadie mas, compila el mismo shader 2-4
+ * veces mas rapido.
+ *
+ * Ahora los bloques de hasta kArenaMaxBlock salen de trozos de 2 MB pedidos a
+ * newlib de una vez: listas por tamano (de 16 en 16 bytes hasta 1 KB, y cuatro
+ * por cada potencia de dos hasta 256 KB) y, si la lista esta vacia, lo
+ * siguiente del trozo. Sin cerrojo propio: todo lo del compilador va con
+ * g_cg_mutex. Lo de siempre se mantiene: cada bloque sale a cero, alineado a
+ * 16, y lo liberado pasa por la cuarentena antes de volver a su lista. Los
+ * mas grandes, o si ya hay kArenaMaxChunks trozos, por newlib como antes.
+ * Cuando el compilador se queda sin trabajo (CgArenaTrim), los trozos sin
+ * ningun bloque vivo vuelven a newlib.
+ */
+constexpr std::size_t kArenaChunkBytes = 2u * 1024u * 1024u;
+constexpr u32 kArenaMaxChunks = 16;
+constexpr std::size_t kArenaMaxBlock = 256u * 1024u;
+constexpr u32 kArenaSmallClasses = 64;
+constexpr u32 kArenaClasses = kArenaSmallClasses + 4 * 8;
+constexpr u32 kArenaMagic = 0x4E524341u; // "ACRN"
+
+/// Delante de cada bloque: 16 bytes (el bloque sigue alineado a 16).
+struct ArenaHeader {
+    u32 magic;
+    u32 klass;
+    u32 bytes;
+    u32 pad;
+};
+static_assert(sizeof(ArenaHeader) == 16);
+
+struct ArenaChunk {
+    u8* base = nullptr;
+    std::size_t used = 0;
+    /// Bloques que no estan en una lista (vivos o en la cuarentena).
+    u32 live = 0;
+};
+std::array<ArenaChunk, kArenaMaxChunks> g_arena{};
+u32 g_arena_chunks = 0;
+std::array<void*, kArenaClasses> g_arena_free{};
+/// Se apaga con ux0:/data/azahar/sin_reservador.txt (para comparar).
+bool g_arena_on = true;
+bool g_arena_checked = false;
+/// Trozos pedidos en la compilacion en curso (para la nota).
+u32 g_arena_new_chunks = 0;
+
+u32 ArenaClass(std::size_t size) {
+    if (size <= 1024) {
+        return size == 0 ? 0 : static_cast<u32>((size + 15) / 16 - 1);
+    }
+    const u32 exponent = 31u - static_cast<u32>(__builtin_clz(static_cast<u32>(size - 1)));
+    const std::size_t base = std::size_t{1} << exponent;
+    const std::size_t step = base / 4;
+    const u32 index = static_cast<u32>((size - base + step - 1) / step);
+    return kArenaSmallClasses + (exponent - 10) * 4 + index - 1;
+}
+
+std::size_t ArenaClassBytes(u32 klass) {
+    if (klass < kArenaSmallClasses) {
+        return (static_cast<std::size_t>(klass) + 1) * 16;
+    }
+    const u32 rest = klass - kArenaSmallClasses;
+    const std::size_t base = std::size_t{1024} << (rest / 4);
+    return base + (base / 4) * (rest % 4 + 1);
+}
+
+/// El trozo que contiene el puntero, o -1 si no es del reservador propio.
+int ArenaChunkOf(const void* pointer) {
+    const u8* const at = static_cast<const u8*>(pointer);
+    for (u32 i = 0; i < g_arena_chunks; i++) {
+        if (at >= g_arena[i].base && at < g_arena[i].base + kArenaChunkBytes) {
+            return static_cast<int>(i);
+        }
+    }
+    return -1;
+}
+
+/// Un bloque del reservador propio, o nullptr (entonces, newlib como antes).
+void* ArenaAlloc(std::size_t size, std::size_t& bytes) {
+    if (!g_arena_checked) {
+        g_arena_checked = true;
+        SceIoStat off{};
+        g_arena_on = sceIoGetstat("ux0:/data/azahar/sin_reservador.txt", &off) < 0;
+        Common::VitaNote("gxm compila", g_arena_on ? "reservador propio del compilador: si"
+                                                   : "reservador propio: no (sin_reservador.txt)");
+    }
+    if (!g_arena_on || size > kArenaMaxBlock) {
+        return nullptr;
+    }
+    const u32 klass = ArenaClass(size);
+    bytes = ArenaClassBytes(klass);
+    if (void* const head = g_arena_free[klass]) {
+        g_arena_free[klass] = *static_cast<void**>(head);
+        const int chunk = ArenaChunkOf(head);
+        if (chunk >= 0) {
+            g_arena[chunk].live++;
+        }
+        return head;
+    }
+    const std::size_t need = sizeof(ArenaHeader) + bytes;
+    ArenaChunk* chunk = g_arena_chunks != 0 ? &g_arena[g_arena_chunks - 1] : nullptr;
+    if (chunk == nullptr || chunk->used + need > kArenaChunkBytes) {
+        if (g_arena_chunks == kArenaMaxChunks) {
+            return nullptr;
+        }
+        // Sin quitarle a la emulacion lo que necesita (ver kEmulatorReserve).
+        const std::size_t in_use = mallinfo().uordblks;
+        if (in_use + kArenaChunkBytes + kEmulatorReserve > _newlib_heap_size_user) {
+            return nullptr;
+        }
+        void* const base = memalign(64, kArenaChunkBytes);
+        if (base == nullptr) {
+            return nullptr;
+        }
+        chunk = &g_arena[g_arena_chunks++];
+        chunk->base = static_cast<u8*>(base);
+        chunk->used = 0;
+        chunk->live = 0;
+        g_arena_new_chunks++;
+    }
+    auto* const header = reinterpret_cast<ArenaHeader*>(chunk->base + chunk->used);
+    header->magic = kArenaMagic;
+    header->klass = klass;
+    header->bytes = static_cast<u32>(bytes);
+    header->pad = 0;
+    chunk->used += need;
+    chunk->live++;
+    return reinterpret_cast<u8*>(header) + sizeof(ArenaHeader);
+}
+
+/// Lo que mide un bloque del reservador propio (0 si no lo es).
+std::size_t ArenaBytes(const void* pointer) {
+    if (ArenaChunkOf(pointer) < 0) {
+        return 0;
+    }
+    const auto* header =
+        reinterpret_cast<const ArenaHeader*>(static_cast<const u8*>(pointer) - sizeof(ArenaHeader));
+    return header->magic == kArenaMagic ? header->bytes : 0;
+}
+
+/// Un bloque del reservador propio que sale de la cuarentena: a su lista.
+bool ArenaRelease(void* pointer) {
+    const int chunk = ArenaChunkOf(pointer);
+    if (chunk < 0) {
+        return false;
+    }
+    const auto* header =
+        reinterpret_cast<const ArenaHeader*>(static_cast<u8*>(pointer) - sizeof(ArenaHeader));
+    if (header->magic != kArenaMagic || header->klass >= kArenaClasses) {
+        // No deberia pasar nunca: se pierde el bloque antes que estropear una lista.
+        static bool noted = false;
+        if (!noted) {
+            noted = true;
+            Common::VitaNote("gxm compila", "reservador propio: bloque con la cabecera rota");
+        }
+        return true;
+    }
+    *static_cast<void**>(pointer) = g_arena_free[header->klass];
+    g_arena_free[header->klass] = pointer;
+    if (g_arena[chunk].live != 0) {
+        g_arena[chunk].live--;
+    }
+    return true;
+}
+
+void* CgAllocInner(unsigned int size) {
     /**
      * Sin NULL por presupuesto (0.2.0.8). libshacccg no comprueba lo que le
      * devuelve el reservador: un NULL a mitad de compilacion lo tumbaba con un
@@ -235,6 +411,22 @@ void* CgAlloc(unsigned int size) {
     // Un bloque de la lista 'slot' tiene al menos slot * 16 bytes utiles.
     const std::size_t slot = rounded / 16;
     void* pointer = nullptr;
+    std::size_t arena_bytes = 0;
+    // Ver EL RESERVADOR PROPIO DEL COMPILADOR.
+    if (void* const own = ArenaAlloc(rounded, arena_bytes)) {
+        std::memset(own, 0, rounded);
+        if (g_tracking) {
+            g_alloc_calls++;
+            g_alloc_total += rounded;
+            g_alloc_reused++;
+            g_compile_bytes += arena_bytes;
+        }
+        g_live_bytes += arena_bytes;
+        if (g_live_bytes > g_peak_bytes) {
+            g_peak_bytes = g_live_bytes;
+        }
+        return own;
+    }
     if (slot >= 1 && slot <= g_small_free.size() && g_small_free[slot - 1] != nullptr) {
         pointer = g_small_free[slot - 1];
         g_small_free[slot - 1] = *static_cast<void**>(pointer);
@@ -262,11 +454,12 @@ void* CgAlloc(unsigned int size) {
     return pointer;
 }
 
-void CgFree(void* pointer) {
+void CgFreeInner(void* pointer) {
     if (pointer == nullptr) {
         return;
     }
-    const std::size_t size = malloc_usable_size(pointer);
+    const std::size_t own_bytes = ArenaBytes(pointer);
+    const std::size_t size = own_bytes != 0 ? own_bytes : malloc_usable_size(pointer);
     g_live_bytes = g_live_bytes > size ? g_live_bytes - size : 0;
     if (g_tracking) {
         g_compile_bytes = g_compile_bytes > size ? g_compile_bytes - size : 0;
@@ -275,7 +468,7 @@ void CgFree(void* pointer) {
         try {
             g_quarantine.resize(kQuarantineSlots);
         } catch (...) {
-            std::free(pointer);
+            ReleaseBlock(pointer, size);
             return;
         }
     }
@@ -299,6 +492,90 @@ void CgFree(void* pointer) {
 }
 
 /**
+ * CUANTO SE LLEVA EL RESERVADOR (0.4.2.2). El banco del compilador da, para el
+ * MISMO shader, entre 2 y 4 veces menos CPU que dentro del juego (un shader de
+ * fragmentos de 8 KB: 1,2 s en el banco, 2-4 s jugando a Luigi's Mansion). Una
+ * sospecha es el malloc de newlib con el heap del emulador lleno de restos y su
+ * cerrojo compartido. Para saberlo sin pagar dos lecturas del reloj por reserva
+ * (son cientos de miles por shader), se cronometra una de cada 64 y se
+ * multiplica: sale como "reservar" y "liberar" en la nota de "compilado en".
+ */
+u32 g_free_calls = 0;
+unsigned long long g_alloc_sample_us = 0;
+unsigned long long g_free_sample_us = 0;
+
+/**
+ * Los trozos del reservador propio sin ningun bloque vivo, de vuelta a newlib
+ * (0.4.2.3). Con g_cg_mutex cogido y el compilador sin compilar: primero se
+ * vacia la cuarentena (sus bloques pasan a las listas), despues se quitan de
+ * las listas los bloques de los trozos que se devuelven.
+ */
+void ArenaTrimLocked() {
+    while (g_quarantine_count != 0) {
+        auto& oldest = g_quarantine[g_quarantine_head];
+        ReleaseBlock(oldest.first, oldest.second);
+        g_quarantine_bytes -= oldest.second;
+        oldest = {};
+        g_quarantine_head = (g_quarantine_head + 1) % kQuarantineSlots;
+        g_quarantine_count--;
+    }
+    FlushSmallFree();
+    std::array<bool, kArenaMaxChunks> dead{};
+    u32 dead_count = 0;
+    for (u32 i = 0; i < g_arena_chunks; i++) {
+        dead[i] = g_arena[i].live == 0;
+        dead_count += dead[i] ? 1u : 0u;
+    }
+    if (dead_count == 0) {
+        return;
+    }
+    for (void*& head : g_arena_free) {
+        void** link = &head;
+        while (*link != nullptr) {
+            void* const block = *link;
+            const int chunk = ArenaChunkOf(block);
+            if (chunk >= 0 && dead[chunk]) {
+                *link = *static_cast<void**>(block);
+            } else {
+                link = static_cast<void**>(block);
+            }
+        }
+    }
+    u32 kept = 0;
+    for (u32 i = 0; i < g_arena_chunks; i++) {
+        if (dead[i]) {
+            std::free(g_arena[i].base);
+        } else {
+            g_arena[kept++] = g_arena[i];
+        }
+    }
+    for (u32 i = kept; i < g_arena_chunks; i++) {
+        g_arena[i] = ArenaChunk{};
+    }
+    g_arena_chunks = kept;
+}
+
+void* CgAlloc(unsigned int size) {
+    if (!g_tracking || (g_alloc_calls & 63u) != 0) {
+        return CgAllocInner(size);
+    }
+    const unsigned long long begin = Common::VitaMicros();
+    void* const pointer = CgAllocInner(size);
+    g_alloc_sample_us += Common::VitaMicros() - begin;
+    return pointer;
+}
+
+void CgFree(void* pointer) {
+    if (!g_tracking || (g_free_calls++ & 63u) != 0) {
+        CgFreeInner(pointer);
+        return;
+    }
+    const unsigned long long begin = Common::VitaMicros();
+    CgFreeInner(pointer);
+    g_free_sample_us += Common::VitaMicros() - begin;
+}
+
+/**
  * CACHE DE SHADERS COMPILADOS EN LA TARJETA (0.1.5.8).
  *
  * POR QUE. libshacccg compila en la propia consola y es lento: cada estado
@@ -319,7 +596,27 @@ void CgFree(void* pointer) {
  * compila como siempre (y se reescribe). Si el fichero no se puede leer o
  * escribir, tambien se compila como siempre: la cache nunca es necesaria.
  */
-constexpr char kCacheDir[] = "ux0:/data/azahar/shadercache";
+/**
+ * LA CARPETA DE LA CACHE, CAMBIABLE PARA LAS PRUEBAS (0.4.2.3). Con
+ * ux0:/data/azahar/cache_prueba.txt todo lo de la cache (binarios, listas,
+ * marcas, paquetes) va a shadercache_prueba: las pruebas con la cache vacia no
+ * tienen que apartar la del usuario (la tanda del 29-10 la dejo apartada dos
+ * dias al cortarse la sesion a medias).
+ */
+std::string CacheDirChoice() {
+    SceIoStat flag{};
+    return sceIoGetstat("ux0:/data/azahar/cache_prueba.txt", &flag) >= 0
+               ? "ux0:/data/azahar/shadercache_prueba"
+               : "ux0:/data/azahar/shadercache";
+}
+const std::string g_cache_dir = CacheDirChoice();
+const char* const kCacheDir = g_cache_dir.c_str();
+
+/// Un fichero de la carpeta de la cache (los nombres de siempre, dentro de kCacheDir).
+const char* CacheFile(std::string& storage, const char* name) {
+    storage = g_cache_dir + "/" + name;
+    return storage.c_str();
+}
 constexpr u32 kCacheMagic = 0x58475A41u; // "AZGX"
 constexpr u32 kCacheVersion = 1;
 
@@ -745,7 +1042,8 @@ void DumpFailedSource(const char* name, const char* source, const SceShaccCgComp
  * 465 ms por vblank en los vertices). Ahora solo se apunta lo que falla con el
  * compilador recien cargado; lo demas solo se salta en esta sesion.
  */
-constexpr char kBadListPath[] = "ux0:/data/azahar/shadercache/cg_roto2.bin";
+std::string g_kBadListPath_storage;
+const char* const kBadListPath = CacheFile(g_kBadListPath_storage, "cg_roto2.bin");
 /**
  * EL SHADER QUE SE ESTA COMPILANDO, EN LA TARJETA (0.2.0.6). libshacccg no solo
  * devuelve "internal error": con algun shader se cae entero (acceso a memoria
@@ -755,15 +1053,18 @@ constexpr char kBadListPath[] = "ux0:/data/azahar/shadercache/cg_roto2.bin";
  * arrancar sigue ahi, la sesion anterior murio compilandolo, y va a la lista
  * negra. Ese shader se dibuja por el otro camino, pero el juego ya no se cae.
  */
-constexpr char kCompilingPath[] = "ux0:/data/azahar/shadercache/cg_compilando.bin";
+std::string g_kCompilingPath_storage;
+const char* const kCompilingPath = CacheFile(g_kCompilingPath_storage, "cg_compilando.bin");
 /// El codigo del que se compila, para estudiar el que lo tumbe (0.2.0.8).
-constexpr char kCompilingSourcePath[] = "ux0:/data/azahar/shadercache/cg_compilando.cg";
+std::string g_kCompilingSourcePath_storage;
+const char* const kCompilingSourcePath = CacheFile(g_kCompilingSourcePath_storage, "cg_compilando.cg");
 /**
  * Los que ya tumbaron el compilador una vez con optimizacion (0.2.0.8): se
  * reintentan sin ella (menos memoria y otro camino dentro del compilador). Si
  * tambien asi se caen, a la lista negra.
  */
-constexpr char kNoOptListPath[] = "ux0:/data/azahar/shadercache/cg_sin_optimizar.bin";
+std::string g_kNoOptListPath_storage;
+const char* const kNoOptListPath = CacheFile(g_kNoOptListPath_storage, "cg_sin_optimizar.bin");
 struct BadSource {
     u64 hash_city;
     u64 hash_fnv;
@@ -795,8 +1096,10 @@ bool g_bad_loaded = false;
  * intro de Zafiro Alfa. La lista se sigue leyendo solo para borrar de la
  * cache esos binarios (PurgeUnoptimizedPrograms).
  */
-constexpr char kRetriedPath[] = "ux0:/data/azahar/shadercache/cg_reintentado.bin";
-constexpr char kDiedPath[] = "ux0:/data/azahar/shadercache/cg_murio.bin";
+std::string g_kRetriedPath_storage;
+const char* const kRetriedPath = CacheFile(g_kRetriedPath_storage, "cg_reintentado.bin");
+std::string g_kDiedPath_storage;
+const char* const kDiedPath = CacheFile(g_kDiedPath_storage, "cg_murio.bin");
 std::unordered_set<BadSource, BadSourceHash> g_died_sources;
 /**
  * SOSPECHOSO (0.2.3.5). Sin volcado no se culpa al shader que se estaba
@@ -807,11 +1110,8 @@ std::unordered_set<BadSource, BadSourceHash> g_died_sources;
  * acabar compilando ESE MISMO, a la lista negra (a la CPU). Si se llega a
  * compilar bien, deja de ser sospechoso.
  */
-constexpr char kSuspectPath[] = "ux0:/data/azahar/shadercache/cg_sospechoso.bin";
-BadSource g_suspect{};
-bool g_has_suspect = false;
-u32 g_suspect_strikes = 0;
-
+std::string g_kSuspectPath_storage;
+const char* const kSuspectPath = CacheFile(g_kSuspectPath_storage, "cg_sospechoso.bin");
 /**
  * CUANTAS VECES ANTES DE CONDENARLO (0.3.5.1). La regla de arriba ("si la
  * siguiente sesion vuelve a acabar compilando ESE MISMO, a la lista negra")
@@ -825,27 +1125,16 @@ u32 g_suspect_strikes = 0;
  * dos de siempre, porque ahi pillarlo dos veces si significa algo.
  */
 constexpr u32 kBigSourceBytes = 20000;
-constexpr u32 kSuspectStrikesSmall = 2;
-constexpr u32 kSuspectStrikesBig = 4;
-
-/// El fichero del sospechoso. Los de antes de 0.3.5.1 solo traian la fuente:
-/// se leen como un aviso ya dado.
-struct SuspectRecord {
-    BadSource source;
-    u32 strikes;
-};
-
-void WriteSuspect(const BadSource& source, u32 strikes) {
-    const SceUID fd = sceIoOpen(kSuspectPath, SCE_O_WRONLY | SCE_O_CREAT | SCE_O_TRUNC, 0777);
-    if (fd >= 0) {
-        const SuspectRecord record{source, strikes};
-        sceIoWrite(fd, &record, sizeof(record));
-        sceIoClose(fd);
-    }
-    g_suspect = source;
-    g_has_suspect = true;
-    g_suspect_strikes = strikes;
-}
+/**
+ * LOS AVISOS SIN PRUEBAS SE ACABAN (0.4.2.2). Contar "la sesion acabo
+ * compilandolo" como aviso castigaba al usuario que cierra el juego mientras
+ * compila (los de 0,7-25 s lo hacen a menudo con la cache vacia). Ahora la
+ * marca lleva cuanta CPU llevaba el compilador con el (ver KeepMarkerAlive): sin
+ * volcado, solo se le culpa si se habia comido esto sin acabar, que es colgarse.
+ * El mas lento medido en el banco: 66 s de CPU uno de vertices de 24 KB.
+ */
+constexpr u32 kHangCpuSmallS = 120;
+constexpr u32 kHangCpuBigS = 900;
 
 /// Lo que se apunta en kCompilingPath antes de compilar.
 struct CompilingMarker {
@@ -854,7 +1143,70 @@ struct CompilingMarker {
     u32 optimization;
     u32 source_size;
     u32 free_kb;
+    /**
+     * CUANDO EMPEZO, HASTA CUANDO SIGUIO Y CUANTA CPU LLEVABA (0.4.2.2), en
+     * segundos del reloj de la tarjeta (ver FsNowSeconds). Al arrancar solo
+     * cuenta como prueba un volcado escrito MIENTRAS se compilaba este shader, y
+     * sin volcado solo una compilacion que se comio kHangCpu*S de CPU.
+     */
+    u64 start_s;
+    u64 alive_s;
+    u32 magic;
+    u32 flags;
+    u32 cpu_s;
+    u32 reserved;
 };
+constexpr u32 kMarkerMagic = 0x324D5A41u; // "AZM2"
+/// En esa sesion se colgo la GPU (gpu_colgada.txt): lo que muriera despues lo explica eso.
+constexpr u32 kMarkerGpuHung = 1u;
+/// El tamano de la marca de antes de 0.4.2.2, sin tiempos.
+constexpr u32 kOldMarkerBytes = 32;
+
+/// Una fecha de fichero o del RTC, en segundos.
+u64 TickSeconds(const SceDateTime& t) {
+    SceRtcTick tick{};
+    if (sceRtcGetTick(&t, &tick) < 0) {
+        return 0;
+    }
+    return tick.tick / 1000000ull;
+}
+
+/**
+ * EL RELOJ DE LA TARJETA (0.4.2.2). Las fechas de los ficheros (las de los
+ * volcados psp2core) no tienen por que ir en la misma zona horaria que el RTC.
+ * La primera vez se escribe un fichero, se mira su fecha y se guarda la
+ * diferencia; despues la hora "de la tarjeta" es el RTC mas esa diferencia.
+ */
+long long g_fs_offset_s = 0;
+bool g_fs_offset_ready = false;
+
+u64 FsNowSeconds() {
+    const auto rtc_now = [] {
+        SceDateTime now{};
+        return sceRtcGetCurrentClock(&now, 0) < 0 ? 0ull : TickSeconds(now);
+    };
+    if (!g_fs_offset_ready) {
+        g_fs_offset_ready = true;
+        const std::string probe = std::string(kCacheDir) + "/cg_reloj.bin";
+        const SceUID fd = sceIoOpen(probe.c_str(), SCE_O_WRONLY | SCE_O_CREAT | SCE_O_TRUNC, 0777);
+        if (fd >= 0) {
+            const u32 one = 1;
+            sceIoWrite(fd, &one, sizeof(one));
+            sceIoClose(fd);
+            SceIoStat stat{};
+            const u64 rtc = rtc_now();
+            if (sceIoGetstat(probe.c_str(), &stat) >= 0 && rtc != 0) {
+                g_fs_offset_s = static_cast<long long>(TickSeconds(stat.st_mtime)) -
+                                static_cast<long long>(rtc);
+            }
+        }
+        Common::VitaNote("gxm shader",
+                         fmt::format("reloj de la tarjeta: {} s respecto al RTC", g_fs_offset_s)
+                             .c_str());
+    }
+    const u64 rtc = rtc_now();
+    return rtc == 0 ? 0 : static_cast<u64>(static_cast<long long>(rtc) + g_fs_offset_s);
+}
 
 /**
  * LA MARCA CON EL FICHERO ABIERTO (0.3.1.8). Antes de cada compilacion se
@@ -862,12 +1214,25 @@ struct CompilingMarker {
  * operaciones de metadatos en ux0 que con la tarjeta ocupada costaban 0,5-2 s
  * POR SHADER ("tarjeta antes" en crash.txt; un 12-33 % de cada compilacion en
  * Super Mario 3D Land). Ahora el fichero se queda abierto y se reescriben sus
- * 24 bytes en su sitio; "borrar" es escribir una marca vacia, que
- * LoadBadSources ignora. La fuente solo se guarda para los de vertices y los
- * grandes, que son los que han colgado el compilador alguna vez.
+ * bytes en su sitio; "borrar" es escribir una marca vacia, que LoadBadSources
+ * ignora. Desde 0.4.2.2 con sceIoPwrite: la mantiene viva otro hilo
+ * (KeepMarkerAlive) y un lseek compartido entre dos hilos no es seguro.
  */
 SceUID g_marker_fd = -1;
-constexpr u32 kSaveSourceMinBytes = 4096;
+/// Hay una compilacion apuntada en la marca ahora mismo.
+std::atomic<bool> g_marker_live{false};
+/// runClocks del hilo de compilacion al empezar (0 si no compila ese hilo).
+std::atomic<unsigned long long> g_marker_start_clocks{0};
+/// La GPU se ha colgado en esta sesion (ver CgNoteGpuHang).
+std::atomic<bool> g_gpu_hung{false};
+/**
+ * EL CODIGO, EN UN FICHERO QUE TAMBIEN SE QUEDA ABIERTO (0.4.2.2). Se abria,
+ * truncaba y cerraba antes de cada compilacion de vertices o de mas de 4 KB:
+ * 1,7 s de "tarjeta antes" en cada uno de vertices de Luigi's Mansion. Ahora se
+ * reescribe en su sitio; lo que sobre detras de un codigo mas corto no se lee
+ * (la marca dice cuantos bytes valen).
+ */
+SceUID g_source_fd = -1;
 
 void WriteCompilingMarker(const CompilingMarker& marker) {
     if (g_marker_fd < 0) {
@@ -876,17 +1241,37 @@ void WriteCompilingMarker(const CompilingMarker& marker) {
             return;
         }
     }
-    sceIoLseek(g_marker_fd, 0, SCE_SEEK_SET);
-    sceIoWrite(g_marker_fd, &marker, sizeof(marker));
+    sceIoPwrite(g_marker_fd, &marker, sizeof(marker), 0);
+    g_marker_live.store(true, std::memory_order_release);
 }
 
 void ClearCompilingMarker() {
+    g_marker_live.store(false, std::memory_order_release);
+    g_marker_start_clocks.store(0, std::memory_order_relaxed);
     if (g_marker_fd < 0) {
         return;
     }
     const CompilingMarker empty{};
-    sceIoLseek(g_marker_fd, 0, SCE_SEEK_SET);
-    sceIoWrite(g_marker_fd, &empty, sizeof(empty));
+    sceIoPwrite(g_marker_fd, &empty, sizeof(empty), 0);
+}
+
+/// Ver CompilingMarker::alive_s: lo llama el hilo del balanceador cada pocos segundos.
+void KeepMarkerAlive(SceUID worker) {
+    if (!g_marker_live.load(std::memory_order_acquire) || g_marker_fd < 0) {
+        return;
+    }
+    const u64 now = FsNowSeconds();
+    sceIoPwrite(g_marker_fd, &now, sizeof(now), offsetof(CompilingMarker, alive_s));
+    const unsigned long long start = g_marker_start_clocks.load(std::memory_order_relaxed);
+    if (start == 0 || worker < 0) {
+        return;
+    }
+    SceKernelThreadInfo info{};
+    info.size = sizeof(info);
+    if (sceKernelGetThreadInfo(worker, &info) >= 0 && info.runClocks >= start) {
+        const u32 cpu = static_cast<u32>((info.runClocks - start) / 1000000ull);
+        sceIoPwrite(g_marker_fd, &cpu, sizeof(cpu), offsetof(CompilingMarker, cpu_s));
+    }
 }
 
 void AppendRecord(const char* path, const BadSource& record) {
@@ -916,54 +1301,39 @@ void ReadRecords(const char* path, std::unordered_set<BadSource, BadSourceHash>&
 
 void StoreBadSource(const BadSource& bad);
 
-/// Un SceDateTime en un numero que se puede comparar (al segundo).
-u64 DateKey(const SceDateTime& t) {
-    return (((((static_cast<u64>(t.year) * 13 + t.month) * 32 + t.day) * 24 + t.hour) * 60 +
-             t.minute) *
-                60 +
-            t.second);
-}
-
 /**
- * MURIO DE VERDAD COMPILANDO? (0.2.1.6). La marca de kCompilingPath se queda
- * igual si la sesion acaba por cualquier otra cosa a mitad de una compilacion:
- * el usuario cierra el juego (hay shaders de 25-30 s), o se cuelga la GPU. Ni
- * una sola de las nueve muertes apuntadas entre 0.2.0.8 y 0.2.1.5 tiene volcado
- * de la consola detras, y sin embargo sus shaders fueron a la lista negra (a la
- * CPU para siempre); uno se reintento en O0 y ese binario colgo la GPU. Cuando
- * el compilador se cae de verdad, el sistema escribe un psp2core-* en ux0:data
- * (los de 0.2.0.x estan ahi). Si no se puede leer la carpeta, se culpa como
- * antes.
+ * QUE VOLCADOS HAY ENTRE DOS HORAS (0.4.2.2). Hasta 0.4.2.1 contaba cualquier
+ * psp2core-* posterior a la fecha de la marca, y eso culpaba a inocentes: la
+ * fecha de la marca era la de abrirla (se queda abierta desde 0.3.1.8), los
+ * volcados de OTRAS aplicaciones se llaman igual (en la tarjeta del usuario,
+ * uno de YouTubers Life del 28-10 a las 22:35) y un cuelgue de la GPU tambien
+ * acaba en volcado. Los seis shaders que entraron en la lista negra el 27, 28 y
+ * 29-10 compilaban bien en el banco (de 0,25 a 66 s, sin un error). Ahora solo
+ * cuenta un volcado escrito mientras se compilaba ESE shader o poco despues.
  *
- * EL GPUCRASH EXCULPA (0.3.7.5). En 0.3.7.4 un psp2core-*-GPUCRASH paso a contar
- * como prueba contra el shader que se compilaba (tope corto, dos sesiones y a
- * la lista negra), porque en la intro de Zafiro Alfa (24-10) la sesion acababa
- * siempre con un GPUCRASH y el mismo shader de 26.754 bytes a medio compilar.
- * Fue un error: el 25-10 la GPU se siguio colgando en esa escena con ese shader
- * ya compilado, con el compilando OTRO, y con los de 26 KB fuera de la GPU
- * (vs_tope_kb=16). Que la GPU se cuelgue no dice nada del compilador; al
- * contrario, EXPLICA la muerte, asi que el shader a medio compilar no se lleva
- * aviso. Contarlo acababa mandando a la CPU, una sesion tras otra, los shaders
- * que esa escena estuviera compilando cuando se colgaba la GPU por otra cosa.
+ * EL GPUCRASH EXCULPA (0.3.7.5): que la GPU se cuelgue no dice nada del
+ * compilador; al contrario, EXPLICA la muerte.
  */
 enum class DumpSince {
-    None,     ///< Nada en ux0:data posterior a la marca.
+    None,     ///< Ningun volcado en esa ventana.
     Gpu,      ///< Un psp2core-*-GPUCRASH: murio la consola, no el compilador.
     Compiler, ///< Un psp2core-* normal: se cayo el proceso compilando.
 };
 
-DumpSince CrashDumpSince(const SceIoStat& marker) {
+DumpSince CrashDumpBetween(u64 from_s, u64 until_s) {
     const SceUID dir = sceIoDopen("ux0:data");
     if (dir < 0) {
-        return DumpSince::Compiler;
+        return DumpSince::None;
     }
-    const u64 since = DateKey(marker.st_mtime);
     DumpSince found = DumpSince::None;
     SceIoDirent entry{};
-    // Sin cortar al primero: uno del compilador manda sobre uno de la GPU.
+    // Sin cortar al primero: uno del proceso manda sobre uno de la GPU.
     while (sceIoDread(dir, &entry) > 0) {
-        if (std::strncmp(entry.d_name, "psp2core-", 9) != 0 ||
-            DateKey(entry.d_stat.st_mtime) < since) {
+        if (std::strncmp(entry.d_name, "psp2core-", 9) != 0) {
+            continue;
+        }
+        const u64 at = TickSeconds(entry.d_stat.st_mtime);
+        if (at < from_s || at > until_s) {
             continue;
         }
         if (std::strstr(entry.d_name, "GPUCRASH") == nullptr) {
@@ -976,6 +1346,132 @@ DumpSince CrashDumpSince(const SceIoStat& marker) {
     return found;
 }
 
+/// El codigo del que tumbo el proceso, a cg_murio_<hash>.cg para estudiarlo desde el PC.
+void SaveDiedSource(const BadSource& source, u32 size) {
+    if (size == 0 || size > 1024u * 1024u) {
+        return;
+    }
+    std::vector<char> text(size);
+    const SceUID in = sceIoOpen(kCompilingSourcePath, SCE_O_RDONLY, 0);
+    if (in < 0) {
+        return;
+    }
+    const int got = sceIoRead(in, text.data(), size);
+    sceIoClose(in);
+    if (got != static_cast<int>(size)) {
+        return;
+    }
+    const std::string path = fmt::format("{}/cg_murio_{:016x}.cg", kCacheDir, source.hash_city);
+    const SceUID out = sceIoOpen(path.c_str(), SCE_O_WRONLY | SCE_O_CREAT | SCE_O_TRUNC, 0777);
+    if (out >= 0) {
+        sceIoWrite(out, text.data(), size);
+        sceIoClose(out);
+    }
+}
+
+/// La sesion anterior acabo con este shader a medio compilar: se le culpa o no.
+void EvaluateInterruptedCompile(const CompilingMarker& marker, bool timed) {
+    const bool vertex = marker.profile == static_cast<u32>(SCE_SHACCCG_PROFILE_VP);
+    const bool big = marker.source_size >= kBigSourceBytes;
+    bool blame = false;
+    std::string verdict;
+    if (!timed) {
+        verdict = "marca sin tiempos (de antes de 0.4.2.2): no se le culpa";
+    } else if ((marker.flags & kMarkerGpuHung) != 0) {
+        verdict = "en esa sesion se colgo la GPU: no se le culpa";
+    } else {
+        const u64 last_s = std::max(marker.alive_s, marker.start_s);
+        const u64 wall_s = last_s - marker.start_s;
+        // Escribir un volcado lleva su rato: hasta cuatro minutos despues.
+        const DumpSince dump =
+            CrashDumpBetween(marker.start_s > 5 ? marker.start_s - 5 : 0, last_s + 240);
+        if (dump == DumpSince::Compiler) {
+            blame = true;
+            verdict = fmt::format("volcado del proceso a los {} s de empezar ({} s de CPU): a "
+                                  "la lista negra",
+                                  wall_s, marker.cpu_s);
+        } else if (dump == DumpSince::Gpu) {
+            verdict = "volcado GPUCRASH: murio la GPU, no se le culpa";
+        } else if (marker.cpu_s >= (big ? kHangCpuBigS : kHangCpuSmallS)) {
+            blame = true;
+            verdict = fmt::format("{} s de CPU sin acabar ({} s de reloj): colgado, a la lista "
+                                  "negra",
+                                  marker.cpu_s, wall_s);
+        } else {
+            verdict = fmt::format("cortado a los {} s ({} s de CPU) y sin volcado: se cerro el "
+                                  "juego, no se le culpa",
+                                  wall_s, marker.cpu_s);
+        }
+    }
+    if (blame) {
+        StoreBadSource(marker.source);
+        if (g_died_sources.insert(marker.source).second) {
+            AppendRecord(kDiedPath, marker.source);
+        }
+        SaveDiedSource(marker.source, marker.source_size);
+    }
+    Common::VitaNote("gxm shader",
+                     fmt::format("la sesion anterior acabo compilando un shader de {} ({} bytes, "
+                                 "O{}): {}",
+                                 vertex ? "vertices" : "fragmentos", marker.source_size,
+                                 marker.optimization, verdict)
+                         .c_str());
+}
+
+/**
+ * LA AMNISTIA (0.4.2.2). Lo que entro en la lista negra por "murio compilando"
+ * con las reglas de antes (cg_murio.bin) vuelve a compilarse una vez: con las
+ * de ahora (EvaluateInterruptedCompile) el que de verdad tumbe el compilador
+ * vuelve a la lista con pruebas. Los de "error interno" (el compilador recien
+ * cargado lo rechaza, siempre igual) se quedan. Una sola vez por tarjeta.
+ */
+std::string g_kAmnestyPath_storage;
+const char* const kAmnestyPath = CacheFile(g_kAmnestyPath_storage, "cg_amnistia_0422.txt");
+std::string g_kDiedBeforeAmnestyPath_storage;
+const char* const kDiedBeforeAmnestyPath = CacheFile(g_kDiedBeforeAmnestyPath_storage, "cg_murio_antes_0422.bin");
+
+void Amnesty() {
+    SceIoStat done{};
+    if (sceIoGetstat(kAmnestyPath, &done) >= 0) {
+        return;
+    }
+    u32 freed = 0;
+    for (const BadSource& died : g_died_sources) {
+        freed += static_cast<u32>(g_bad_sources.erase(died));
+    }
+    const std::size_t died = g_died_sources.size();
+    g_died_sources.clear();
+    if (!g_cache_dir_ready) {
+        sceIoMkdir(kCacheDir, 0777);
+        g_cache_dir_ready = true;
+    }
+    if (freed != 0) {
+        const SceUID fd = sceIoOpen(kBadListPath, SCE_O_WRONLY | SCE_O_CREAT | SCE_O_TRUNC, 0777);
+        if (fd >= 0) {
+            for (const BadSource& bad : g_bad_sources) {
+                sceIoWrite(fd, &bad, sizeof(bad));
+            }
+            sceIoClose(fd);
+        }
+    }
+    if (died != 0) {
+        sceIoRemove(kDiedBeforeAmnestyPath);
+        sceIoRename(kDiedPath, kDiedBeforeAmnestyPath);
+        sceIoRemove(kDiedPath);
+    }
+    const SceUID flag = sceIoOpen(kAmnestyPath, SCE_O_WRONLY | SCE_O_CREAT | SCE_O_TRUNC, 0777);
+    if (flag >= 0) {
+        const std::string text = fmt::format("{} de {} muertes sin pruebas fuera de la lista\n",
+                                             freed, died);
+        sceIoWrite(flag, text.data(), static_cast<SceSize>(text.size()));
+        sceIoClose(flag);
+    }
+    Common::VitaNote("gxm shader", fmt::format("amnistia: {} shaders de la lista negra por "
+                                               "muertes sin pruebas vuelven a compilarse",
+                                               freed)
+                                       .c_str());
+}
+
 void LoadBadSources() {
     if (g_bad_loaded) {
         return;
@@ -983,131 +1479,25 @@ void LoadBadSources() {
     g_bad_loaded = true;
     ReadRecords(kBadListPath, g_bad_sources);
     ReadRecords(kDiedPath, g_died_sources);
-    SceIoStat marker_stat{};
-    const bool marker_dated = sceIoGetstat(kCompilingPath, &marker_stat) >= 0;
-    SceUID crashed_fd = sceIoOpen(kCompilingPath, SCE_O_RDONLY, 0);
-    if (crashed_fd >= 0) {
-        CompilingMarker probe{};
-        const int got = sceIoRead(crashed_fd, &probe, sizeof(probe));
-        if (got == static_cast<int>(sizeof(probe)) && probe.source == BadSource{} &&
-            probe.source_size == 0) {
-            // Marca vacia (ver WriteCompilingMarker): no murio compilando.
-            sceIoClose(crashed_fd);
-            crashed_fd = -1;
-        } else {
-            sceIoLseek(crashed_fd, 0, SCE_SEEK_SET);
-        }
-    }
+    Amnesty();
+    // El sospechoso de 0.2.3.5-0.4.2.1 ya no se usa (ver kHangCpuSmallS).
+    sceIoRemove(kSuspectPath);
+    CompilingMarker interrupted{};
+    int got = -1;
     {
-        const SceUID suspect_fd = sceIoOpen(kSuspectPath, SCE_O_RDONLY, 0);
-        if (suspect_fd >= 0) {
-            SuspectRecord record{};
-            const int got = sceIoRead(suspect_fd, &record, sizeof(record));
-            sceIoClose(suspect_fd);
-            if (got == static_cast<int>(sizeof(record))) {
-                g_suspect = record.source;
-                g_suspect_strikes = record.strikes;
-                g_has_suspect = true;
-            } else if (got == static_cast<int>(sizeof(BadSource))) {
-                g_suspect = record.source;
-                g_suspect_strikes = 1;
-                g_has_suspect = true;
-            }
+        const SceUID fd = sceIoOpen(kCompilingPath, SCE_O_RDONLY, 0);
+        if (fd >= 0) {
+            got = sceIoRead(fd, &interrupted, sizeof(interrupted));
+            sceIoClose(fd);
         }
     }
-    const DumpSince dump = marker_dated ? CrashDumpSince(marker_stat) : DumpSince::Compiler;
-    if (crashed_fd >= 0 && dump != DumpSince::Compiler) {
-        CompilingMarker interrupted{{}, SCE_SHACCCG_PROFILE_VP, 1, 0, 0};
-        sceIoRead(crashed_fd, &interrupted, sizeof(interrupted));
-        sceIoClose(crashed_fd);
-        sceIoRemove(kCompilingPath);
-        const u32 strikes =
-            (g_has_suspect && g_suspect == interrupted.source) ? g_suspect_strikes + 1 : 1;
-        const bool big = interrupted.source_size >= kBigSourceBytes;
-        const u32 allowed = big ? kSuspectStrikesBig : kSuspectStrikesSmall;
-        const char* const evidence = "sin volcado de la consola";
-        /**
-         * LOS GRANDES, NUNCA SIN VOLCADO (0.3.8.3). Uno de mas de kBigSourceBytes
-         * tarda de uno a tres minutos en compilar, asi que lo normal es que la
-         * sesion acabe a medias: el usuario cierra el juego, o lo cierra el
-         * piloto automatico. Contarlo como aviso mando a la lista negra, a los
-         * cuatro, el shader de piel del personaje de la intro de Zafiro Alfa
-         * (25-10): esa escena, en la CPU para siempre. Si el compilador muere de
-         * verdad deja un psp2core del proceso (DumpSince::Compiler, arriba).
-         */
-        if (dump == DumpSince::Gpu) {
-            // Ver CrashDumpSince: murio la GPU, no el compilador. Sin aviso.
-            sceIoRemove(kCompilingSourcePath);
-            Common::VitaNote("gxm shader",
-                             fmt::format("la sesion anterior acabo con la GPU colgada (volcado "
-                                         "GPUCRASH) mientras se compilaba un shader de {} "
-                                         "bytes: no se le culpa",
-                                         interrupted.source_size)
-                                 .c_str());
-        } else if (!big && strikes >= allowed) {
-            StoreBadSource(interrupted.source);
-            if (g_died_sources.insert(interrupted.source).second) {
-                AppendRecord(kDiedPath, interrupted.source);
-            }
-            sceIoRemove(kSuspectPath);
-            g_has_suspect = false;
-            sceIoRename(kCompilingSourcePath,
-                        fmt::format("{}/cg_murio_{:016x}.cg", kCacheDir,
-                                    interrupted.source.hash_city)
-                            .c_str());
-            g_suspect_strikes = 0;
-            Common::VitaNote("gxm shader",
-                             fmt::format("la sesion anterior acabo compilando un shader de {} "
-                                         "bytes por {}a vez seguida, {}: a la lista "
-                                         "negra (sus lotes, por la CPU)",
-                                         interrupted.source_size, strikes, evidence)
-                                 .c_str());
-        } else {
-            sceIoRemove(kCompilingSourcePath);
-            WriteSuspect(interrupted.source, strikes);
-            Common::VitaNote("gxm shader",
-                             (big ? fmt::format("la sesion anterior acabo compilando un shader "
-                                                "de {} bytes ({}a vez, {}): es de los grandes, "
-                                                "se compilara otra vez",
-                                                interrupted.source_size, strikes, evidence)
-                                  : fmt::format("la sesion anterior acabo compilando un shader de "
-                                                "{} bytes ({}a vez, {}): se compilara otra vez, "
-                                                "a la lista negra a la {}a",
-                                                interrupted.source_size, strikes, evidence,
-                                                allowed))
-                                 .c_str());
-        }
-    } else if (crashed_fd >= 0) {
-        // El de 0.2.0.6 y 0.2.0.7 solo traia el hash: se toma como uno de
-        // vertices optimizado, que es lo que se caia.
-        CompilingMarker crashed{{}, SCE_SHACCCG_PROFILE_VP, 1, 0, 0};
-        const int read = sceIoRead(crashed_fd, &crashed, sizeof(crashed));
-        const bool read_ok =
-            read == static_cast<int>(sizeof(crashed)) || read == static_cast<int>(sizeof(BadSource));
-        sceIoClose(crashed_fd);
-        sceIoRemove(kCompilingPath);
-        if (read_ok) {
-            // Nunca sin optimizar, ni los de vertices (0.2.1.4: uno de Pokemon Sol
-            // colgo la GPU en O0) ni, desde 0.3.7.8, los de fragmentos (ver
-            // PurgeUnoptimizedPrograms). A la lista negra: sus lotes, por la CPU.
-            StoreBadSource(crashed.source);
-            if (g_died_sources.insert(crashed.source).second) {
-                AppendRecord(kDiedPath, crashed.source);
-            }
-            // El codigo, guardado con su hash para estudiarlo desde el PC.
-            sceIoRename(kCompilingSourcePath,
-                        fmt::format("{}/cg_murio_{:016x}.cg", kCacheDir, crashed.source.hash_city)
-                            .c_str());
-            Common::VitaNote(
-                "gxm shader",
-                fmt::format("el compilador murio en la sesion anterior con un shader de {} "
-                            "({} bytes, O{}, heap libre {} KB): {}",
-                            crashed.profile == SCE_SHACCCG_PROFILE_VP ? "vertices" : "fragmentos",
-                            crashed.source_size, crashed.optimization, crashed.free_kb,
-                            "a la lista negra")
-                    .c_str());
-        }
+    // Marca vacia (ver ClearCompilingMarker): no murio compilando.
+    if (got >= static_cast<int>(kOldMarkerBytes) &&
+        !(interrupted.source == BadSource{} && interrupted.source_size == 0)) {
+        EvaluateInterruptedCompile(interrupted, got == static_cast<int>(sizeof(interrupted)) &&
+                                                    interrupted.magic == kMarkerMagic);
     }
+    sceIoRemove(kCompilingPath);
     if (!g_bad_sources.empty()) {
         Common::VitaNote("gxm shader", fmt::format("{} shaders que rompen el compilador se "
                                                    "saltan (lista de la tarjeta)",
@@ -1428,7 +1818,8 @@ std::string CurrentGameCachePrefix() {
  */
 std::atomic<bool> g_vs_o2{false};
 constexpr u64 kVsO2Salt = 0x4F32A5C3D1E07B69ull;
-constexpr char kO2BadPath[] = "ux0:/data/azahar/shadercache/cg_o2_malos.bin";
+std::string g_kO2BadPath_storage;
+const char* const kO2BadPath = CacheFile(g_kO2BadPath_storage, "cg_o2_malos.bin");
 std::mutex g_o2_bad_mutex;
 std::unordered_set<u64> g_o2_bad;
 bool g_o2_bad_loaded = false;
@@ -1837,12 +2228,25 @@ const SceShaccCgCompileOutput* CompileCgOnce(SceShaccCgTargetProfile profile, co
      */
     const bool vertex = profile == SCE_SHACCCG_PROFILE_VP;
     const std::size_t min_free = vertex ? kMinFreeToCompileVs : kMinFreeToCompile;
-    if (FreeHeap() < min_free) {
+    /**
+     * UNA MEDIDA DEL HEAP POR COMPILACION (0.4.2.5). mallinfo() de newlib recorre
+     * todos los bloques libres del heap, y con el del emulador (180 MB en uso,
+     * lleno de restos) eso no es gratis; aqui se llamaba cinco veces antes de
+     * cada compilacion (el minimo, el presupuesto, la nota, la marca) y eso caia
+     * en "tarjeta antes": 0,47 s por shader en Luigi's Mansion con la cache
+     * vacia (31-10). Una sola, cronometrada ("medir el heap" en la nota).
+     */
+    const unsigned long long heap_probe_begin_us = Common::VitaMicros();
+    const std::size_t heap_before = HeapInUse();
+    const std::size_t free_before =
+        _newlib_heap_size_user > heap_before ? _newlib_heap_size_user - heap_before : 0;
+    const unsigned long long heap_probe_us = Common::VitaMicros() - heap_probe_begin_us;
+    if (free_before < min_free) {
         static u32 skip_notes = 0;
         if (skip_notes < 4) {
             skip_notes++;
             Common::VitaNote("gxm mem", fmt::format("{}: sin compilar, solo quedan {} KB de heap",
-                                                    name, FreeHeap() / 1024)
+                                                    name, free_before / 1024)
                                             .c_str());
         }
         return nullptr;
@@ -1864,6 +2268,10 @@ const SceShaccCgCompileOutput* CompileCgOnce(SceShaccCgTargetProfile profile, co
     g_alloc_calls = 0;
     g_alloc_total = 0;
     g_alloc_reused = 0;
+    g_free_calls = 0;
+    g_alloc_sample_us = 0;
+    g_free_sample_us = 0;
+    g_arena_new_chunks = 0;
     g_source.fileName = name;
     g_source.text = source;
     g_source.size = static_cast<SceUInt32>(std::strlen(source));
@@ -1900,8 +2308,7 @@ const SceShaccCgCompileOutput* CompileCgOnce(SceShaccCgTargetProfile profile, co
     // Nada en O0: los de vertices desde 0.2.1.6 (uno colgo la GPU en 0.2.1.3),
     // los de fragmentos desde 0.3.7.8 (ver PurgeUnoptimizedPrograms).
 
-    const std::size_t heap_before = HeapInUse();
-    g_compile_budget = FreeHeap() - kEmulatorReserve;
+    g_compile_budget = free_before - kEmulatorReserve;
     g_compile_bytes = 0;
     g_compile_over_budget = false;
     g_peak_bytes = g_live_bytes;
@@ -1914,7 +2321,7 @@ const SceShaccCgCompileOutput* CompileCgOnce(SceShaccCgTargetProfile profile, co
     // Hasta 200 (eran 24): con menos, el que tumba el compilador no salia.
     if (g_start_notes.fetch_add(1, std::memory_order_relaxed) < 200) {
         Common::VitaNote("gxm compila", fmt::format("{}: {} bytes de codigo, heap libre {} KB, O{}",
-                                                    name, g_source.size, FreeHeap() / 1024,
+                                                    name, g_source.size, free_before / 1024,
                                                     options.optimizationLevel)
                                             .c_str());
     }
@@ -1924,19 +2331,27 @@ const SceShaccCgCompileOutput* CompileCgOnce(SceShaccCgTargetProfile profile, co
     const unsigned long long marker_us = Common::VitaMicros() - compile_begin_us;
     const unsigned long long marker_begin_us = Common::VitaMicros();
     {
-        const CompilingMarker compiling{BadSource{key.hash_city, key.hash_fnv},
-                                        static_cast<u32>(profile),
-                                        static_cast<u32>(options.optimizationLevel),
-                                        static_cast<u32>(source_size),
-                                        static_cast<u32>(FreeHeap() / 1024)};
-        if (profile == SCE_SHACCCG_PROFILE_VP || source_size >= kSaveSourceMinBytes) {
-            const SceUID source_fd =
-                sceIoOpen(kCompilingSourcePath, SCE_O_WRONLY | SCE_O_CREAT | SCE_O_TRUNC, 0777);
-            if (source_fd >= 0) {
-                sceIoWrite(source_fd, source, static_cast<SceSize>(source_size));
-                sceIoClose(source_fd);
-            }
+        CompilingMarker compiling{};
+        compiling.source = BadSource{key.hash_city, key.hash_fnv};
+        compiling.profile = static_cast<u32>(profile);
+        compiling.optimization = static_cast<u32>(options.optimizationLevel);
+        compiling.source_size = static_cast<u32>(source_size);
+        compiling.free_kb = static_cast<u32>(free_before / 1024);
+        compiling.start_s = FsNowSeconds();
+        compiling.alive_s = compiling.start_s;
+        compiling.magic = kMarkerMagic;
+        compiling.flags = g_gpu_hung.load(std::memory_order_relaxed) ? kMarkerGpuHung : 0u;
+        // Ver g_source_fd: en su sitio, sin abrir ni truncar.
+        if (g_source_fd < 0) {
+            g_source_fd = sceIoOpen(kCompilingSourcePath, SCE_O_WRONLY | SCE_O_CREAT, 0777);
         }
+        if (g_source_fd >= 0) {
+            sceIoPwrite(g_source_fd, source, static_cast<SceSize>(source_size), 0);
+        }
+        // La CPU de ESTA compilacion la mide el balanceador (ver KeepMarkerAlive).
+        const bool on_worker = g_worker_running && pthread_equal(pthread_self(), g_worker_thread);
+        g_marker_start_clocks.store(have_info && on_worker ? info_before.runClocks : 0ull,
+                                    std::memory_order_relaxed);
         WriteCompilingMarker(compiling);
     }
     const unsigned long long card_us = marker_us + (Common::VitaMicros() - marker_begin_us);
@@ -2071,18 +2486,17 @@ const SceShaccCgCompileOutput* CompileCgOnce(SceShaccCgTargetProfile profile, co
             }
             Common::VitaNote("gxm compila",
                              fmt::format("{}: compilado en {} ms (CPU {}; {} reservas, {} sin "
-                                         "newlib, {} MB pedidos; tarjeta antes {} ms)",
+                                         "newlib, {} MB pedidos, reservar ~{} ms, liberar ~{} "
+                                         "ms, {} trozos propios ({} nuevos); medir el heap {} ms, "
+                                         "tarjeta antes {} ms)",
                                          name, compile_ms, cpu, g_alloc_calls, g_alloc_reused,
-                                         g_alloc_total >> 20, card_us / 1000)
+                                         g_alloc_total >> 20, g_alloc_sample_us * 64 / 1000,
+                                         g_free_sample_us * 64 / 1000, g_arena_chunks,
+                                         g_arena_new_chunks, heap_probe_us / 1000, card_us / 1000)
                                  .c_str());
         }
     }
     StoreCached(key, cache_path, *output);
-    if (g_has_suspect && g_suspect == BadSource{key.hash_city, key.hash_fnv}) {
-        sceIoRemove(kSuspectPath);
-        g_has_suspect = false;
-        g_suspect_strikes = 0;
-    }
     // 0.1.7.9: la salida pasa a un bloque nuestro y el compilador suelta todo
     // lo suyo. Si no hay memoria ni para la copia, se devuelve la original
     // (como antes de 0.1.7.9) y el compilador se queda como estaba.
@@ -2115,6 +2529,50 @@ const SceShaccCgCompileOutput* CompileCgOnce(SceShaccCgTargetProfile profile, co
 
 void CgForgetInterruptedCompile() {
     ClearCompilingMarker();
+}
+
+const SceShaccCgCompileOutput* LoadProgramFile(const char* path) {
+    const SceUID fd = sceIoOpen(path, SCE_O_RDONLY, 0);
+    if (fd < 0) {
+        return nullptr;
+    }
+    const SceOff size = sceIoLseek(fd, 0, SCE_SEEK_END);
+    sceIoLseek(fd, 0, SCE_SEEK_SET);
+    if (size < 16 || size > 1024 * 1024) {
+        sceIoClose(fd);
+        return nullptr;
+    }
+    void* memory = std::malloc(sizeof(SceShaccCgCompileOutput) + static_cast<std::size_t>(size));
+    if (memory == nullptr) {
+        sceIoClose(fd);
+        return nullptr;
+    }
+    u8* program = static_cast<u8*>(memory) + sizeof(SceShaccCgCompileOutput);
+    const int got = sceIoRead(fd, program, static_cast<SceSize>(size));
+    sceIoClose(fd);
+    if (got != static_cast<int>(size) || std::memcmp(program, "GXP", 4) != 0) {
+        std::free(memory);
+        return nullptr;
+    }
+    auto* output = static_cast<SceShaccCgCompileOutput*>(memory);
+    output->programData = program;
+    output->programSize = static_cast<SceInt32>(size);
+    output->diagnosticCount = 0;
+    output->diagnostics = nullptr;
+    {
+        // Como los de la cache: ReleaseCgOutput lo libera con free.
+        const std::lock_guard lock{g_outputs_mutex};
+        g_cached_outputs.emplace(output, 0);
+    }
+    return output;
+}
+
+void CgNoteGpuHang() {
+    g_gpu_hung.store(true, std::memory_order_relaxed);
+    if (g_marker_live.load(std::memory_order_acquire) && g_marker_fd >= 0) {
+        const u32 flags = kMarkerGpuHung;
+        sceIoPwrite(g_marker_fd, &flags, sizeof(flags), offsetof(CompilingMarker, flags));
+    }
 }
 
 u64 CgOutputHash(const SceShaccCgCompileOutput* output) {
@@ -2199,8 +2657,13 @@ void* CgBalancerMain(void*) {
     unsigned long long last_idle[3] = {};
     unsigned long long last_wall = 0;
     u32 moves = 0;
+    u32 ticks = 0;
     while (true) {
         sceKernelDelayThread(250 * 1000);
+        // Ver CompilingMarker::alive_s: cada 4 s, cuanto lleva y cuanta CPU.
+        if ((++ticks & 15u) == 0) {
+            KeepMarkerAlive(g_worker_uid.load(std::memory_order_acquire));
+        }
         SceKernelSystemInfo system{};
         system.size = sizeof(system);
         if (sceKernelGetSystemInfo(&system) < 0) {
@@ -2298,8 +2761,45 @@ void* CgWorkerMain(void*) {
              * kHeavyCalmUs sin llegar ninguno pequeno (0.3.4.3).
              */
             std::deque<std::shared_ptr<CgJob>>::iterator pick;
+            u32 picked_demand = 0;
             while (true) {
                 g_jobs_ready.wait(lock, [] { return !g_jobs.empty(); });
+                /**
+                 * LO QUE MAS DIBUJOS TAPA, PRIMERO (0.4.2.2). En Luigi's Mansion con
+                 * la cache vacia (28-10) el shader de vertices de 19 KB que usaba
+                 * casi toda la escena espero minutos en la cola: era "grande" y los
+                 * de fragmentos (uno por objeto, urgentes) no dejaban de llegar, asi
+                 * que no habia la calma que pide un grande. Mientras, sus lotes se
+                 * saltaban: 284.365 en la partida. Cada lote que espera a un trabajo
+                 * le suma a CgJob::demand; se coge el que mas lleva, sea grande o
+                 * no. Sin demanda (los de calentar, o nadie los pide ya), el orden
+                 * de siempre.
+                 */
+                pick = g_jobs.end();
+                for (auto it = g_jobs.begin(); it != g_jobs.end(); ++it) {
+                    const u32 wanted = (*it)->demand.load(std::memory_order_relaxed);
+                    if (wanted > picked_demand) {
+                        picked_demand = wanted;
+                        pick = it;
+                    }
+                }
+                if (pick != g_jobs.end()) {
+                    static u32 demand_notes = 0;
+                    if (pick != g_jobs.begin() && demand_notes < 12) {
+                        demand_notes++;
+                        Common::VitaNote(
+                            "gxm compila",
+                            fmt::format("por demanda: {} de {} ({}) con {} lotes esperandolo, "
+                                        "{} en la cola",
+                                        (*pick)->profile == SCE_SHACCCG_PROFILE_VP ? "vertices"
+                                                                                   : "fragmentos",
+                                        (*pick)->sources.empty() ? 0 : (*pick)->sources.front().size(),
+                                        (*pick)->heavy ? "grande" : "normal", picked_demand,
+                                        g_jobs.size())
+                                .c_str());
+                    }
+                    break;
+                }
                 pick = std::find_if(g_jobs.begin(), g_jobs.end(),
                                     [](const std::shared_ptr<CgJob>& queued) {
                                         return !queued->heavy;
@@ -2344,6 +2844,16 @@ void* CgWorkerMain(void*) {
         g_worker_busy_since.store(0, std::memory_order_relaxed);
         g_worker_last_done_us.store(Common::VitaMicros(), std::memory_order_relaxed);
         job->done.store(true, std::memory_order_release);
+        // Sin mas trabajo: los trozos vacios del reservador propio, a newlib.
+        bool idle = false;
+        {
+            const std::lock_guard jobs_lock{g_jobs_mutex};
+            idle = g_jobs.empty();
+        }
+        if (idle) {
+            const std::lock_guard cg_lock{g_cg_mutex};
+            ArenaTrimLocked();
+        }
         if (g_worker_boosted.exchange(false, std::memory_order_acq_rel)) {
             sceKernelChangeThreadPriority(sceKernelGetThreadId(),
                                           Common::kVitaPriorityBackground);
@@ -2538,8 +3048,12 @@ std::string BenchCompile(bool vertex, const std::string& source, int opt, int fa
             std::memcpy(&v, gxp + at, sizeof(v));
             return v;
         };
-        header = fmt::format("instrucciones {} (secundario {}), temporales {}, PA {}, SA {}",
-                             u32_at(60), u32_at(68), u32_at(52), u16_at(48), u16_at(50));
+        // Y las banderas del programa (+20, 0.4.2.4): ver EL REGISTRO PUEDE FALLAR
+        // en rasterizer_gxm.cpp.
+        header = fmt::format("instrucciones {} (secundario {}), temporales {}, PA {}, SA {}, "
+                             "banderas {:08x}",
+                             u32_at(60), u32_at(68), u32_at(52), u16_at(48), u16_at(50),
+                             u32_at(20));
     }
     const std::string text = fmt::format(
         "{} | reloj {} ms, CPU {} ms | {} bytes de binario | {} | {} reservas, {} MB pedidos | {}",

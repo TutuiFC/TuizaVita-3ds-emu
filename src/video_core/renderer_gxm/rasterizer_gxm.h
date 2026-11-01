@@ -192,6 +192,10 @@ public:
     static std::atomic<u32> software_syncs;
     /// Lotes no dibujados porque su shader de fragmentos se compilaba (0.1.9.8).
     static std::atomic<u32> skipped_batches;
+    /// Lotes dibujados con el shader de fragmentos de reserva (0.4.2.2).
+    static std::atomic<u32> reserve_batches;
+    /// De los saltados, los que esperaban a su shader de VERTICES (0.4.2.3).
+    static std::atomic<u32> skipped_vs_batches;
 
     /// Interruptor del menu ("Copia de pantalla en GPU"). Encendido.
     static std::atomic<u32> transfer_on_gpu;
@@ -655,6 +659,9 @@ private:
     /// Antes de un lote por software en el framebuffer actual (ver el .cpp).
     void PrepareSoftwareBatch();
 
+    /// Una textura de 1x1 para las unidades que no lee el shader de reserva.
+    const SceGxmTexture* ReserveDummyTexture();
+
     /// Estado de dibujado comun a los dos caminos de GPU. Ver el .cpp.
     template <typename Entry>
     bool SetupDrawState(Surface* surface, const Entry* pipeline,
@@ -937,6 +944,10 @@ private:
     /// Versiones ANTERIORES a la actual que la escena abierta todavia lee.
     u32 lighting_lut_retired_in_scene = 0;
     bool lighting_lut_ready = false;
+    /// La textura de las unidades que el shader de reserva no usa (0.4.2.2).
+    Allocation reserve_dummy_buffer;
+    SceGxmTexture reserve_dummy_texture{};
+    bool reserve_dummy_ready = false;
     /**
      * La escena abierta ya le ha atado la textura de tablas a algun dibujado.
      *

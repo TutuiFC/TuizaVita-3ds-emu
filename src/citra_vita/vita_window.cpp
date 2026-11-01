@@ -1459,7 +1459,7 @@ void EmuWindow_Vita::DrawStatsOverlay() {
                                 "esc {} vol {} | gx tri {:.0f}% rell {:.0f}% tran {:.0f}% "
                                 "(ms/fot {:.1f} {:.1f} {:.1f}) | "
                                 "par {:.0f} ins {:.0f} rap {:.0f}% | copia gpu {} de verdad {} | relleno gpu {} "
-                                "sinc soft {} | saltados por compilar {}",
+                                "sinc soft {} | saltados por compilar {} (vs {}) reserva {}",
                                 stats_triangles_per_frame, stats_tri_gpu, stats_tri_sw,
                                 stats_gpu_batches, stats_hw_vs_batches, stats_hw_vs_rejects,
                                 Gxm::RasterizerGXM::TakeRejectSummary(),
@@ -1476,6 +1476,10 @@ void EmuWindow_Vita::DrawStatsOverlay() {
                                 Gxm::RasterizerGXM::software_syncs.exchange(
                                     0, std::memory_order_relaxed),
                                 Gxm::RasterizerGXM::skipped_batches.exchange(
+                                    0, std::memory_order_relaxed),
+                                Gxm::RasterizerGXM::skipped_vs_batches.exchange(
+                                    0, std::memory_order_relaxed),
+                                Gxm::RasterizerGXM::reserve_batches.exchange(
                                     0, std::memory_order_relaxed))
                         .c_str());
                 // Lo que cuesta cargar modelos nuevos (0.2.1.1): texturas

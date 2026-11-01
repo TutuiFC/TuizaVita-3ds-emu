@@ -15,6 +15,7 @@
 #include <psp2/io/stat.h>
 #include <psp2/kernel/threadmgr.h>
 #include "common/vita_diag.h"
+#include "video_core/renderer_gxm/gxm_cg.h"
 
 namespace Gxm::BlackBox {
 
@@ -207,6 +208,8 @@ void WriteReport(const Box& box) {
         sceIoClose(fd);
     }
     Common::VitaNote("gxm caja negra", "la GPU no avanza: escrito gpu_colgada.txt");
+    // Lo que se compile ahora no tiene la culpa de lo que pase despues (0.4.2.2).
+    Gxm::CgNoteGpuHang();
 }
 
 /*

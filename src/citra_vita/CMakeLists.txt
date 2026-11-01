@@ -196,4 +196,8 @@ vita_create_vpk(azahar.vpk ${VITA_TITLEID} azahar.self
     # ux0:app/AZHR00001/aznative.skprx, que es donde LoadModuleIfMissing lo busca
     # primero. Fuente: Azaharvita2versiones/nativo/kernel.
     FILE ${CMAKE_CURRENT_SOURCE_DIR}/nativo/aznative.skprx aznative.skprx
+    # El shader de fragmentos de reserva ya compilado (0.4.2.5): ver LA RESERVA VA
+    # COMPILADA EN EL VPK en rasterizer_gxm.cpp.
+    FILE ${CMAKE_CURRENT_SOURCE_DIR}/reserva/reserva_f.gxp reserva_f.gxp
+    FILE ${CMAKE_CURRENT_SOURCE_DIR}/reserva/reserva_fl.gxp reserva_fl.gxp
 )

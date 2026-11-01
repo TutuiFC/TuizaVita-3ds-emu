@@ -97,6 +97,13 @@ const SceShaccCgCompileOutput* LoadCgCache(SceShaccCgTargetProfile profile, cons
 const SceShaccCgCompileOutput* LoadCgCacheIndexed(u64 key, u32* variant);
 void AddVsIndex(u64 key, const std::string& source, u32 variant);
 
+/**
+ * Un programa ya compilado en un fichero .gxp suelto (0.4.2.5, el shader de
+ * reserva, que va en el VPK). nullptr si no esta o no empieza por "GXP". El
+ * resultado vive hasta ReleaseCgOutput, como uno de la cache.
+ */
+const SceShaccCgCompileOutput* LoadProgramFile(const char* path);
+
 /// Compila un shader. El resultado vive hasta ReleaseCgOutput.
 const SceShaccCgCompileOutput* CompileCg(SceShaccCgTargetProfile profile, const char* name,
                                          const char* source);
@@ -110,6 +117,16 @@ u64 CgOutputHash(const SceShaccCgCompileOutput* output);
 /// Olvida la compilacion en curso para el siguiente arranque: el proceso va a
 /// salir a proposito, no se muere compilando (0.3.8.3, piloto automatico).
 void CgForgetInterruptedCompile();
+
+/**
+ * LA GPU SE HA COLGADO (0.4.2.2, lo llama la caja negra al escribir
+ * gpu_colgada.txt). Lo que se este compilando o se compile despues no tiene la
+ * culpa si la sesion acaba mal: la marca lo dice y el arranque siguiente no lo
+ * manda a la lista negra. En la tarjeta del usuario (29-10, 02:51) la GPU se
+ * colgo con un shader de vertices de 18 KB a medio compilar, y ese shader, que
+ * en el banco compila bien en 3,9 s, acabo en la lista negra.
+ */
+void CgNoteGpuHang();
 
 /**
  * PRECARGA DE LA CACHE DE SHADERS (0.2.0.3). Cada shader que se lee o se
@@ -162,6 +179,12 @@ struct CgJob {
     std::atomic<unsigned long long> started_us{0};
     /// Minutos de compilador (0.2.2.3): se coge cuando no queda otro en la cola.
     bool heavy = false;
+    /**
+     * CUANTOS LOTES LO ESPERAN (0.4.2.2). Cada lote que no se puede dibujar como
+     * toca porque esto no ha acabado le suma (el rasterizador); el hilo de
+     * compilacion coge primero el que mas lleva. Ver CgWorkerMain.
+     */
+    std::atomic<u32> demand{0};
 };
 
 /// 'urgent' pone el trabajo delante de la cola (los de fragmentos: sin ellos

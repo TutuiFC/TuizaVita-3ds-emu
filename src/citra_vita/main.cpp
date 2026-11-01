@@ -1772,6 +1772,8 @@ void RunGame(vita2d_pgf* font, const std::string& path) {
             if (still == 20 && g_pilot_running.load(std::memory_order_relaxed)) {
                 WriteCrashLog("congelado", "piloto: 20 s parado, fallo a proposito para tener "
                                            "el volcado con los registros de todos los hilos");
+                // El volcado es a proposito: no culpa al shader que se compile (0.4.2.2).
+                Gxm::CgForgetInterruptedCompile();
                 sceKernelDelayThread(200 * 1000);
                 *reinterpret_cast<volatile unsigned int*>(0x00000C00) = still;
             }

@@ -501,6 +501,8 @@ std::atomic<u32> RasterizerGXM::texture_copy_kb{0};
 
 std::atomic<u32> RasterizerGXM::software_syncs{0};
 std::atomic<u32> RasterizerGXM::skipped_batches{0};
+std::atomic<u32> RasterizerGXM::reserve_batches{0};
+std::atomic<u32> RasterizerGXM::skipped_vs_batches{0};
 RasterizerGXM* RasterizerGXM::s_instance = nullptr;
 
 const char* RasterizerGXM::Ablation::Name(u32 value) {
@@ -1738,6 +1740,220 @@ u32 UsedFloatUniforms(const Pica::ShaderSetup& setup) {
  * se reutilizan; la Fase 4 hara que la compilacion no bloquee el hilo de
  * dibujado.
  */
+/**
+ * EL SHADER DE FRAGMENTOS DE RESERVA (0.4.2.2).
+ *
+ * Mientras se compila el shader de fragmentos de una configuracion nueva, sus
+ * lotes se saltaban (o iban unos pocos por software): objetos que faltan o
+ * parpadean la primera vez que sale cada cosa, durante segundos o minutos con
+ * la cache vacia (Luigi's Mansion, 28-10: 58 shaders, 330 s compilando y
+ * 284.365 lotes saltados). Este es UNO solo para todos: el combinador TEV
+ * entero de la PICA (seis etapas, fuentes, modificadores, operaciones,
+ * multiplicadores y el buffer) con la configuracion en uniforms, mas la prueba
+ * de alfa y los portadores de la mezcla. Se compila una vez (2-3 s, banco del
+ * 29-10) y queda en la cache; mientras llega el de verdad, el lote se dibuja
+ * con este.
+ *
+ * LO QUE APROXIMA. Sin niebla, sin color de borde, sin bump y con una luz
+ * sencilla (difusa y ambiente de hasta cuatro luces, sin tablas ni focos ni
+ * atenuacion; especular cero). Sin el redondeo a 8 bits de cada etapa. Es lo
+ * que se ve unos segundos; el de verdad lo sustituye en cuanto compila.
+ *
+ * LO QUE CUESTA. 432 instrucciones (526 con luz) frente a 60-210 de uno normal:
+ * mas tiempo de chip por pixel solo mientras se usa. Las etapas que no hacen
+ * nada (sustituir por la anterior) se saltan con una rama: la condicion es un
+ * uniform, igual para todo el lote. Ver SIN ARRAYS CON INDICE.
+ */
+constexpr const char* kReserveFsHead = R"(// Shader de fragmentos de RESERVA de Azahar para GXM (0.4.2.2).
+// NO EDITAR A MANO: lo compila la consola con SceShaccCg.
+
+uniform sampler2D tex0;
+uniform sampler2D tex1;
+uniform sampler2D tex2;
+uniform float4 const_color[6];
+uniform float4 tev_combiner_buffer_color;
+uniform float alphatest_ref;
+uniform float blend_const_alpha;
+uniform float3 blend_const_color;
+uniform float4 uber_tev[42];
+uniform float4 uber_misc[2];
+)";
+
+constexpr const char* kReserveFsLitHead = R"(uniform float4 uber_light[12];
+uniform float4 lighting_global_ambient;
+
+float3 quaternion_rotate(float4 q, float3 v) {
+    return v + 2.0 * cross(q.xyz, cross(q.xyz, v) + q.w * v);
+}
+)";
+
+/**
+ * SIN ARRAYS CON INDICE (0.4.2.4). La primera version elegia fuentes,
+ * modificadores y operaciones con un array indexado por un uniform
+ * (cand[(int)i]): el compilador los guarda como temporales indexables, el
+ * programa sale con otra bandera en la cabecera (0x0018180d frente a
+ * 0x...1805 de los normales) y el parcheador de GXM solo dejaba registrar UNO
+ * de los dos (el segundo, sin importar cual: err 0x805b0022 en
+ * sceGxmShaderPatcherRegisterProgram, con sceGxmProgramCheck bien y la
+ * alineacion cambiando en cada intento). Ahora cada eleccion es una cadena de
+ * comparaciones: mismas instrucciones (banco del 31-10: 432 sin luz), mas
+ * temporales (55 frente a 35) y nada en memoria.
+ */
+constexpr const char* kReserveFsFunctions = R"(
+float4 Pick(float i, float4 c0, float4 c1, float4 c2, float4 c3, float4 c4, float4 c5,
+            float4 c6, float4 c7, float4 c8) {
+    float4 r = c0;
+    r = i > 0.5 ? c1 : r;
+    r = i > 1.5 ? c2 : r;
+    r = i > 2.5 ? c3 : r;
+    r = i > 3.5 ? c4 : r;
+    r = i > 4.5 ? c5 : r;
+    r = i > 5.5 ? c6 : r;
+    r = i > 6.5 ? c7 : r;
+    r = i > 7.5 ? c8 : r;
+    return r;
+}
+
+float3 ColorMod(float4 c, float m, float inv) {
+    float3 x = c.rgb;
+    x = m > 0.5 ? c.aaa : x;
+    x = m > 1.5 ? c.rrr : x;
+    x = m > 2.5 ? c.ggg : x;
+    x = m > 3.5 ? c.bbb : x;
+    return abs(inv - x);
+}
+
+float AlphaMod(float4 c, float m, float inv) {
+    float x = c.a;
+    x = m > 0.5 ? c.r : x;
+    x = m > 1.5 ? c.g : x;
+    x = m > 2.5 ? c.b : x;
+    return abs(inv - x);
+}
+
+float3 ColorOp(float3 a, float3 b, float3 c, float op) {
+    float d = dot(a - 0.5, b - 0.5) * 4.0;
+    float3 r = a;
+    r = op > 0.5 ? a * b : r;
+    r = op > 1.5 ? a + b : r;
+    r = op > 2.5 ? a + b - 0.5 : r;
+    r = op > 3.5 ? lerp(b, a, c) : r;
+    r = op > 4.5 ? a - b : r;
+    r = op > 5.5 ? float3(d, d, d) : r;
+    r = op > 7.5 ? a * b + c : r;
+    r = op > 8.5 ? min(a + b, 1.0) * c : r;
+    return saturate(r);
+}
+
+float AlphaOp(float a, float b, float c, float op) {
+    float r = a;
+    r = op > 0.5 ? a * b : r;
+    r = op > 1.5 ? a + b : r;
+    r = op > 2.5 ? a + b - 0.5 : r;
+    r = op > 3.5 ? lerp(b, a, c) : r;
+    r = op > 4.5 ? a - b : r;
+    r = op > 5.5 ? a : r;
+    r = op > 7.5 ? a * b + c : r;
+    r = op > 8.5 ? min(a + b, 1.0) * c : r;
+    return saturate(r);
+}
+
+)";
+
+constexpr const char* kReserveFsMainPlain = R"(void main(float4 primary_color : COLOR0, float2 tc0 : TEXCOORD0, float2 tc1 : TEXCOORD1,
+          float2 tc2 : TEXCOORD2, out float4 gl_FragColor : COLOR)
+{
+    float4 k0 = primary_color;
+    float4 k1 = float4(0.0, 0.0, 0.0, 0.0);
+    float4 k2 = float4(0.0, 0.0, 0.0, 0.0);
+)";
+
+constexpr const char* kReserveFsMainLit = R"(void main(float4 primary_color : COLOR0, float2 tc0 : TEXCOORD0, float2 tc1 : TEXCOORD1,
+          float2 tc2 : TEXCOORD2, float4 normquat : TEXCOORD3, float3 view : TEXCOORD4,
+          out float4 gl_FragColor : COLOR)
+{
+    float3 normal = quaternion_rotate(normalize(normquat), float3(0.0, 0.0, 1.0));
+    float3 diffuse = lighting_global_ambient.rgb;
+    for (int h = 0; h < 4; h++) {
+        float4 lp = uber_light[h * 3 + 0];
+        float4 ld = uber_light[h * 3 + 1];
+        float4 la = uber_light[h * 3 + 2];
+        float3 lv = normalize(lp.xyz + view * (1.0 - lp.w));
+        float nl = dot(lv, normal);
+        nl = lerp(max(nl, 0.0), abs(nl), ld.w);
+        diffuse += la.w * (ld.rgb * nl + la.rgb);
+    }
+    float4 k0 = primary_color;
+    float4 k1 = float4(saturate(diffuse), 1.0);
+    float4 k2 = float4(0.0, 0.0, 0.0, 1.0);
+)";
+
+constexpr const char* kReserveFsBody = R"(    float4 k3 = tex2D(tex0, tc0);
+    float4 k4 = tex2D(tex1, tc1);
+    float4 k5 = tex2D(tex2, lerp(tc2, tc1, uber_misc[0].x));
+    float4 buffer = float4(0.0, 0.0, 0.0, 0.0);
+    float4 next_buffer = tev_combiner_buffer_color;
+    float4 prev = float4(0.0, 0.0, 0.0, 0.0);
+    for (int s = 0; s < 6; s++) {
+        float4 cs = uber_tev[s * 7 + 0];
+        float4 as = uber_tev[s * 7 + 1];
+        float4 cm = uber_tev[s * 7 + 2];
+        float4 am = uber_tev[s * 7 + 3];
+        float4 ci = uber_tev[s * 7 + 4];
+        float4 ai = uber_tev[s * 7 + 5];
+        float4 up = uber_tev[s * 7 + 6];
+        if (cs.w > 0.5) {
+            float4 k8 = const_color[s];
+            float3 c1 = ColorMod(Pick(cs.x, k0, k1, k2, k3, k4, k5, buffer, prev, k8), cm.x, ci.x);
+            float3 c2 = ColorMod(Pick(cs.y, k0, k1, k2, k3, k4, k5, buffer, prev, k8), cm.y, ci.y);
+            float3 c3 = ColorMod(Pick(cs.z, k0, k1, k2, k3, k4, k5, buffer, prev, k8), cm.z, ci.z);
+            float3 col = ColorOp(c1, c2, c3, cm.w);
+            float a1 = AlphaMod(Pick(as.x, k0, k1, k2, k3, k4, k5, buffer, prev, k8), am.x, ai.x);
+            float a2 = AlphaMod(Pick(as.y, k0, k1, k2, k3, k4, k5, buffer, prev, k8), am.y, ai.y);
+            float a3 = AlphaMod(Pick(as.z, k0, k1, k2, k3, k4, k5, buffer, prev, k8), am.z, ai.z);
+            float alp = AlphaOp(a1, a2, a3, am.w);
+            alp = lerp(alp, col.r, as.w);
+            prev = float4(saturate(col * ci.w), saturate(alp * ai.w));
+        }
+        buffer = next_buffer;
+        next_buffer.rgb = lerp(next_buffer.rgb, prev.rgb, up.x);
+        next_buffer.a = lerp(next_buffer.a, prev.a, up.y);
+    }
+    float v = floor(prev.a * 255.0 + 0.5) - alphatest_ref;
+    float lt = step(0.5, -v);
+    float gt = step(0.5, v);
+    float3 cmp = float3(lt, 1.0 - lt - gt, gt);
+    if (dot(cmp, uber_misc[0].yzw) < 0.5) discard;
+    gl_FragColor.rgb = lerp(prev.rgb, blend_const_color, uber_misc[1].y);
+    gl_FragColor.a = lerp(prev.a, blend_const_alpha, uber_misc[1].x);
+}
+)";
+
+/// La fuente del de reserva: sin luz o con ella (normales y vista).
+std::string ReserveFsSource(bool lit) {
+    std::string out = kReserveFsHead;
+    if (lit) {
+        out += kReserveFsLitHead;
+    }
+    out += kReserveFsFunctions;
+    out += lit ? kReserveFsMainLit : kReserveFsMainPlain;
+    out += kReserveFsBody;
+    return out;
+}
+
+/// Se apaga con ux0:/data/azahar/sin_reserva.txt (para comparar).
+bool ReserveEnabled() {
+    static const bool on = [] {
+        SceIoStat off{};
+        const bool enabled = sceIoGetstat("ux0:/data/azahar/sin_reserva.txt", &off) < 0;
+        Common::VitaNote("gxm reserva", enabled ? "shader de fragmentos de reserva: si"
+                                                : "shader de fragmentos de reserva: no "
+                                                  "(sin_reserva.txt)");
+        return enabled;
+    }();
+    return on;
+}
+
 struct RasterizerGXM::PipelineCache {
     /**
      * SALTAR EL LOTE, NO PINTARLO POR SOFTWARE (0.3.1.3). Pasados 2 s desde
@@ -1832,6 +2048,13 @@ struct RasterizerGXM::PipelineCache {
         /// la que se creara el programa cuando acabe.
         std::shared_ptr<CgJob> job;
         SceGxmBlendInfo blend{};
+        /// Shader de reserva (0.4.2.2, ver PipelineCache::Reserve): el programa es
+        /// compartido (no es de esta entrada) y la configuracion va en uniforms.
+        bool reserve = false;
+        const SceGxmProgramParameter* uber_tev = nullptr;
+        const SceGxmProgramParameter* uber_misc = nullptr;
+        const SceGxmProgramParameter* uber_light = nullptr;
+        UniformSlot uber_tev_slot, uber_misc_slot, uber_light_slot;
     };
 
     /**
@@ -1862,6 +2085,19 @@ struct RasterizerGXM::PipelineCache {
             }
             if (entry->output != nullptr) {
                 ReleaseCgOutput(entry->output);
+            }
+        }
+        for (auto& [key, entry] : reserve_entries) {
+            if (entry != nullptr && entry->program != nullptr) {
+                sceGxmShaderPatcherReleaseFragmentProgram(patcher, entry->program);
+            }
+        }
+        for (ReserveProgram& program : reserve) {
+            if (program.registered) {
+                sceGxmShaderPatcherUnregisterProgram(patcher, program.id);
+            }
+            if (program.output != nullptr) {
+                ReleaseCgOutput(program.output);
             }
         }
         ReleaseVertexFormat(plain);
@@ -1938,6 +2174,7 @@ struct RasterizerGXM::PipelineCache {
             Common::VitaNote("gxm init", "sin vs de textura proyectada con luz");
             ReleaseVertexFormat(lit_proj);
         }
+        StartReserve();
         return true;
     }
 
@@ -2198,6 +2435,17 @@ struct RasterizerGXM::PipelineCache {
         if (it != entries.end() && it->second->job != nullptr) {
             Entry& pending = *it->second;
             if (!pending.job->done.load(std::memory_order_acquire)) {
+                // Ver EL SHADER DE FRAGMENTOS DE RESERVA: se dibuja con el. La
+                // demanda (ver CgJob::demand) cuenta menos si el lote se ve.
+                if (const Entry* reserve_entry = Reserve(config, regs, blend, blend_bits,
+                                                         alpha_carrier, color_carrier)) {
+                    pending.job->demand.fetch_add(1, std::memory_order_relaxed);
+                    if (out_reason != nullptr) {
+                        *out_reason = "fs reserva";
+                    }
+                    return reserve_entry;
+                }
+                pending.job->demand.fetch_add(4, std::memory_order_relaxed);
                 // Ver kAsyncFsStuckUs: por software solo si el compilador se ha
                 // atascado con el o lleva demasiado en la cola.
                 const unsigned long long now = Common::VitaMicros();
@@ -2270,6 +2518,13 @@ struct RasterizerGXM::PipelineCache {
         }
         if (entry->job != nullptr) {
             entries.emplace(key, std::move(entry));
+            if (const Entry* reserve_entry =
+                    Reserve(config, regs, blend, blend_bits, alpha_carrier, color_carrier)) {
+                if (out_reason != nullptr) {
+                    *out_reason = "fs reserva";
+                }
+                return reserve_entry;
+            }
             return fail("fs compilando");
         }
         const bool usable = entry->usable;
@@ -2353,6 +2608,8 @@ struct RasterizerGXM::PipelineCache {
         job->name = "azahar_gxm_f.cg";
         job->sources.push_back(std::move(*source));
         job->variants.push_back(0);
+        // El lote que lo pide ya cuenta (ver CgJob::demand); los de calentar, no.
+        job->demand.store(4, std::memory_order_relaxed);
         entry->job = job;
         CgSubmit(std::move(job), true);
         return true;
@@ -2650,6 +2907,481 @@ struct RasterizerGXM::PipelineCache {
         return true;
     }
 
+    /// El programa de reserva compilado (o compilandose): sin luz [0] y con ella [1].
+    struct ReserveProgram {
+        const SceShaccCgCompileOutput* output = nullptr;
+        SceGxmShaderPatcherId id{};
+        bool registered = false;
+        bool failed = false;
+        std::shared_ptr<CgJob> job;
+        /// Para volver a leerlo de la cache si el registro falla (0.4.2.3).
+        std::string source;
+        /// O del VPK (0.4.2.5, ver LA RESERVA VA COMPILADA EN EL VPK).
+        const char* file = nullptr;
+        u32 attempts = 0;
+        unsigned long long retry_us = 0;
+    };
+
+    /**
+     * LA RESERVA VA COMPILADA EN EL VPK (0.4.2.5). Compilar la version sin arrays
+     * con indice deja al compilador reteniendo 13,8 MB (y 27,7 tras la segunda):
+     * pasados los 12 MB de kMaxRetained ya no se traducen shaders de vertices en
+     * toda la sesion, y en Luigi's Mansion en frio (31-10) todo fue por la CPU a
+     * 3-9 FPS. Ademas eran 30 s de compilador al empezar. Los dos binarios
+     * (reserva_f.gxp y reserva_fl.gxp, de la propia consola con estas mismas
+     * fuentes) van en el VPK y se cargan tal cual. Para rehacerlos tras tocar
+     * las fuentes: ux0:/data/azahar/compilar_reserva.txt, una partida, y
+     * sacarlos de la cache (son los dos de 4-5 KB de fragmentos).
+     */
+    void StartReserve() {
+        if (!ReserveEnabled()) {
+            return;
+        }
+        SceIoStat flag{};
+        const bool compile = sceIoGetstat("ux0:/data/azahar/compilar_reserva.txt", &flag) >= 0;
+        static constexpr const char* kFiles[2] = {"app0:/reserva_f.gxp", "app0:/reserva_fl.gxp"};
+        // Y si no estan en la app (pruebas con solo el eboot: el FTP no deja crear
+        // ficheros en ux0:app), en la carpeta de datos.
+        static constexpr const char* kDataFiles[2] = {"ux0:/data/azahar/reserva_f.gxp",
+                                                      "ux0:/data/azahar/reserva_fl.gxp"};
+        for (u32 variant = 0; variant < 2; variant++) {
+            if (variant == 1 && lit.program == nullptr) {
+                continue;
+            }
+            ReserveProgram& program = reserve[variant];
+            const std::string source = ReserveFsSource(variant == 1);
+            program.source = source;
+            if (!compile) {
+                program.file = kFiles[variant];
+                program.output = LoadProgramFile(program.file);
+                if (program.output == nullptr) {
+                    program.file = kDataFiles[variant];
+                    program.output = LoadProgramFile(program.file);
+                }
+                RegisterReserve(program);
+                continue;
+            }
+            if (const SceShaccCgCompileOutput* cached =
+                    LoadCgCache(SCE_SHACCCG_PROFILE_FP, "azahar_reserva_f.cg", source.c_str())) {
+                program.output = cached;
+                RegisterReserve(program);
+                continue;
+            }
+            auto job = std::make_shared<CgJob>();
+            job->profile = SCE_SHACCCG_PROFILE_FP;
+            job->name = "azahar_reserva_f.cg";
+            job->sources.push_back(source);
+            job->variants.push_back(0);
+            // Ver CgJob::demand: el primero de la cola, tapa a todos los demas.
+            job->demand.store(1u << 24, std::memory_order_relaxed);
+            program.job = job;
+            CgSubmit(std::move(job), true);
+        }
+    }
+
+    void RegisterReserve(ReserveProgram& program) {
+        if (program.output == nullptr) {
+            program.failed = true;
+            Common::VitaNote("gxm reserva", program.file != nullptr
+                                                ? "falta el binario del shader de reserva en el "
+                                                  "VPK: sin reserva"
+                                                : "el shader de reserva no compila: sin reserva");
+            return;
+        }
+        const auto* gxp = reinterpret_cast<const SceGxmProgram*>(program.output->programData);
+        /**
+         * EL REGISTRO PUEDE FALLAR, Y SE REINTENTA (0.4.2.3). En la primera prueba
+         * (Kirby's Extra Epic Yarn, 29-10) el de sin luz no se registro y sus lotes
+         * siguieron saltandose. Ahora el error va a crash.txt con lo que dice
+         * sceGxmProgramCheck y la alineacion del binario, y se reintenta a los
+         * 2, 4 y 8 s con el binario leido otra vez de la cache (otra copia).
+         */
+        const int check = sceGxmProgramCheck(gxp);
+        const int rc = sceGxmShaderPatcherRegisterProgram(patcher, gxp, &program.id);
+        if (rc != 0) {
+            const u32 bytes = program.output->programSize;
+            const u32 misalign = static_cast<u32>(reinterpret_cast<uintptr_t>(gxp) & 63u);
+            ReleaseCgOutput(program.output);
+            program.output = nullptr;
+            program.attempts++;
+            NoteFmt("gxm reserva",
+                    "no se pudo registrar el de reserva ({} bytes, alineado +{}): err {:#x}, "
+                    "check {:#x}, intento {}",
+                    bytes, misalign, static_cast<u32>(rc), static_cast<u32>(check),
+                    program.attempts);
+            if (program.attempts >= 4 || program.source.empty()) {
+                program.failed = true;
+            } else {
+                program.retry_us = Common::VitaMicros() + (1000000ull << program.attempts);
+            }
+            return;
+        }
+        program.registered = true;
+        Common::VitaNote("gxm reserva", fmt::format("shader de reserva listo ({} bytes, {})",
+                                                    program.output->programSize,
+                                                    program.file != nullptr ? program.file
+                                                                            : "compilado")
+                                            .c_str());
+    }
+
+    bool ReserveReady(ReserveProgram& program) {
+        if (program.registered) {
+            return true;
+        }
+        if (program.failed) {
+            return false;
+        }
+        if (program.job == nullptr) {
+            // Ver EL REGISTRO PUEDE FALLAR: otra copia, de la cache.
+            if (program.retry_us == 0 || Common::VitaMicros() < program.retry_us) {
+                return false;
+            }
+            program.retry_us = 0;
+            program.output = program.file != nullptr
+                                 ? LoadProgramFile(program.file)
+                                 : LoadCgCache(SCE_SHACCCG_PROFILE_FP, "azahar_reserva_f.cg",
+                                               program.source.c_str());
+            RegisterReserve(program);
+            return program.registered;
+        }
+        if (!program.job->done.load(std::memory_order_acquire)) {
+            return false;
+        }
+        program.output = program.job->output;
+        program.job.reset();
+        RegisterReserve(program);
+        return program.registered;
+    }
+
+    /**
+     * La entrada de reserva para esta mezcla, con la configuracion de ESTE lote
+     * ya en reserve_tev, reserve_misc, reserve_light y reserve_units (las lee
+     * SetupDrawState). nullptr si no la hay: sin compilar todavia, textura 0
+     * proyectada (lee otra coordenada), luz sin el formato de vertice largo.
+     * Nunca se guarda en el memo del lote ni en la cache por huella (ver
+     * AccelerateDrawBatch): en cuanto acabe el de verdad, se usa ese.
+     */
+    const Entry* Reserve(const Pica::Shader::FSConfig& config, const Pica::RegsInternal& regs,
+                         const SceGxmBlendInfo& blend, u32 blend_bits, bool alpha_carrier,
+                         u8 color_carrier) {
+        if (!ReserveEnabled()) {
+            return nullptr;
+        }
+        const bool lit_variant = config.lighting.enable != 0;
+        if (config.texture.texture0_type.Value() ==
+                Pica::TexturingRegs::TextureConfig::Projection2D ||
+            (lit_variant && lit.program == nullptr)) {
+            return nullptr;
+        }
+        ReserveProgram& program = reserve[lit_variant ? 1 : 0];
+        if (!ReserveReady(program)) {
+            return nullptr;
+        }
+        const u64 key = (static_cast<u64>(lit_variant ? 1u : 0u) << 32) | blend_bits;
+        Entry* entry = nullptr;
+        if (const auto found = reserve_entries.find(key); found != reserve_entries.end()) {
+            entry = found->second.get();
+        } else {
+            auto made = std::make_unique<Entry>();
+            made->reserve = true;
+            made->lit = lit_variant;
+            made->proj = false;
+            made->blend = blend;
+            made->color_carrier = color_carrier;
+            made->light_count = 0;
+            const auto* gxp = reinterpret_cast<const SceGxmProgram*>(program.output->programData);
+            const int rc = sceGxmShaderPatcherCreateFragmentProgram(
+                patcher, program.id, SCE_GXM_OUTPUT_REGISTER_FORMAT_UCHAR4,
+                SCE_GXM_MULTISAMPLE_NONE, &made->blend, FormatFor(lit_variant, false).gxp,
+                &made->program);
+            if (rc != 0) {
+                NoteOnce(noted[6], "gxm reserva", "programa de fragmentos de reserva err {:#x}",
+                         static_cast<u32>(rc));
+                reserve_entries.emplace(key, nullptr);
+                return nullptr;
+            }
+            made->const_color = sceGxmProgramFindParameterByName(gxp, "const_color");
+            made->combiner_buffer_color =
+                sceGxmProgramFindParameterByName(gxp, "tev_combiner_buffer_color");
+            made->alphatest_ref = sceGxmProgramFindParameterByName(gxp, "alphatest_ref");
+            made->blend_const_alpha = sceGxmProgramFindParameterByName(gxp, "blend_const_alpha");
+            made->blend_const_color = sceGxmProgramFindParameterByName(gxp, "blend_const_color");
+            made->lighting_global_ambient =
+                sceGxmProgramFindParameterByName(gxp, "lighting_global_ambient");
+            made->uber_tev = sceGxmProgramFindParameterByName(gxp, "uber_tev");
+            made->uber_misc = sceGxmProgramFindParameterByName(gxp, "uber_misc");
+            made->uber_light = sceGxmProgramFindParameterByName(gxp, "uber_light");
+            made->const_color_slot = ProbeUniform(made->const_color, 24);
+            made->combiner_buffer_color_slot = ProbeUniform(made->combiner_buffer_color, 4);
+            made->alphatest_ref_slot = ProbeUniform(made->alphatest_ref, 1);
+            made->blend_const_alpha_slot = ProbeUniform(made->blend_const_alpha, 1);
+            made->blend_const_color_slot = ProbeUniform(made->blend_const_color, 3);
+            made->lighting_global_ambient_slot = ProbeUniform(made->lighting_global_ambient, 4);
+            made->uber_tev_slot = ProbeUniform(made->uber_tev, 42 * 4);
+            made->uber_misc_slot = ProbeUniform(made->uber_misc, 2 * 4);
+            made->uber_light_slot = ProbeUniform(made->uber_light, 12 * 4);
+            const char* const names[3] = {"tex0", "tex1", "tex2"};
+            for (u32 i = 0; i < 3; i++) {
+                made->samplers[i] = sceGxmProgramFindParameterByName(gxp, names[i]);
+                made->sampler_units[i] =
+                    made->samplers[i] != nullptr
+                        ? static_cast<u8>(sceGxmProgramParameterGetResourceIndex(made->samplers[i]))
+                        : 0;
+            }
+            if (made->uber_tev == nullptr || made->uber_misc == nullptr) {
+                NoteOnce(noted[7], "gxm reserva", "al shader de reserva le faltan uniforms");
+                sceGxmShaderPatcherReleaseFragmentProgram(patcher, made->program);
+                reserve_entries.emplace(key, nullptr);
+                return nullptr;
+            }
+            entry = made.get();
+            reserve_entries.emplace(key, std::move(made));
+        }
+        if (entry == nullptr) {
+            return nullptr;
+        }
+        FillReserve(config, regs, alpha_carrier, color_carrier);
+        return entry;
+    }
+
+    /// La configuracion del lote en los uniforms del de reserva (ver kReserveFsBody).
+    void FillReserve(const Pica::Shader::FSConfig& config, const Pica::RegsInternal& regs,
+                     bool alpha_carrier, u8 color_carrier) {
+        using TevStage = Pica::TexturingRegs::TevStageConfig;
+        using Source = TevStage::Source;
+        using ColorModifier = TevStage::ColorModifier;
+        using AlphaModifier = TevStage::AlphaModifier;
+        using Operation = TevStage::Operation;
+        // El orden de los candidatos de Pick en el shader (k0..k5, buffer, prev, k8).
+        const auto candidate = [](Source source) -> f32 {
+            switch (source) {
+            case Source::PrimaryColor:
+                return 0.0f;
+            case Source::PrimaryFragmentColor:
+                return 1.0f;
+            case Source::SecondaryFragmentColor:
+                return 2.0f;
+            case Source::Texture0:
+                return 3.0f;
+            case Source::Texture1:
+                return 4.0f;
+            case Source::Texture2:
+                return 5.0f;
+            case Source::PreviousBuffer:
+                return 6.0f;
+            case Source::Constant:
+                return 8.0f;
+            default:
+                return 7.0f; // la salida anterior
+            }
+        };
+        u32 units = 0;
+        const auto mark = [&units](Source source) {
+            if (source == Source::Texture0) {
+                units |= 1u;
+            } else if (source == Source::Texture1) {
+                units |= 2u;
+            } else if (source == Source::Texture2) {
+                units |= 4u;
+            }
+        };
+        // 0 rgb, 1 aaa, 2 rrr, 3 ggg, 4 bbb; y si es "uno menos".
+        const auto color_mod = [](ColorModifier modifier, f32& part, f32& invert) {
+            switch (modifier) {
+            case ColorModifier::OneMinusSourceColor:
+                part = 0.0f, invert = 1.0f;
+                break;
+            case ColorModifier::SourceAlpha:
+                part = 1.0f, invert = 0.0f;
+                break;
+            case ColorModifier::OneMinusSourceAlpha:
+                part = 1.0f, invert = 1.0f;
+                break;
+            case ColorModifier::SourceRed:
+                part = 2.0f, invert = 0.0f;
+                break;
+            case ColorModifier::OneMinusSourceRed:
+                part = 2.0f, invert = 1.0f;
+                break;
+            case ColorModifier::SourceGreen:
+                part = 3.0f, invert = 0.0f;
+                break;
+            case ColorModifier::OneMinusSourceGreen:
+                part = 3.0f, invert = 1.0f;
+                break;
+            case ColorModifier::SourceBlue:
+                part = 4.0f, invert = 0.0f;
+                break;
+            case ColorModifier::OneMinusSourceBlue:
+                part = 4.0f, invert = 1.0f;
+                break;
+            default:
+                part = 0.0f, invert = 0.0f;
+                break;
+            }
+        };
+        // 0 a, 1 r, 2 g, 3 b.
+        const auto alpha_mod = [](AlphaModifier modifier, f32& part, f32& invert) {
+            switch (modifier) {
+            case AlphaModifier::OneMinusSourceAlpha:
+                part = 0.0f, invert = 1.0f;
+                break;
+            case AlphaModifier::SourceRed:
+                part = 1.0f, invert = 0.0f;
+                break;
+            case AlphaModifier::OneMinusSourceRed:
+                part = 1.0f, invert = 1.0f;
+                break;
+            case AlphaModifier::SourceGreen:
+                part = 2.0f, invert = 0.0f;
+                break;
+            case AlphaModifier::OneMinusSourceGreen:
+                part = 2.0f, invert = 1.0f;
+                break;
+            case AlphaModifier::SourceBlue:
+                part = 3.0f, invert = 0.0f;
+                break;
+            case AlphaModifier::OneMinusSourceBlue:
+                part = 3.0f, invert = 1.0f;
+                break;
+            default:
+                part = 0.0f, invert = 0.0f;
+                break;
+            }
+        };
+        const auto operation = [](Operation op) -> f32 {
+            const u32 value = static_cast<u32>(op);
+            return value <= 9 ? static_cast<f32>(value) : 0.0f;
+        };
+        for (u32 index = 0; index < 6; index++) {
+            const TevStage stage = config.texture.tev_stages[index];
+            // En la etapa 0, "Previous" es la fuente 3 (EffectiveSource del generador).
+            const auto effective = [index](Source source, Source source3) {
+                return index == 0 && source == Source::Previous ? source3 : source;
+            };
+            const Source c1 = effective(stage.color_source1, stage.color_source3);
+            const Source c2 = effective(stage.color_source2, stage.color_source3);
+            const Source c3 = effective(stage.color_source3, stage.color_source3);
+            const Source a1 = effective(stage.alpha_source1, stage.alpha_source3);
+            const Source a2 = effective(stage.alpha_source2, stage.alpha_source3);
+            const Source a3 = effective(stage.alpha_source3, stage.alpha_source3);
+            // La etapa de paso del generador (IsPassThroughStage): no se calcula.
+            const bool pass = stage.color_op == Operation::Replace &&
+                              stage.alpha_op == Operation::Replace && c1 == Source::Previous &&
+                              a1 == Source::Previous &&
+                              stage.color_modifier1 == ColorModifier::SourceColor &&
+                              stage.alpha_modifier1 == AlphaModifier::SourceAlpha &&
+                              stage.GetColorMultiplier() == 1 && stage.GetAlphaMultiplier() == 1;
+            f32* v = reserve_tev.data() + index * 28;
+            v[0] = candidate(c1);
+            v[1] = candidate(c2);
+            v[2] = candidate(c3);
+            v[3] = pass ? 0.0f : 1.0f;
+            v[4] = candidate(a1);
+            v[5] = candidate(a2);
+            v[6] = candidate(a3);
+            v[7] = stage.color_op == Operation::Dot3_RGBA ? 1.0f : 0.0f;
+            color_mod(stage.color_modifier1, v[8], v[16]);
+            color_mod(stage.color_modifier2, v[9], v[17]);
+            color_mod(stage.color_modifier3, v[10], v[18]);
+            v[11] = operation(stage.color_op);
+            alpha_mod(stage.alpha_modifier1, v[12], v[20]);
+            alpha_mod(stage.alpha_modifier2, v[13], v[21]);
+            alpha_mod(stage.alpha_modifier3, v[14], v[22]);
+            v[15] = operation(stage.alpha_op);
+            v[19] = static_cast<f32>(stage.GetColorMultiplier());
+            v[23] = static_cast<f32>(stage.GetAlphaMultiplier());
+            v[24] = config.TevStageUpdatesCombinerBufferColor(index) ? 1.0f : 0.0f;
+            v[25] = config.TevStageUpdatesCombinerBufferAlpha(index) ? 1.0f : 0.0f;
+            v[26] = 0.0f;
+            v[27] = 0.0f;
+            if (!pass) {
+                for (const Source source : {c1, c2, c3, a1, a2, a3}) {
+                    mark(source);
+                }
+            }
+        }
+        reserve_units = units;
+        // Prueba de alfa: pesos de (menor, igual, mayor) que pasan.
+        using CompareFunc = Pica::FramebufferRegs::CompareFunc;
+        f32 lt = 1.0f, eq = 1.0f, gt = 1.0f;
+        const CompareFunc alpha_func = config.framebuffer.alpha_test_func;
+        switch (alpha_func) {
+        case CompareFunc::Never:
+            lt = eq = gt = 0.0f;
+            break;
+        case CompareFunc::Equal:
+            lt = gt = 0.0f;
+            break;
+        case CompareFunc::NotEqual:
+            eq = 0.0f;
+            break;
+        case CompareFunc::LessThan:
+            eq = gt = 0.0f;
+            break;
+        case CompareFunc::LessThanOrEqual:
+            gt = 0.0f;
+            break;
+        case CompareFunc::GreaterThan:
+            lt = eq = 0.0f;
+            break;
+        case CompareFunc::GreaterThanOrEqual:
+            lt = 0.0f;
+            break;
+        default:
+            break;
+        }
+        reserve_misc = {config.texture.texture2_use_coord1 ? 1.0f : 0.0f, lt, eq, gt,
+                        alpha_carrier ? 1.0f : 0.0f, color_carrier != 0 ? 1.0f : 0.0f, 0.0f,
+                        0.0f};
+        if (config.lighting.enable == 0) {
+            return;
+        }
+        // Hasta cuatro luces, por hueco: posicion (w: direccional), difusa (w: dos
+        // caras) y ambiente (w: encendida). Ver kReserveFsMainLit.
+        reserve_light.fill(0.0f);
+        const auto& lighting_regs = regs.lighting;
+        for (u32 slot = 0; slot < config.lighting.src_num && slot < 4; slot++) {
+            const auto& light = config.lighting.lights[slot];
+            const u32 num = light.num.Value();
+            const auto& registers = lighting_regs.light[num];
+            f32 px = Pica::f16::FromRaw(registers.x).ToFloat32();
+            f32 py = Pica::f16::FromRaw(registers.y).ToFloat32();
+            f32 pz = Pica::f16::FromRaw(registers.z).ToFloat32();
+            const bool directional = light.directional != 0;
+            if (directional) {
+                const f32 length = std::sqrt(px * px + py * py + pz * pz);
+                const f32 inverse = length > 0.0f ? 1.0f / length : 0.0f;
+                px *= inverse;
+                py *= inverse;
+                pz *= inverse;
+            }
+            f32* l = reserve_light.data() + slot * 12;
+            l[0] = px;
+            l[1] = py;
+            l[2] = pz;
+            l[3] = directional ? 1.0f : 0.0f;
+            l[4] = static_cast<f32>(registers.diffuse.r) / 255.0f;
+            l[5] = static_cast<f32>(registers.diffuse.g) / 255.0f;
+            l[6] = static_cast<f32>(registers.diffuse.b) / 255.0f;
+            l[7] = light.two_sided_diffuse != 0 ? 1.0f : 0.0f;
+            l[8] = static_cast<f32>(registers.ambient.r) / 255.0f;
+            l[9] = static_cast<f32>(registers.ambient.g) / 255.0f;
+            l[10] = static_cast<f32>(registers.ambient.b) / 255.0f;
+            l[11] = 1.0f;
+        }
+    }
+
+    ReserveProgram reserve[2];
+    /// Por (con luz, mezcla): nulo si no se pudo crear (no se reintenta).
+    std::unordered_map<u64, std::unique_ptr<Entry>> reserve_entries;
+    /// La configuracion del ultimo lote que se dio a la reserva.
+    std::array<f32, 42 * 4> reserve_tev{};
+    std::array<f32, 2 * 4> reserve_misc{};
+    std::array<f32, 12 * 4> reserve_light{};
+    /// Las unidades de textura que lee su combinador (bit por unidad).
+    u32 reserve_units = 0;
+
     SceGxmContext* context;
     /**
      * Motivos por los que este cache se ha negado a dar un pipeline, uno por
@@ -2754,6 +3486,8 @@ struct RasterizerGXM::HwShaderCache {
             Program& found = *it->second;
             if (found.job != nullptr) {
                 if (!found.job->done.load(std::memory_order_acquire)) {
+                    // Ver CgJob::demand: este lote no se ve (o va por la CPU).
+                    found.job->demand.fetch_add(4, std::memory_order_relaxed);
                     /**
                      * SALTAR SOLO UN RATO (0.2.1.2). Con los shaders
                      * asincronos el lote se salta mientras compila; en
@@ -3098,6 +3832,8 @@ private:
         }
         // Al hilo de compilacion (0.1.9.6); GetProgram recoge el resultado.
         job->heavy = job->sources.front().size() > kHeavySource;
+        // El lote que lo pide ya cuenta (ver CgJob::demand).
+        job->demand.store(4, std::memory_order_relaxed);
         program.job = job;
         CgSubmit(std::move(job));
     }
@@ -6811,6 +7547,27 @@ void RasterizerGXM::PrepareSoftwareBatch() {
     }
 }
 
+const SceGxmTexture* RasterizerGXM::ReserveDummyTexture() {
+    if (!reserve_dummy_ready) {
+        constexpr u32 kBytes = 4096;
+        reserve_dummy_buffer = Allocate(Pool::Cdram, kBytes);
+        if (!reserve_dummy_buffer.Valid()) {
+            reserve_dummy_buffer = Allocate(Pool::Host, kBytes);
+        }
+        if (!reserve_dummy_buffer.Valid()) {
+            return nullptr;
+        }
+        std::memset(reserve_dummy_buffer.Data(), 0xFF, kBytes);
+        if (sceGxmTextureInitLinear(&reserve_dummy_texture, reserve_dummy_buffer.Data(),
+                                    SCE_GXM_TEXTURE_FORMAT_U8U8U8U8_ABGR, 1, 1, 1) < 0) {
+            reserve_dummy_buffer = Allocation{};
+            return nullptr;
+        }
+        reserve_dummy_ready = true;
+    }
+    return &reserve_dummy_texture;
+}
+
 bool RasterizerGXM::DrawBatchOnGpu() {
     Surface* surface = CurrentSurface();
     if (surface == nullptr) {
@@ -7413,13 +8170,20 @@ bool RasterizerGXM::SetupDrawState(Surface* surface, const Entry* pipeline,
         if (pipeline->samplers[i] == nullptr) {
             continue;
         }
-        const unsigned long long copy_mark = timed ? Common::VitaMicros() : 0;
-        const SceGxmTexture* texture = TextureFromCopy(i);
-        if (timed) {
-            g_state_copy_us += Common::VitaMicros() - copy_mark;
-        }
-        if (texture == nullptr) {
-            texture = textures->Get(i, pica.regs.internal, memory);
+        const SceGxmTexture* texture = nullptr;
+        if (pipeline->reserve && (pipelines->reserve_units & (1u << i)) == 0) {
+            // El de reserva muestrea siempre las tres (ver PipelineCache::Reserve):
+            // la que su combinador no lee, de 1x1.
+            texture = ReserveDummyTexture();
+        } else {
+            const unsigned long long copy_mark = timed ? Common::VitaMicros() : 0;
+            texture = TextureFromCopy(i);
+            if (timed) {
+                g_state_copy_us += Common::VitaMicros() - copy_mark;
+            }
+            if (texture == nullptr) {
+                texture = textures->Get(i, pica.regs.internal, memory);
+            }
         }
         if (texture == nullptr) {
             NoteSkip(4, "textura");
@@ -7465,6 +8229,18 @@ bool RasterizerGXM::SetupDrawState(Surface* surface, const Entry* pipeline,
          * desde entonces (los dirty_regs que siguen puestos).
          */
         BatchMemo& memo = *batch_memo;
+        if (pipeline->reserve) {
+            // La configuracion que dejo PipelineCache::Reserve para este lote.
+            reserve_batches.fetch_add(1, std::memory_order_relaxed);
+            PutUniform(uniform_buffer, pipeline->uber_tev, pipeline->uber_tev_slot, 42 * 4,
+                       pipelines->reserve_tev.data());
+            PutUniform(uniform_buffer, pipeline->uber_misc, pipeline->uber_misc_slot, 2 * 4,
+                       pipelines->reserve_misc.data());
+            if (pipeline->uber_light != nullptr) {
+                PutUniform(uniform_buffer, pipeline->uber_light, pipeline->uber_light_slot,
+                           12 * 4, pipelines->reserve_light.data());
+            }
+        }
         if (pipeline->const_color != nullptr) {
             if (memo.colors_dirty || AnyDirty(pica.dirty_regs, kConstColorMask)) {
                 const auto tev_stages = pica.regs.internal.texturing.GetTevStages();
@@ -7873,7 +8649,11 @@ void RasterizerGXM::ClearAll(bool flush) {
  * geometria sin dibujar toda la partida.
  */
 static bool LongCompileCpuAllowed(u32 frame) {
-    constexpr u32 kMaxCpuBatches = 6;
+    // 24 con ux0:/data/azahar/vs_cpu_24.txt (0.4.2.2, para probar).
+    static const u32 kMaxCpuBatches = [] {
+        SceIoStat flag{};
+        return sceIoGetstat("ux0:/data/azahar/vs_cpu_24.txt", &flag) >= 0 ? 24u : 6u;
+    }();
     static u32 budget_frame = ~0u;
     static u32 used = 0;
     if (budget_frame != frame) {
@@ -8430,7 +9210,8 @@ bool RasterizerGXM::AccelerateDrawBatch(bool is_indexed) {
         if (fs_key_ok && pipeline != nullptr && pipelines->entries.size() == known_before) {
             g_fp_miss_known++;
         }
-        if (pipeline != nullptr && fs_key_ok && pipeline->usable && pipeline->job == nullptr) {
+        if (pipeline != nullptr && fs_key_ok && pipeline->usable && pipeline->job == nullptr &&
+            !pipeline->reserve) {
             const std::size_t set =
                 static_cast<std::size_t>((fs_key_fp * 0x9E3779B97F4A7C15ull) >> 56) * 2;
             // La nueva delante; la de delante pasa a la segunda via.
@@ -8445,7 +9226,9 @@ bool RasterizerGXM::AccelerateDrawBatch(bool is_indexed) {
             skipped_batches.fetch_add(1, std::memory_order_relaxed);
             return true;
         }
-        memo.pipeline = pipeline;
+        // La de reserva no se recuerda: el lote siguiente vuelve a preguntar, y
+        // en cuanto acabe el de verdad, ese (ver PipelineCache::Reserve).
+        memo.pipeline = pipeline != nullptr && pipeline->reserve ? nullptr : pipeline;
         if (pipeline == nullptr && fs_reason != nullptr &&
             std::strcmp(fs_reason, "fs compilando largo") == 0 &&
             async_vs.load(std::memory_order_relaxed) != 0 &&
@@ -8746,12 +9529,14 @@ bool RasterizerGXM::AccelerateDrawBatch(bool is_indexed) {
             if (reason != nullptr && std::strcmp(reason, "vs compilando") == 0 &&
                 async_vs.load(std::memory_order_relaxed) != 0) {
                 skipped_batches.fetch_add(1, std::memory_order_relaxed);
+                skipped_vs_batches.fetch_add(1, std::memory_order_relaxed);
                 return true;
             }
             if (reason != nullptr && std::strcmp(reason, "vs compilando largo") == 0 &&
                 async_vs.load(std::memory_order_relaxed) != 0 &&
                 !LongCompileCpuAllowed(presents_seen)) {
                 skipped_batches.fetch_add(1, std::memory_order_relaxed);
+                skipped_vs_batches.fetch_add(1, std::memory_order_relaxed);
                 return true;
             }
             NoteSkip(5, reason != nullptr ? reason : "vs");
