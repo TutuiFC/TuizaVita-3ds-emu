@@ -24,6 +24,17 @@ extern std::atomic<bool> g_fs_flat_test;
 extern std::atomic<bool> g_fs_half_tev;
 
 /**
+ * El COLOR de las etapas TEV sin redondear a 8 bits entre etapa y etapa (0.4.4.1,
+ * ajuste fs_tev_exacto=0, el de serie). La 3DS calcula cada etapa en enteros
+ * de 8 bits; aqui, en float, solo se redondea el color al final por el propio
+ * framebuffer, y la diferencia es de 1/255 en algun pixel. El ALFA sigue
+ * exacto en todos los casos (la prueba de alfa compara con un umbral entero).
+ * Banco de 178 shaders de fragmentos: -9,7 % de instrucciones. Con
+ * fs_tev_exacto=1, como hasta 0.4.4.0.
+ */
+extern std::atomic<bool> g_fs_tev_exact;
+
+/**
  * Generador del shader de fragmentos de la PICA en Cg para el backend GXM.
  *
  * Es el tercer hermano de glsl_fs_shader_gen.cpp y spv_fs_shader_gen.cpp:

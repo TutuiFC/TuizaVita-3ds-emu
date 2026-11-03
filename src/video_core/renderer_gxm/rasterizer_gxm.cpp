@@ -4602,6 +4602,8 @@ struct RasterizerGXM::BatchMemo {
      */
     bool lights_dirty = true;
     bool fog_dirty = true;
+    /// La fila de niebla de la textura de tablas (0.4.4.2, ver kFogLutRow).
+    bool fog_row_dirty = true;
     bool colors_dirty = true;
     std::array<f32, 32> specular_0{};
     std::array<f32, 32> specular_1{};
@@ -6861,11 +6863,16 @@ bool RasterizerGXM::UpdateLightingLut() {
         }
         lighting_lut_hash.fill(0);
         lut_scene_mask = 0;
-        // Recien creada no tiene nada dentro: se suben las 24.
+        // Recien creada no tiene nada dentro: se suben las 24 y la de niebla.
         pica.lighting.lut_dirty = Pica::PicaCore::Lighting::LutAllDirty;
+        batch_memo->fog_row_dirty = true;
     }
 
-    if (pica.lighting.lut_dirty == 0) {
+    // La fila de niebla (kFogLutRow): sus registros los apunta la memoria del
+    // lote, y si aun no ha pasado por ella, siguen marcados en dirty_regs.
+    const bool fog_row_dirty =
+        batch_memo->fog_row_dirty || AnyDirty(pica.dirty_regs, kFogLutMask);
+    if (pica.lighting.lut_dirty == 0 && !fog_row_dirty) {
         return true;
     }
 
@@ -6901,6 +6908,14 @@ bool RasterizerGXM::UpdateLightingLut() {
             lighting_lut_row_stale |= 1u << index;
         }
         pica.lighting.lut_dirty = 0;
+        if (fog_row_dirty) {
+            // La de niebla, igual: huella de lo que escribio el juego y a convertir.
+            lighting_lut_gen[kFogLutRow] = ++lighting_lut_gen_counter;
+            lighting_lut_hash[kFogLutRow] =
+                Common::ComputeHash64(pica.fog.lut.data(), sizeof(pica.fog.lut)) | 1ull;
+            lighting_lut_row_stale |= 1u << kFogLutRow;
+            batch_memo->fog_row_dirty = false;
+        }
     }
     constexpr std::size_t kRowBytes = static_cast<std::size_t>(kLutEntries) * 2 * sizeof(f32);
     // Una version al dia: las tablas cuyo contenido no tiene ya (0.3.9.6, por hash).
@@ -6912,12 +6927,33 @@ bool RasterizerGXM::UpdateLightingLut() {
             if (held[index] != lighting_lut_hash[index]) {
                 if (((lighting_lut_row_stale >> index) & 1u) != 0) {
                     // Ver arriba: se convierte al hacer falta copiarla.
-                    const auto& source = pica.lighting.luts[index];
                     f32* row = lighting_lut_shadow.data() +
                                static_cast<std::size_t>(index) * kLutEntries * 2;
-                    for (u32 i = 0; i < kLutEntries; i++) {
-                        row[i * 2] = source[i].ToFloat();
-                        row[i * 2 + 1] = source[i].DiffToFloat();
+                    if (index == kFogLutRow) {
+                        /**
+                         * La niebla: 128 entradas de valor y pendiente, con ToFloat y
+                         * DiffToFloat (11 bits de valor en 13-23 y 13 de diferencia con
+                         * signo en 0-12), como el rasterizador de software y el de
+                         * OpenGL. EL UNIFORM fog_lut HASTA 0.4.4.1 LAS LEIA MAL (los
+                         * 16 bits bajos y los altos sobre 65535): una entrada de "sin
+                         * niebla" daba 0,875 en vez de 1, o sea un 12,5 % de color de
+                         * niebla donde no tocaba. El resto de la fila, a cero.
+                         */
+                        for (u32 i = 0; i < kLutEntries; i++) {
+                            if (i < pica.fog.lut.size()) {
+                                row[i * 2] = pica.fog.lut[i].ToFloat();
+                                row[i * 2 + 1] = pica.fog.lut[i].DiffToFloat();
+                            } else {
+                                row[i * 2] = 0.0f;
+                                row[i * 2 + 1] = 0.0f;
+                            }
+                        }
+                    } else {
+                        const auto& source = pica.lighting.luts[index];
+                        for (u32 i = 0; i < kLutEntries; i++) {
+                            row[i * 2] = source[i].ToFloat();
+                            row[i * 2 + 1] = source[i].DiffToFloat();
+                        }
                     }
                     lighting_lut_row_stale &= ~(1u << index);
                 }
@@ -9328,6 +9364,7 @@ bool RasterizerGXM::AccelerateDrawBatch(bool is_indexed) {
         memo_batches.fetch_add(1, std::memory_order_relaxed);
         memo.lights_dirty = memo.lights_dirty || AnyDirty(pica.dirty_regs, kLightsMask);
         memo.fog_dirty = memo.fog_dirty || AnyDirty(pica.dirty_regs, kFogLutMask);
+        memo.fog_row_dirty = memo.fog_row_dirty || AnyDirty(pica.dirty_regs, kFogLutMask);
         memo.colors_dirty = memo.colors_dirty || AnyDirty(pica.dirty_regs, kConstColorMask);
         pica.dirty_regs.Reset();
     }

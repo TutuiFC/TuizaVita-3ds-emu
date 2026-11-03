@@ -494,6 +494,9 @@ struct UserSettings {
     /// 0.4.1.9: fragmentos con fastprecision y combinador en half. Solo ajustes.txt.
     bool fs_fast = false;
     bool fs_half = false;
+    /// 0.4.4.1: el color de las etapas TEV redondeado a 8 bits en cada etapa, como
+    /// la 3DS (GXM::g_fs_tev_exact). Apagado: -9,7 % de instrucciones. Solo ajustes.txt.
+    bool fs_tev_exact = false;
     bool jit_nativo = false;
     /// 0.3.9.8: el motor nativo tambien en el nucleo 1 (ver
     /// Core::Native::both_cores). Experimental, solo ajustes.txt.
@@ -656,6 +659,8 @@ void ApplyUserSettings() {
     Gxm::g_fs_fast.store(g_user.fs_fast, std::memory_order_relaxed);
     Pica::Shader::Generator::GXM::g_fs_half_tev.store(g_user.fs_half,
                                                       std::memory_order_relaxed);
+    Pica::Shader::Generator::GXM::g_fs_tev_exact.store(g_user.fs_tev_exact,
+                                                       std::memory_order_relaxed);
     Core::Native::enabled = g_user.jit_nativo;
     Core::Native::both_cores = g_user.native_both_cores;
     if (g_user.jit_nativo) {
@@ -757,6 +762,7 @@ void LoadUserSettings() {
     read_bool("vs_o3=", g_user.vs_o3);
     read_bool("fs_rapidos=", g_user.fs_fast);
     read_bool("fs_media=", g_user.fs_half);
+    read_bool("fs_tev_exacto=", g_user.fs_tev_exact);
     read_bool("jit_nativo=", g_user.jit_nativo);
     read_bool("nativo_dos_nucleos=", g_user.native_both_cores);
     if (read_int("vs_tope_kb=", value)) {

@@ -906,7 +906,15 @@ private:
      * de luz" 7-14 ms por fotograma; 4 ms en Pokemon Sol). Son 1,5 MB.
      */
     static constexpr u32 kLutVersions = 32;
-    static constexpr u32 kLutTables = 24;
+    /**
+     * Las 24 tablas de luz de la PICA mas la de NIEBLA en la fila 24 (0.4.4.2):
+     * el shader de fragmentos la leia de un array de uniforms con un indice
+     * int, y en la USSE la conversion a entero es cara (-5,5 % de instrucciones
+     * en los shaders con niebla, banco del 03-11); de paso el lote ya no sube
+     * 1 KB de uniforms cada vez. Ver kFogLutRow y UpdateLightingLut.
+     */
+    static constexpr u32 kLutTables = 25;
+    static constexpr u32 kFogLutRow = 24;
     /// La valla de la ultima escena que leyo cada version (0.1.9.4).
     std::array<u32, kLutVersions> lut_fence{};
     /// Generacion de cada tabla en lighting_lut_shadow, y la que tiene escrita

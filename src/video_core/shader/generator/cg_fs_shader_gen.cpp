@@ -315,9 +315,15 @@ public:
             }
             out += "    float fog_i = clamp(floor(fog_index), 0.0, 127.0);\n";
             out += "    float fog_f = fog_index - fog_i;\n";
-            out += "    int fog_ii = int(fog_i);\n";
-            out += "    float fog_factor = fog_lut[fog_ii * 2] + fog_lut[fog_ii * 2 + 1] * "
-                   "fog_f;\n";
+            /**
+             * DE LA TEXTURA DE TABLAS, SIN int (0.4.4.2): la fila 24 de
+             * lighting_lut (ver RasterizerGXM::kFogLutRow) en vez del array de
+             * uniforms con indice entero: -5,5 % de instrucciones en estos
+             * shaders. Punto y en el centro del texel, como las de luz.
+             */
+            out += "    float2 fog_entry = tex2D(lighting_lut, float2((fog_i + 0.5) / 256.0, "
+                   "(24.0 + 0.5) / 25.0)).rg;\n";
+            out += "    float fog_factor = fog_entry.x + fog_entry.y * fog_f;\n";
             out += "    fog_factor = clamp(fog_factor, 0.0, 1.0);\n";
             out += "    combiner_output.rgb = lerp(fog_color, combiner_output.rgb, "
                    "fog_factor);\n";
@@ -433,7 +439,8 @@ private:
          * indice sin envolver, tambien igual que antes.
          */
         out += "float LookupLightingLUT(float lut_row, float index, float delta) {\n";
-        out += "    float2 uv = float2((index + 0.5) / 256.0, (lut_row + 0.5) / 24.0);\n";
+        // 25 filas: las 24 tablas de luz y la de niebla (0.4.4.2, kFogLutRow).
+        out += "    float2 uv = float2((index + 0.5) / 256.0, (lut_row + 0.5) / 25.0);\n";
         out += "    float2 lut_entry = tex2D(lighting_lut, uv).rg;\n";
         out += "    return lut_entry.x + lut_entry.y * delta;\n";
         out += "}\n\n";
@@ -565,7 +572,11 @@ private:
             out += "uniform float alphatest_ref;\n";
         }
         if (config.texture.fog_mode == TexturingRegs::FogMode::Fog) {
-            out += "uniform float fog_lut[256];\n";
+            // La tabla va en la fila 24 de lighting_lut (0.4.4.2); si no hay luz,
+            // el sampler no lo ha declarado WriteLightingHelpers.
+            if (!config.lighting.enable) {
+                out += "uniform sampler2D lighting_lut;\n";
+            }
             out += "uniform float3 fog_color;\n";
         }
         if (AnyBorderUsed()) {
@@ -1349,9 +1360,11 @@ private:
 
         const bool color_bounded = SourcesBounded(stage.color_op, stage.color_source1,
                                                   stage.color_source2, stage.color_source3, index);
-        if (OnGridReplace(stage.color_op,
-                          EffectiveSource(stage.color_source1, stage.color_source3, index)) &&
-            ColorModifierKeepsGrid(stage.color_modifier1)) {
+        if (loose_color || (OnGridReplace(stage.color_op, EffectiveSource(stage.color_source1,
+                                                                          stage.color_source3,
+                                                                          index)) &&
+                            ColorModifierKeepsGrid(stage.color_modifier1))) {
+            // Sin redondeo: ya en la rejilla de 8 bits, o color suelto (g_fs_tev_exact).
             out += fmt::format(";\n    float3 color_output_{} = ", index);
             AppendColorCombiner(stage.color_op, color_bounded);
             out += ";\n";
@@ -1362,7 +1375,14 @@ private:
         }
 
         if (stage.color_op == Operation::Dot3_RGBA) {
-            out += fmt::format("    float alpha_output_{0} = color_output_{0}.r;\n", index);
+            // Con el color suelto, el alfa que sale del color se redondea aqui: el
+            // alfa siempre exacto (ver g_fs_tev_exact).
+            if (loose_color) {
+                out += fmt::format("    float alpha_output_{0} = byteround1(color_output_{0}.r);\n",
+                                   index);
+            } else {
+                out += fmt::format("    float alpha_output_{0} = color_output_{0}.r;\n", index);
+            }
         } else {
             out += "    alpha_results_1 = ";
             AppendAlphaModifier(stage.alpha_modifier1, stage.alpha_source1, index);
@@ -1373,9 +1393,18 @@ private:
             const bool alpha_bounded = SourcesBounded(stage.alpha_op, stage.alpha_source1,
                                                       stage.alpha_source2, stage.alpha_source3,
                                                       index);
-            if (OnGridReplace(stage.alpha_op,
-                              EffectiveSource(stage.alpha_source1, stage.alpha_source3, index)) &&
-                AlphaModifierKeepsGrid(stage.alpha_modifier1)) {
+            /**
+             * Con el color suelto (g_fs_tev_exact), "sustituir por la salida anterior"
+             * solo esta en la rejilla si toma su ALFA: un canal de color de la etapa
+             * anterior ya no salio de byteround. El color primario si (rounded_).
+             */
+            const Source alpha_source1 =
+                EffectiveSource(stage.alpha_source1, stage.alpha_source3, index);
+            const bool alpha_reads_loose_color =
+                loose_color && alpha_source1 == Source::Previous &&
+                stage.alpha_modifier1 != AlphaModifier::SourceAlpha;
+            if (OnGridReplace(stage.alpha_op, alpha_source1) &&
+                AlphaModifierKeepsGrid(stage.alpha_modifier1) && !alpha_reads_loose_color) {
                 out += fmt::format(";\n    float alpha_output_{} = ", index);
                 AppendAlphaCombiner(stage.alpha_op, alpha_bounded);
                 out += ";\n";
@@ -1424,6 +1453,8 @@ private:
     bool color_from_blend_const = false;
     /// Ver HalfTev: se lee una vez por shader.
     const bool half_tev = g_fs_half_tev.load(std::memory_order_relaxed);
+    /// Ver g_fs_tev_exact (0.4.4.1): el color de las etapas sin redondear.
+    const bool loose_color = !g_fs_tev_exact.load(std::memory_order_relaxed);
     std::string out;
     bool uses_tex0 = false;
     bool uses_tex1 = false;
@@ -1436,6 +1467,7 @@ private:
 
 std::atomic<bool> g_fs_flat_test{false};
 std::atomic<bool> g_fs_half_tev{false};
+std::atomic<bool> g_fs_tev_exact{false};
 
 std::optional<std::string> GenerateFragmentShader(const FSConfig& config,
                                                   const char** out_reason,
