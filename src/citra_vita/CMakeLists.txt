@@ -199,7 +199,8 @@ vita_create_vpk(azahar.vpk ${VITA_TITLEID} azahar.self
     # primero. Fuente: Azaharvita2versiones/nativo/kernel.
     FILE ${CMAKE_CURRENT_SOURCE_DIR}/nativo/aznative.skprx aznative.skprx
     # El shader de fragmentos de reserva ya compilado (0.4.2.5): ver LA RESERVA VA
-    # COMPILADA EN EL VPK en rasterizer_gxm.cpp.
-    FILE ${CMAKE_CURRENT_SOURCE_DIR}/reserva/reserva_f.gxp reserva_f.gxp
-    FILE ${CMAKE_CURRENT_SOURCE_DIR}/reserva/reserva_fl.gxp reserva_fl.gxp
+    # COMPILADA EN EL VPK en rasterizer_gxm.cpp. Desde 0.4.4.3 la RAPIDA
+    # (reserva_r_*, ver LA RESERVA RAPIDA); los reserva_f*.gxp viejos ya no se usan.
+    FILE ${CMAKE_CURRENT_SOURCE_DIR}/reserva/reserva_r_f.gxp reserva_r_f.gxp
+    FILE ${CMAKE_CURRENT_SOURCE_DIR}/reserva/reserva_r_fl.gxp reserva_r_fl.gxp
 )

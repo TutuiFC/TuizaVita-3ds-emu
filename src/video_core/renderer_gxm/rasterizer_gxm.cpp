@@ -1891,37 +1891,31 @@ constexpr const char* kReserveFsMainLit = R"(void main(float4 primary_color : CO
     float4 k2 = float4(0.0, 0.0, 0.0, 1.0);
 )";
 
-constexpr const char* kReserveFsBody = R"(    float4 k3 = tex2D(tex0, tc0);
-    float4 k4 = tex2D(tex1, tc1);
-    float4 k5 = tex2D(tex2, lerp(tc2, tc1, uber_misc[0].x));
-    float4 buffer = float4(0.0, 0.0, 0.0, 0.0);
-    float4 next_buffer = tev_combiner_buffer_color;
-    float4 prev = float4(0.0, 0.0, 0.0, 0.0);
-    for (int s = 0; s < 6; s++) {
-        float4 cs = uber_tev[s * 7 + 0];
-        float4 as = uber_tev[s * 7 + 1];
-        float4 cm = uber_tev[s * 7 + 2];
-        float4 am = uber_tev[s * 7 + 3];
-        float4 ci = uber_tev[s * 7 + 4];
-        float4 ai = uber_tev[s * 7 + 5];
-        float4 up = uber_tev[s * 7 + 6];
-        if (cs.w > 0.5) {
-            float4 k8 = const_color[s];
-            float3 c1 = ColorMod(Pick(cs.x, k0, k1, k2, k3, k4, k5, buffer, prev, k8), cm.x, ci.x);
-            float3 c2 = ColorMod(Pick(cs.y, k0, k1, k2, k3, k4, k5, buffer, prev, k8), cm.y, ci.y);
-            float3 c3 = ColorMod(Pick(cs.z, k0, k1, k2, k3, k4, k5, buffer, prev, k8), cm.z, ci.z);
-            float3 col = ColorOp(c1, c2, c3, cm.w);
-            float a1 = AlphaMod(Pick(as.x, k0, k1, k2, k3, k4, k5, buffer, prev, k8), am.x, ai.x);
-            float a2 = AlphaMod(Pick(as.y, k0, k1, k2, k3, k4, k5, buffer, prev, k8), am.y, ai.y);
-            float a3 = AlphaMod(Pick(as.z, k0, k1, k2, k3, k4, k5, buffer, prev, k8), am.z, ai.z);
-            float alp = AlphaOp(a1, a2, a3, am.w);
-            alp = lerp(alp, col.r, as.w);
-            prev = float4(saturate(col * ci.w), saturate(alp * ai.w));
-        }
-        buffer = next_buffer;
-        next_buffer.rgb = lerp(next_buffer.rgb, prev.rgb, up.x);
-        next_buffer.a = lerp(next_buffer.a, prev.a, up.y);
-    }
+/**
+ * LA RESERVA RAPIDA (0.4.4.3). La de arriba (seis etapas eligiendo fuentes,
+ * modificadores y operaciones con cadenas de comparaciones en el propio
+ * shader) eran 432-526 instrucciones con 55 temporales, y con tan pocos hilos
+ * en vuelo el chip tardaba 100-140 ms por superficie (picos de 290) frente a
+ * los 8 ms del shader de verdad: Mario 3D Land a 3-7 FPS mientras compilaba,
+ * "injugable" (03-11). Una sola etapa pero eligiendo en el shader no bastaba
+ * (349 instrucciones, 43 temporales). Ahora ELIGE LA CPU (FillReserve): el
+ * color base (del vertice, de la luz o el constante, con pesos 0/1) por las
+ * texturas 0 y 1 si la primera etapa que hace algo las usa. Unas pocas
+ * multiplicaciones y sumas. El color sale aproximado unos segundos; el juego
+ * no se hunde.
+ */
+constexpr const char* kReserveFsBody = R"(    float4 t0 = tex2D(tex0, tc0);
+    float4 t1 = tex2D(tex1, tc1);
+    float4 wc = uber_tev[0];
+    float4 wa = uber_tev[1];
+    float4 ut = uber_tev[2];
+    float4 k8 = uber_tev[3];
+    float3 base_c = k0.rgb * wc.x + k1.rgb * wc.y + k8.rgb * wc.z + wc.w;
+    float base_a = k0.a * wa.x + k1.a * wa.y + k8.a * wa.z + wa.w;
+    float3 tex_c = lerp(float3(1.0, 1.0, 1.0), t0.rgb, ut.x) *
+                   lerp(float3(1.0, 1.0, 1.0), t1.rgb, ut.z);
+    float tex_a = lerp(1.0, t0.a, ut.y) * lerp(1.0, t1.a, ut.w);
+    float4 prev = saturate(float4(base_c * tex_c, base_a * tex_a));
     float v = floor(prev.a * 255.0 + 0.5) - alphatest_ref;
     float lt = step(0.5, -v);
     float gt = step(0.5, v);
@@ -1938,7 +1932,7 @@ std::string ReserveFsSource(bool lit) {
     if (lit) {
         out += kReserveFsLitHead;
     }
-    out += kReserveFsFunctions;
+    // kReserveFsFunctions (Pick y compania) ya no: elige la CPU (0.4.4.3).
     out += lit ? kReserveFsMainLit : kReserveFsMainPlain;
     out += kReserveFsBody;
     return out;
@@ -2923,7 +2917,24 @@ struct RasterizerGXM::PipelineCache {
         const char* file = nullptr;
         u32 attempts = 0;
         unsigned long long retry_us = 0;
+        /// Con compilar_reserva.txt: donde dejar el binario para meterlo en el VPK.
+        const char* dump = nullptr;
     };
+
+    /// El binario compilado a un fichero (ver ReserveProgram::dump).
+    static void DumpReserve(const ReserveProgram& program) {
+        if (program.dump == nullptr || program.output == nullptr) {
+            return;
+        }
+        const SceUID fd =
+            sceIoOpen(program.dump, SCE_O_WRONLY | SCE_O_CREAT | SCE_O_TRUNC, 0777);
+        if (fd >= 0) {
+            sceIoWrite(fd, program.output->programData, program.output->programSize);
+            sceIoClose(fd);
+            NoteFmt("gxm reserva", "binario volcado en {} ({} bytes)", program.dump,
+                    program.output->programSize);
+        }
+    }
 
     /**
      * LA RESERVA VA COMPILADA EN EL VPK (0.4.2.5). Compilar la version sin arrays
@@ -2942,11 +2953,17 @@ struct RasterizerGXM::PipelineCache {
         }
         SceIoStat flag{};
         const bool compile = sceIoGetstat("ux0:/data/azahar/compilar_reserva.txt", &flag) >= 0;
-        static constexpr const char* kFiles[2] = {"app0:/reserva_f.gxp", "app0:/reserva_fl.gxp"};
+        /**
+         * La reserva RAPIDA (0.4.4.3) va con otro nombre: los reserva_f*.gxp de
+         * los VPK de 0.4.2.5-0.4.4.2 son la lenta y siguen en ux0:app de quien
+         * actualice solo el eboot.
+         */
+        static constexpr const char* kFiles[2] = {"app0:/reserva_r_f.gxp",
+                                                  "app0:/reserva_r_fl.gxp"};
         // Y si no estan en la app (pruebas con solo el eboot: el FTP no deja crear
         // ficheros en ux0:app), en la carpeta de datos.
-        static constexpr const char* kDataFiles[2] = {"ux0:/data/azahar/reserva_f.gxp",
-                                                      "ux0:/data/azahar/reserva_fl.gxp"};
+        static constexpr const char* kDataFiles[2] = {"ux0:/data/azahar/reserva_r_f.gxp",
+                                                      "ux0:/data/azahar/reserva_r_fl.gxp"};
         for (u32 variant = 0; variant < 2; variant++) {
             if (variant == 1 && lit.program == nullptr) {
                 continue;
@@ -2954,6 +2971,7 @@ struct RasterizerGXM::PipelineCache {
             ReserveProgram& program = reserve[variant];
             const std::string source = ReserveFsSource(variant == 1);
             program.source = source;
+            program.dump = compile ? kDataFiles[variant] : nullptr;
             if (!compile) {
                 program.file = kFiles[variant];
                 program.output = LoadProgramFile(program.file);
@@ -2967,6 +2985,7 @@ struct RasterizerGXM::PipelineCache {
             if (const SceShaccCgCompileOutput* cached =
                     LoadCgCache(SCE_SHACCCG_PROFILE_FP, "azahar_reserva_f.cg", source.c_str())) {
                 program.output = cached;
+                DumpReserve(program);
                 RegisterReserve(program);
                 continue;
             }
@@ -3052,6 +3071,7 @@ struct RasterizerGXM::PipelineCache {
         }
         program.output = program.job->output;
         program.job.reset();
+        DumpReserve(program);
         RegisterReserve(program);
         return program.registered;
     }
@@ -3305,6 +3325,67 @@ struct RasterizerGXM::PipelineCache {
             }
         }
         reserve_units = units;
+        /**
+         * LOS PESOS DE LA RESERVA RAPIDA (0.4.4.3, ver kReserveFsBody). De la
+         * primera etapa que hace algo: las fuentes que usa su operacion (la 1 al
+         * sustituir; la 1 y la 2 en las demas). Color base: el del vertice, si no
+         * el de la luz, si no el constante, si no blanco; y por las texturas 0 y 1
+         * que aparezcan. Lo mismo para el alfa. Pisa los cuatro primeros vec4 de
+         * reserve_tev (uber_tev[0..3]), que es lo unico que lee el shader.
+         */
+        {
+            u32 first = 6;
+            for (u32 index = 0; index < 6; index++) {
+                if (reserve_tev[index * 28 + 3] > 0.5f) {
+                    first = index;
+                    break;
+                }
+            }
+            std::array<f32, 16> weights{};
+            if (first < 6) {
+                const TevStage stage = config.texture.tev_stages[first];
+                const auto effective = [first](Source source, Source source3) {
+                    return first == 0 && source == Source::Previous ? source3 : source;
+                };
+                const auto fill = [&](Operation op, Source s1, Source s2, f32* base, f32& tex0,
+                                      f32& tex1) {
+                    const bool two = op != Operation::Replace;
+                    const auto uses = [&](Source wanted) {
+                        return s1 == wanted || (two && s2 == wanted);
+                    };
+                    tex0 = uses(Source::Texture0) ? 1.0f : 0.0f;
+                    tex1 = uses(Source::Texture1) ? 1.0f : 0.0f;
+                    if (uses(Source::PrimaryColor)) {
+                        base[0] = 1.0f;
+                    } else if (uses(Source::PrimaryFragmentColor) ||
+                               uses(Source::SecondaryFragmentColor)) {
+                        base[1] = 1.0f;
+                    } else if (uses(Source::Constant)) {
+                        base[2] = 1.0f;
+                    } else {
+                        base[3] = 1.0f;
+                    }
+                };
+                fill(stage.color_op,
+                     effective(stage.color_source1, stage.color_source3),
+                     effective(stage.color_source2, stage.color_source3), &weights[0],
+                     weights[8], weights[10]);
+                fill(stage.alpha_op,
+                     effective(stage.alpha_source1, stage.alpha_source3),
+                     effective(stage.alpha_source2, stage.alpha_source3), &weights[4],
+                     weights[9], weights[11]);
+                const u32 constant = regs.texturing.GetTevStages()[first].const_color;
+                weights[12] = static_cast<f32>(constant & 0xFF) / 255.0f;
+                weights[13] = static_cast<f32>((constant >> 8) & 0xFF) / 255.0f;
+                weights[14] = static_cast<f32>((constant >> 16) & 0xFF) / 255.0f;
+                weights[15] = static_cast<f32>((constant >> 24) & 0xFF) / 255.0f;
+            } else {
+                // Ninguna etapa hace nada: el color del vertice.
+                weights[0] = 1.0f;
+                weights[4] = 1.0f;
+            }
+            std::copy(weights.begin(), weights.end(), reserve_tev.begin());
+        }
         // Prueba de alfa: pesos de (menor, igual, mayor) que pasan.
         using CompareFunc = Pica::FramebufferRegs::CompareFunc;
         f32 lt = 1.0f, eq = 1.0f, gt = 1.0f;
