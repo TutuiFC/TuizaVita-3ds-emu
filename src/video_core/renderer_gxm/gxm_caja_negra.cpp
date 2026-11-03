@@ -361,6 +361,13 @@ void NoteWindow(const Window& w, double seconds) {
 }
 
 void* TimerMain(void*) {
+    /**
+     * Sin nucleo fijo y mirando cada 250 us, a proposito. En 0.4.3.9 se probo en
+     * el nucleo 2 (con el DSP y el audio) y cada 500 us / 2 ms: Kirby TD bajo de
+     * 27 a 22 FPS en el video de la introduccion, dos partidas de dos, con el
+     * DSP atascado (la emulacion esperandolo 16-29 ms por fotograma). Si se
+     * vuelve a tocar, medir primero un juego con video (Kirby TD).
+     */
     sceKernelChangeThreadPriority(sceKernelGetThreadId(), kTimerPriority);
     u32 tail = 0;
     u32 seq = 0;
@@ -371,6 +378,11 @@ void* TimerMain(void*) {
     static unsigned long long vstart_at[kTimed];
     static unsigned long long vdone_at[kTimed];
     unsigned long long window_start = Common::VitaMicros();
+    // El segundo del overlay: cuando empezo, lo que llevaba sumado chip_total_us
+    // (que no se pone a cero con la ventana de 10 s) y lo que lleva ahora.
+    unsigned long long second_start = window_start;
+    unsigned long long second_base = 0;
+    unsigned long long chip_total_us = 0;
     Window w{};
     int fill = 0;
     u32 filled = 0;
@@ -412,6 +424,7 @@ void* TimerMain(void*) {
             KindStats& k = w.kind[sub.kind & 3u];
             k.scenes++;
             k.chip_us += chip;
+            chip_total_us += chip;
             k.vertex_us += vend > vstart ? vend - vstart : 0;
             k.pixel_us += now > pstart ? now - pstart : 0;
             k.max_us = std::max(k.max_us, chip);
@@ -449,6 +462,22 @@ void* TimerMain(void*) {
                 filled = 0;
             }
             tail++;
+        }
+        /**
+         * EL OVERLAY (0.4.3.5): lo ocupado del chip en el ultimo segundo, para
+         * "gpu ... chip" de la pantalla. Las escenas no se solapan (cada una
+         * empieza cuando acaba la anterior), asi que la suma de sus tiempos
+         * entre el tiempo de reloj no pasa de 100 %. Aparte de la ventana de 10
+         * s de crash.txt, que es demasiado lenta para mirarla jugando.
+         */
+        if (now - second_start >= 1'000'000ull) {
+            const unsigned long long busy = chip_total_us - second_base;
+            const unsigned long long span = now - second_start;
+            g_chip_busy_tenths.store(
+                static_cast<int>(std::min<unsigned long long>(1000, busy * 1000 / span)),
+                std::memory_order_relaxed);
+            second_base = chip_total_us;
+            second_start = now;
         }
         if (now - window_start >= 10'000'000ull) {
             NoteWindow(w, static_cast<double>(now - window_start) / 1e6);
@@ -606,6 +635,12 @@ void* BoxMain(void*) {
 }
 
 } // Anonymous namespace
+
+std::atomic<int> g_chip_busy_tenths{-1};
+
+int ChipBusyTenths() {
+    return g_chip_busy_tenths.load(std::memory_order_relaxed);
+}
 
 void Start(const volatile unsigned int* fence, const volatile unsigned int* vertex_fence) {
     g_fence = fence;

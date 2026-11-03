@@ -38,6 +38,9 @@ void RunCgBenchIfAny();
 
 /// Los shaders de vertices a O2 (0.4.1.1, ver gxm_cg.cpp). Ajuste "vs_o2=".
 extern std::atomic<bool> g_vs_o2;
+/// Los de vertices nuevos a O3, sin cambiar su identidad en la cache (0.4.3.7,
+/// ver gxm_cg.cpp). Ajuste "vs_o3=", encendido.
+extern std::atomic<bool> g_vs_o3;
 /// Fragmentos compilados con useFastprecision (0.4.1.9, ajuste fs_rapidos=).
 extern std::atomic<bool> g_fs_fast;
 

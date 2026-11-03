@@ -393,6 +393,12 @@ private:
     /// hilo y parte que el de emulacion ha estado parado esperandola, mas las
     /// esperas por motivo. Ver VideoCore::GxStats.
     double stats_gpu_busy_percent = 0.0;
+    /// Uso REAL de la consola (0.4.3.5), para las lineas cpu y gpu del overlay:
+    /// lo ocupado de cada nucleo de usuario (Common::VitaCoreUsage) y del chip de
+    /// la GPU (Gxm::BlackBox::ChipBusyTenths, en decimas; -1 = sin dato).
+    double stats_core_percent[3] = {0.0, 0.0, 0.0};
+    bool stats_core_valid = false;
+    int stats_chip_tenths = -1;
     /// Ver VideoCore::GxStats::present_us (0.3.9.9), en ms por fotograma.
     double stats_gpu_present_ms = 0.0;
     /// Ver VideoCore::GxStats::present_flush_us (0.4.0.0).

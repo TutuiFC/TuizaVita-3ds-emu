@@ -443,6 +443,32 @@ std::string VitaThreadSummary() {
     return text;
 }
 
+bool VitaCoreUsage(double percent[3]) {
+    static unsigned long long last_wall = 0;
+    static std::array<unsigned long long, 3> last_idle{};
+    const unsigned long long now = VitaMicros();
+    const unsigned long long wall = last_wall != 0 ? now - last_wall : 0;
+    last_wall = now;
+    SceKernelSystemInfo system{};
+    system.size = sizeof(system);
+    if (sceKernelGetSystemInfo(&system) < 0) {
+        last_wall = 0;
+        return false;
+    }
+    bool have = wall > 0;
+    for (int core = 0; core < 3; core++) {
+        const unsigned long long idle = system.cpuInfo[core].idleClock;
+        if (have) {
+            const double free_percent =
+                std::min(100.0, static_cast<double>(idle - last_idle[core]) * 100.0 /
+                                    static_cast<double>(wall));
+            percent[core] = 100.0 - free_percent;
+        }
+        last_idle[core] = idle;
+    }
+    return have;
+}
+
 void VitaSetThreadPriority(int priority, const char* role) {
     RegisterThread(role);
     const int before = sceKernelGetThreadCurrentPriority();

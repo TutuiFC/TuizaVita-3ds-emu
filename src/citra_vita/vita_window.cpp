@@ -24,6 +24,7 @@
 #include "core/core.h"
 #include "core/vita_loop_profile.h"
 #include "video_core/gpu.h"
+#include "video_core/renderer_gxm/gxm_caja_negra.h"
 #include "video_core/renderer_gxm/gxm_cg.h"
 #include "video_core/renderer_gxm/gxm_pica_format.h"
 #include "video_core/renderer_gxm/gxm_presenter.h"
@@ -801,6 +802,10 @@ void EmuWindow_Vita::DrawStatsOverlay() {
             const double wait = static_cast<double>(
                 VideoCore::GxStats::emu_wait_us.exchange(0, std::memory_order_relaxed));
             stats_gpu_busy_percent = interval_us > 0.0 ? busy / interval_us * 100.0 : 0.0;
+            // Uso real de la consola para el overlay (0.4.3.5), con el mismo
+            // ritmo que el resto de los contadores del intervalo.
+            stats_core_valid = Common::VitaCoreUsage(stats_core_percent);
+            stats_chip_tenths = Gxm::BlackBox::ChipBusyTenths();
             {
                 // Por fotograma del juego, como 'ocupado': ver GxStats::present_us.
                 const double per_frame = interval_us > 0.0 && stats_frame_ms > 0.0
@@ -1533,6 +1538,16 @@ void EmuWindow_Vita::DrawStatsOverlay() {
                 Common::VitaNote("svc", Core::TakeSvcProfile().c_str());
                 Common::VitaNote("servicios", Core::TakeIpcProfile().c_str());
                 Common::VitaNote("hilos", Common::VitaThreadSummary().c_str());
+                // Lo mismo que muestra el overlay (0.4.3.5), para comprobarlo sin captura.
+                Common::VitaNote("uso", fmt::format("nucleos {:.0f}/{:.0f}/{:.0f}% ({}) chip {}%",
+                                                    stats_core_percent[0], stats_core_percent[1],
+                                                    stats_core_percent[2],
+                                                    stats_core_valid ? "valido" : "sin dato",
+                                                    stats_chip_tenths >= 0
+                                                        ? fmt::format("{:.1f}",
+                                                                      stats_chip_tenths / 10.0)
+                                                        : std::string("sin dato"))
+                                            .c_str());
                 Common::VitaNote("vs flujo", Pica::Shader::Fast::TakeFlowSummary().c_str());
                 u32 code_bytes = 0;
                 u32 code_blocks = 0;
@@ -1605,6 +1620,29 @@ void EmuWindow_Vita::DrawStatsOverlay() {
         put(line2);
         put("  ms ");
         AppendMillis(compact, c, stats_frame_ms);
+        /**
+         * USO REAL TAMBIEN EN EL COMPACTO (0.4.3.6): "cpu 78/48/26 gpu 31%", los
+         * tres nucleos y el chip de la GPU (ver las lineas cpu y gpu del completo).
+         * Son unos 25 caracteres mas en una linea que se redibuja una vez por
+         * segundo: nada frente a las treinta lineas del completo.
+         */
+        if (stats_core_valid) {
+            put("  cpu ");
+            for (int core = 0; core < 3; core++) {
+                if (core != 0) {
+                    compact[c++] = '/';
+                }
+                c += AppendUInt(compact + c,
+                                static_cast<unsigned int>(
+                                    std::min(std::max(stats_core_percent[core], 0.0), 100.0) +
+                                    0.5));
+            }
+        }
+        if (stats_chip_tenths >= 0) {
+            put("  gpu ");
+            c += AppendUInt(compact + c, static_cast<unsigned int>((stats_chip_tenths + 5) / 10));
+            compact[c++] = '%';
+        }
         compact[c] = '\0';
         vita2d_pgf_draw_text(stats_font, static_cast<int>(kOverlayX), 20, 0xFF60C0FF, 0.8f,
                              compact);
@@ -1645,10 +1683,47 @@ void EmuWindow_Vita::DrawStatsOverlay() {
         out[n] = '\0';
     };
 
-    char line_cpu[24];
+    /**
+     * USO REAL EN LAS LINEAS cpu Y gpu (0.4.3.5). El primer numero de cada una
+     * sigue siendo lo de siempre: la parte del fotograma que se va en el
+     * interprete (cpu) o en las listas de comandos GX (gpu). Detras, lo que la
+     * consola esta trabajando de verdad:
+     *   nuc a/b/c = % ocupado de cada uno de los tres nucleos de usuario
+     *               (cualquier hilo, no solo los nuestros)
+     *   chip      = % del ultimo segundo que el chip de la GPU ha estado dibujando
+     * Con el chip al 100 % la GPU es el muro; con un nucleo al 100 % lo es la CPU.
+     */
+    char line_cpu[64];
     build_percent_line(line_cpu, "cpu ", stats_cpu_percent);
-    char line_gpu[24];
+    if (stats_core_valid) {
+        std::size_t n = std::strlen(line_cpu);
+        const char* tag = "  nuc ";
+        for (std::size_t i = 0; tag[i] != '\0'; i++) {
+            line_cpu[n++] = tag[i];
+        }
+        for (int core = 0; core < 3; core++) {
+            if (core != 0) {
+                line_cpu[n++] = '/';
+            }
+            n += AppendUInt(line_cpu + n,
+                            static_cast<unsigned int>(
+                                std::min(std::max(stats_core_percent[core], 0.0), 100.0) + 0.5));
+        }
+        line_cpu[n++] = '%';
+        line_cpu[n] = '\0';
+    }
+    char line_gpu[64];
     build_percent_line(line_gpu, "gpu ", stats_gpu_percent);
+    if (stats_chip_tenths >= 0) {
+        std::size_t n = std::strlen(line_gpu);
+        const char* tag = "  chip ";
+        for (std::size_t i = 0; tag[i] != '\0'; i++) {
+            line_gpu[n++] = tag[i];
+        }
+        AppendOneDecimal(line_gpu, n, stats_chip_tenths / 10.0);
+        line_gpu[n++] = '%';
+        line_gpu[n] = '\0';
+    }
     char line_svc[48];
     build_percent_line(line_svc, "svc ", stats_svc_percent);
     // El swap (presentacion por vita2d incluida) no se veia en ninguna linea y

@@ -40,6 +40,9 @@ extern unsigned int _newlib_heap_size_user;
 
 namespace Gxm {
 
+/// Ver g_vs_o3 (0.4.3.7): esta fuente de vertices se compila a O1 desde ahora.
+void AddO3Bad(u64 hash_city);
+
 namespace {
 
 constexpr const char* kShacccgPaths[] = {
@@ -70,8 +73,16 @@ unsigned long long g_last_attempt_us = 0;
 /// caida de 450 ms a 13.734 ms de fotograma.
 constexpr unsigned long long kRetryIntervalUs = 1000000;
 
-SceShaccCgSourceFile* OpenSource(const char*, const SceShaccCgSourceLocation*,
+/// Las dos fuentes del banco en paralelo (0.4.3.1): cada compilacion la suya.
+SceShaccCgSourceFile g_bench_files[2]{};
+
+SceShaccCgSourceFile* OpenSource(const char* name, const SceShaccCgSourceLocation*,
                                  const SceShaccCgCompileOptions*, const char**) {
+    for (SceShaccCgSourceFile& file : g_bench_files) {
+        if (file.fileName != nullptr && name != nullptr && std::strcmp(file.fileName, name) == 0) {
+            return &file;
+        }
+    }
     return &g_source;
 }
 
@@ -555,7 +566,22 @@ void ArenaTrimLocked() {
     g_arena_chunks = kept;
 }
 
+/// El banco en paralelo (0.4.3.1): el reservador propio no tiene cerrojo.
+std::atomic<bool> g_bench_parallel{false};
+
+int ArenaChunkOf(const void* pointer);
+
 void* CgAlloc(unsigned int size) {
+    // Banco en paralelo (0.4.3.1): directo a newlib, sin el reservador propio ni
+    // la cuarentena (no tienen cerrojo) y sin cerrojo nuestro que lo serialice.
+    if (g_bench_parallel.load(std::memory_order_relaxed)) {
+        const std::size_t rounded = size == 0 ? 16u : (size + 15u) & ~15u;
+        void* const pointer = memalign(16, rounded);
+        if (pointer != nullptr) {
+            std::memset(pointer, 0, rounded);
+        }
+        return pointer;
+    }
     if (!g_tracking || (g_alloc_calls & 63u) != 0) {
         return CgAllocInner(size);
     }
@@ -566,6 +592,13 @@ void* CgAlloc(unsigned int size) {
 }
 
 void CgFree(void* pointer) {
+    if (g_bench_parallel.load(std::memory_order_relaxed)) {
+        // Los del reservador propio de antes del banco se quedan (es el banco).
+        if (pointer != nullptr && ArenaChunkOf(pointer) < 0) {
+            std::free(pointer);
+        }
+        return;
+    }
     if (!g_tracking || (g_free_calls++ & 63u) != 0) {
         CgFreeInner(pointer);
         return;
@@ -1403,7 +1436,17 @@ void EvaluateInterruptedCompile(const CompilingMarker& marker, bool timed) {
                                   wall_s, marker.cpu_s);
         }
     }
-    if (blame) {
+    if (blame && vertex && marker.optimization == 3) {
+        /**
+         * Murio a O3 (ver g_vs_o3, 0.4.3.7): primero se le da la oportunidad
+         * a O1, que es como compilaban todos hasta 0.4.3.6. Si a O1 tambien
+         * tumba el proceso, la marca siguiente dira O1 y entonces si va a la
+         * lista negra.
+         */
+        AddO3Bad(marker.source.hash_city);
+        SaveDiedSource(marker.source, marker.source_size);
+        verdict += " (a O3: se compilara a O1, sin lista negra)";
+    } else if (blame) {
         StoreBadSource(marker.source);
         if (g_died_sources.insert(marker.source).second) {
             AppendRecord(kDiedPath, marker.source);
@@ -1864,6 +1907,63 @@ void SaltForO2(u64& hash_city, u64& hash_fnv) {
 }
 
 /**
+ * LOS DE VERTICES NUEVOS, A O3 (0.4.3.7, ajuste vs_o3=, encendido). Banco del
+ * 03-11 con las 41 fuentes de vertices de Kirby TD, Luigi's Mansion y Zafiro
+ * Alfa tal como las genera 0.4.3.6: las 41 compilan a O3 sin un error interno,
+ * en un 15 % menos de tiempo en total (los grandes, que son los que hacen
+ * esperar, un 20-26 % menos; algunos pequenos tardan hasta medio segundo mas)
+ * y con binarios un 46 % mas pequenos (-52 % de instrucciones). El chip tarda
+ * en proporcion al binario de vertices (ver kVsO2Salt), asi que compensa de
+ * sobra lo que crecen las fuentes unificadas (kCgUnifiedInputs).
+ *
+ * A diferencia de O2, el binario se guarda con la MISMA identidad que a O1: lo
+ * que ya hay en la cache de la tarjeta sigue valiendo tal cual (nadie recompila
+ * sus juegos) y solo lo nuevo sale a O3. Si una fuente da error interno a O3 (en
+ * 0.4.0.1 cuatro de Zafiro lo daban, con otro traductor) o el proceso muere
+ * compilandola a O3, va a cg_o3_malos.bin y desde entonces se compila a O1, en
+ * la misma compilacion si fue un error interno. O2 (vs_o2=1) manda sobre esto.
+ */
+std::atomic<bool> g_vs_o3{true};
+std::string g_kO3BadPath_storage;
+const char* const kO3BadPath = CacheFile(g_kO3BadPath_storage, "cg_o3_malos.bin");
+std::mutex g_o3_bad_mutex;
+std::unordered_set<u64> g_o3_bad;
+bool g_o3_bad_loaded = false;
+
+bool IsO3Bad(u64 hash_city) {
+    const std::lock_guard lock{g_o3_bad_mutex};
+    if (!g_o3_bad_loaded) {
+        g_o3_bad_loaded = true;
+        if (std::FILE* in = std::fopen(kO3BadPath, "rb")) {
+            u64 hash = 0;
+            while (std::fread(&hash, sizeof(hash), 1, in) == 1) {
+                g_o3_bad.insert(hash);
+            }
+            std::fclose(in);
+        }
+    }
+    return g_o3_bad.count(hash_city) != 0;
+}
+
+void AddO3Bad(u64 hash_city) {
+    (void)IsO3Bad(hash_city);
+    const std::lock_guard lock{g_o3_bad_mutex};
+    if (!g_o3_bad.insert(hash_city).second) {
+        return;
+    }
+    if (std::FILE* out = std::fopen(kO3BadPath, "ab")) {
+        std::fwrite(&hash_city, sizeof(hash_city), 1, out);
+        std::fclose(out);
+    }
+}
+
+/// Este fuente de vertices se compila a O3 (si no esta ya en la cache).
+bool VsUsesO3(SceShaccCgTargetProfile profile, u64 hash_city) {
+    return profile == SCE_SHACCCG_PROFILE_VP && g_vs_o3.load(std::memory_order_relaxed) &&
+           !VsUsesO2(profile, hash_city) && !IsO3Bad(hash_city);
+}
+
+/**
  * FRAGMENTOS CON fastprecision (0.4.1.9, ajuste fs_rapidos=). El 80-90 % del
  * chip en Mario 3D Land y Zafiro es el shader de fragmentos (experimento
  * fs_plano de 0.4.1.5). Con esto el compilador puede usar media precision
@@ -2191,6 +2291,8 @@ const SceShaccCgCompileOutput* CompileCgOnce(SceShaccCgTargetProfile profile, co
     if (o2) {
         SaltForO2(key.hash_city, key.hash_fnv);
     }
+    // Ver g_vs_o3 (0.4.3.7): sin sal, con la misma identidad que a O1.
+    const bool o3 = !o2 && VsUsesO3(profile, plain_hash_city);
     const bool fast = FsUsesFast(profile);
     if (fast) {
         SaltForFast(key.hash_city, key.hash_fnv);
@@ -2290,16 +2392,17 @@ const SceShaccCgCompileOutput* CompileCgOnce(SceShaccCgTargetProfile profile, co
      * fragmentos (se ejecutan por pixel) siguen con la optimizacion de serie.
      */
     /**
-     * O1 EN LOS DE VERTICES (0.1.9.6), y se queda. En 0.4.0.1 se probo O3, que con
-     * la lectura de uniforms corta compila antes y deja binarios la mitad de
+     * O1 EN LOS DE VERTICES (0.1.9.6). En 0.4.0.1 se probo O3, que con la
+     * lectura de uniforms corta compila antes y deja binarios la mitad de
      * grandes (banco: 9 s y 7,5 KB frente a 12 s y 15,7 KB), pero en Zafiro Alfa
      * cuatro shaders dieron "fatal internal error" en O3 y no en O1 (banco_cg4), y
-     * un error interno deja el compilador roto el resto de la sesion: todos los
-     * de vertices a la CPU y el juego a 3 fps. No vale el riesgo.
+     * entonces un error interno dejaba el compilador roto el resto de la sesion.
+     * Desde 0.4.3.7, O3 otra vez (ver g_vs_o3): el compilador ya se recarga tras
+     * un error interno y el que falle a O3 se repite a O1 en el acto.
      */
     if (profile == SCE_SHACCCG_PROFILE_VP) {
-        // Ver g_vs_o2 (0.4.1.1).
-        options.optimizationLevel = o2 ? 2 : 1;
+        // Ver g_vs_o2 (0.4.1.1) y g_vs_o3 (0.4.3.7).
+        options.optimizationLevel = o2 ? 2 : (o3 ? 3 : 1);
     }
     if (fast) {
         // Ver g_fs_fast (0.4.1.9).
@@ -2432,11 +2535,16 @@ const SceShaccCgCompileOutput* CompileCgOnce(SceShaccCgTargetProfile profile, co
             sceShaccCgDestroyCompileOutput(output);
         }
         ClearCompilingMarker();
-        if (internal && o2) {
-            // Ver g_vs_o2 (0.4.1.1): no a la lista negra, sino a O1.
-            AddO2Bad(plain_hash_city);
-            Common::VitaNote("gxm shader", fmt::format("{}: error interno a O2, se "
-                                                     "compila a O1", name)
+        if (internal && (o2 || o3)) {
+            // Ver g_vs_o2 (0.4.1.1) y g_vs_o3 (0.4.3.7): no a la lista negra, sino a O1.
+            if (o2) {
+                AddO2Bad(plain_hash_city);
+            } else {
+                AddO3Bad(plain_hash_city);
+            }
+            Common::VitaNote("gxm shader", fmt::format("{}: error interno a O{}, se "
+                                                     "compila a O1",
+                                                     name, o2 ? 2 : 3)
                                              .c_str());
             RecoverFromInternalError(false);
             retry_at_o1 = true;
@@ -2972,20 +3080,27 @@ CgActivity GetCgActivity() {
 namespace {
 /// Una compilacion del banco: sin cache, sin marcas, sin lista negra.
 std::string BenchCompile(bool vertex, const std::string& source, int opt, int fastmath,
-                         int fastprecision, int fastint, int nostdlib) {
+                         int fastprecision, int fastint, int nostdlib, int slot = -1) {
     if (!EnsureCgReady()) {
         return "sin compilador";
     }
-    const std::lock_guard lock{g_cg_mutex};
+    // En paralelo (slot 0 o 1) sin el cerrojo: es justo lo que se quiere medir.
+    std::unique_lock<std::recursive_mutex> lock{g_cg_mutex, std::defer_lock};
+    if (slot < 0) {
+        lock.lock();
+    }
     g_alloc_calls = 0;
     g_alloc_total = 0;
     g_alloc_reused = 0;
-    g_source.fileName = "banco.cg";
-    g_source.text = source.c_str();
-    g_source.size = static_cast<SceUInt32>(source.size());
+    static constexpr const char* kSlotNames[2] = {"banco_a.cg", "banco_b.cg"};
+    SceShaccCgSourceFile& file = slot >= 0 ? g_bench_files[slot] : g_source;
+    const char* const file_name = slot >= 0 ? kSlotNames[slot] : "banco.cg";
+    file.fileName = file_name;
+    file.text = source.c_str();
+    file.size = static_cast<SceUInt32>(source.size());
     SceShaccCgCompileOptions options{};
     sceShaccCgInitializeCompileOptions(&options);
-    options.mainSourceFile = "banco.cg";
+    options.mainSourceFile = file_name;
     options.targetProfile = vertex ? SCE_SHACCCG_PROFILE_VP : SCE_SHACCCG_PROFILE_FP;
     options.entryFunctionName = "main";
     if (opt >= 0) {
@@ -3100,15 +3215,80 @@ void RunCgBenchIfAny() {
         std::sscanf(spec.c_str(), "%255s %7s O=%d fastmath=%d fastprecision=%d fastint=%d "
                                   "nostdlib=%d",
                     file, profile, &opt, &fastmath, &fastprecision, &fastint, &nostdlib);
-        std::string source;
-        if (std::FILE* in = std::fopen((std::string(kDir) + file).c_str(), "rb")) {
-            char chunk[4096];
-            std::size_t got = 0;
-            while ((got = std::fread(chunk, 1, sizeof(chunk), in)) > 0) {
-                source.append(chunk, got);
+        const auto read_source = [&](const char* name) {
+            std::string text;
+            if (std::FILE* in = std::fopen((std::string(kDir) + name).c_str(), "rb")) {
+                char chunk[4096];
+                std::size_t got = 0;
+                while ((got = std::fread(chunk, 1, sizeof(chunk), in)) > 0) {
+                    text.append(chunk, got);
+                }
+                std::fclose(in);
             }
-            std::fclose(in);
+            return text;
+        };
+        /**
+         * DOS A LA VEZ (0.4.3.1): "par a.cg b.cg vp|fp O=n". Cada una en su hilo
+         * (1 MB de pila, como el de compilacion), sin el cerrojo del compilador:
+         * para saber si libshacccg aguanta dos compilaciones en paralelo y si
+         * de verdad van a la vez (reloj total frente a la suma).
+         */
+        if (std::strcmp(file, "par") == 0) {
+            char first[128] = {};
+            char second[128] = {};
+            char par_profile[8] = {};
+            int par_opt = -1;
+            std::sscanf(spec.c_str(), "par %127s %127s %7s O=%d", first, second, par_profile,
+                        &par_opt);
+            struct Work {
+                std::string source;
+                bool vertex;
+                int opt;
+                int slot;
+                std::string result;
+            };
+            Work work[2] = {{read_source(first), std::strcmp(par_profile, "fp") != 0, par_opt, 0, {}},
+                            {read_source(second), std::strcmp(par_profile, "fp") != 0, par_opt, 1, {}}};
+            EnsureCgReady();
+            g_bench_parallel.store(true, std::memory_order_relaxed);
+            const unsigned long long par_begin = Common::VitaMicros();
+            pthread_t threads[2]{};
+            bool started[2] = {false, false};
+            for (int i = 0; i < 2; i++) {
+                pthread_attr_t attr;
+                pthread_attr_init(&attr);
+                pthread_attr_setstacksize(&attr, 1024 * 1024);
+                started[i] = pthread_create(&threads[i], &attr, [](void* arg) -> void* {
+                    auto* w = static_cast<Work*>(arg);
+                    // Cada uno en un nucleo distinto (1 y 2).
+                    sceKernelChangeThreadCpuAffinityMask(
+                        sceKernelGetThreadId(),
+                        w->slot == 0 ? SCE_KERNEL_CPU_MASK_USER_1 : SCE_KERNEL_CPU_MASK_USER_2);
+                    w->result = w->source.empty()
+                                    ? std::string("no se pudo leer")
+                                    : BenchCompile(w->vertex, w->source, w->opt, 0, 0, 0, 0, w->slot);
+                    return nullptr;
+                }, &work[i]) == 0;
+                pthread_attr_destroy(&attr);
+            }
+            for (int i = 0; i < 2; i++) {
+                if (started[i]) {
+                    pthread_join(threads[i], nullptr);
+                }
+            }
+            g_bench_parallel.store(false, std::memory_order_relaxed);
+            const std::string result =
+                fmt::format("los dos en {} ms | A: {} | B: {}",
+                            (Common::VitaMicros() - par_begin) / 1000, work[0].result,
+                            work[1].result);
+            Common::VitaNote("banco cg", fmt::format("{} -> {}", spec, result).c_str());
+            if (out != nullptr) {
+                std::fprintf(out, "%s -> %s\n", spec.c_str(), result.c_str());
+                std::fflush(out);
+            }
+            continue;
         }
+        const std::string source = read_source(file);
         const std::string result =
             source.empty() ? std::string("no se pudo leer")
                            : BenchCompile(std::strcmp(profile, "fp") != 0, source, opt,

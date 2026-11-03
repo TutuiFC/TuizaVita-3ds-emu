@@ -225,8 +225,8 @@ void ConfigureSettings() {
     // a rasterizarse.
     Settings::values.disable_right_eye_render = true;
 
-    // Sin limite de velocidad: el emulador no va a llegar al 100% de todas
-    // formas, y limitarlo solo anadiria esperas.
+    // El limite de velocidad lo pone ApplyUserSettings segun sin_limite= (0.4.4.0):
+    // aqui, apagado hasta que se lean los ajustes.
     Settings::values.frame_limit = 0;
 
     Settings::values.audio_emulation = Settings::AudioEmulation::HLE;
@@ -489,6 +489,8 @@ struct UserSettings {
     bool vertex_epochs = true;
     /// 0.4.1.1: shaders de vertices a O2 (Gxm::g_vs_o2). Solo ajustes.txt.
     bool vs_o2 = false;
+    /// 0.4.3.7: shaders de vertices nuevos a O3 (Gxm::g_vs_o3). Solo ajustes.txt.
+    bool vs_o3 = true;
     /// 0.4.1.9: fragmentos con fastprecision y combinador en half. Solo ajustes.txt.
     bool fs_fast = false;
     bool fs_half = false;
@@ -609,6 +611,17 @@ void ApplyUserSettings() {
                                               std::memory_order_relaxed);
     VideoCore::GPU::async_enabled.store(g_user.gpu_thread, std::memory_order_relaxed);
     VitaFrontend::g_unlimited_speed.store(g_user.unlimited_speed, std::memory_order_relaxed);
+    /**
+     * LIMITE DE VELOCIDAD AL 100 % (0.4.4.0), salvo con sin_limite. Estaba a 0
+     * desde el principio del port ("no va a llegar al 100 % de todas formas") y
+     * lo unico que frenaba era esperar al refresco al presentar. Pero un
+     * fotograma igual al anterior no se presenta (omitir_repetidas), asi que en
+     * un video nada frenaba: Kirby TD iba al 110-120 % en su introduccion, y al
+     * 136-146 % cuando las esperas de pthread dejaron de gastar CPU en balde
+     * (0.4.3.8), que es lo que le frenaba sin querer. El limitador de Citra no
+     * espera nunca si la emulacion va por detras: solo recorta lo que se adelanta.
+     */
+    Settings::values.frame_limit = g_user.unlimited_speed ? 0.0 : 100.0;
     Gxm::RasterizerGXM::resolution_scale.store(static_cast<u32>(g_user.gpu_scale),
                                                std::memory_order_relaxed);
     Gxm::RasterizerGXM::async_vs.store(g_user.async_shaders ? 1u : 0u, std::memory_order_relaxed);
@@ -639,6 +652,7 @@ void ApplyUserSettings() {
                                                 std::memory_order_relaxed);
     Common::WriteEpochs::enabled.store(g_user.vertex_epochs, std::memory_order_relaxed);
     Gxm::g_vs_o2.store(g_user.vs_o2, std::memory_order_relaxed);
+    Gxm::g_vs_o3.store(g_user.vs_o3, std::memory_order_relaxed);
     Gxm::g_fs_fast.store(g_user.fs_fast, std::memory_order_relaxed);
     Pica::Shader::Generator::GXM::g_fs_half_tev.store(g_user.fs_half,
                                                       std::memory_order_relaxed);
@@ -740,6 +754,7 @@ void LoadUserSettings() {
     read_bool("uniformes_justos=", g_user.exact_vs_uniforms);
     read_bool("vertices_por_vaciados=", g_user.vertex_epochs);
     read_bool("vs_o2=", g_user.vs_o2);
+    read_bool("vs_o3=", g_user.vs_o3);
     read_bool("fs_rapidos=", g_user.fs_fast);
     read_bool("fs_media=", g_user.fs_half);
     read_bool("jit_nativo=", g_user.jit_nativo);
@@ -766,7 +781,7 @@ int FormatUserSettings(char* buffer, std::size_t size) {
         "dsp_hilo=%d\njit_perfil=%d\nvolcado_cada2=%d\ncopia_textura_gpu=%d\n"
         "jit_tabla_enlaces=%d\njit_saltos_cro=%d\njit_reusar_base=%d\nidioma_menu=%d\n"
         "wbuffer_gpu=%d\nmemo_valor=%d\nestado_sombra=%d\nvs_tope_kb=%d\nvs_cache_disp=%d\ncache_pipeline=%d\njit_nativo=%d\n"
-        "nativo_dos_nucleos=%d\nuniformes_directos=%d\ncache_subidas=%d\ny2r_hilo=%d\nvalla_exacta=%d\nuniformes_justos=%d\nvertices_por_vaciados=%d\nvs_o2=%d\n",
+        "nativo_dos_nucleos=%d\nuniformes_directos=%d\ncache_subidas=%d\ny2r_hilo=%d\nvalla_exacta=%d\nuniformes_justos=%d\nvertices_por_vaciados=%d\nvs_o2=%d\nvs_o3=%d\n",
         g_user.volume_percent, g_user.language, g_user.half_resolution ? 1 : 0,
         g_user.jit_reg_cache ? 1 : 0, g_user.jit_vfp_data ? 1 : 0, g_user.gxm_no_finish ? 1 : 0,
         g_user.gxm_present_direct ? 1 : 0, g_user.jit_direct_link ? 1 : 0,
@@ -785,7 +800,7 @@ int FormatUserSettings(char* buffer, std::size_t size) {
         g_user.native_both_cores ? 1 : 0, g_user.direct_uniforms ? 1 : 0,
         g_user.vertex_upload_cache ? 1 : 0, g_user.y2r_async ? 1 : 0,
         g_user.present_marks ? 1 : 0, g_user.exact_vs_uniforms ? 1 : 0,
-        g_user.vertex_epochs ? 1 : 0, g_user.vs_o2 ? 1 : 0);
+        g_user.vertex_epochs ? 1 : 0, g_user.vs_o2 ? 1 : 0, g_user.vs_o3 ? 1 : 0);
 }
 
 /// Los ajustes con los que se juega, a crash.txt en una linea (0.1.8.7): sin
@@ -1242,6 +1257,37 @@ int pthread_cancel(pthread_t thread) {
     return ENOSYS;
 }
 #endif
+
+/**
+ * ESPERAS QUE DUERMEN DE VERDAD (0.4.3.8).
+ *
+ * En pthread-embedded del VitaSDK, toda espera que sea "punto de cancelacion"
+ * (pthread_cond_wait y pthread_cond_timedwait, o sea std::condition_variable;
+ * tambien sem_wait y pthread_join) acaba en pte_osSemaphoreCancellablePend, y
+ * esa NO duerme: hace un bucle de sceKernelPollEventFlag (mirar si han cancelado
+ * el hilo) + sceKernelWaitSema con 500 us de tope, una y otra vez, hasta que le
+ * den el semaforo. Desensamblado de libpthread.a (vita_osal.o) el 03-11.
+ * Resultado: cada hilo PARADO esperando trabajo se despierta 2.000 veces por
+ * segundo. En crash.txt se veia como un 3-4 % de CPU fijo en hilos que no hacen
+ * nada (los dos SwRenderer_workers, FS_lectura) en todos los juegos, y
+ * 6.000-9.000 cambios de hilo por segundo en cada nucleo.
+ *
+ * Azahar nunca cancela hilos (pthread_cancel, arriba, no hace nada), asi que
+ * esa comprobacion no puede dar nunca "cancelado": aqui se cambia por la espera
+ * sin cancelacion de la misma libreria, pte_osSemaphorePend, que es UN
+ * sceKernelWaitSema con el mismo tope (el que se pida, o ninguno) y los mismos
+ * codigos de vuelta (0 bien, 3 tope, 2 error). Con
+ * ux0:/data/azahar/esperas_con_sondeo.txt se vuelve a la de siempre.
+ */
+int pte_osSemaphorePend(int handle, unsigned int* timeout_ms);
+int __real_pte_osSemaphoreCancellablePend(int handle, unsigned int* timeout_ms);
+bool g_waits_poll = false;
+int __wrap_pte_osSemaphoreCancellablePend(int handle, unsigned int* timeout_ms) {
+    if (g_waits_poll) {
+        return __real_pte_osSemaphoreCancellablePend(handle, timeout_ms);
+    }
+    return pte_osSemaphorePend(handle, timeout_ms);
+}
 
 /**
  * Guardas propias para los "static" locales de funcion.
@@ -2600,6 +2646,14 @@ int main(int argc, char** argv) {
                              ExtendedMemoryGranted() ? "SI" : "no");
         *result.out = 0;
         WriteCrashLog("memoria", buffer);
+    }
+    {
+        // Ver __wrap_pte_osSemaphoreCancellablePend (0.4.3.8).
+        SceIoStat flag{};
+        g_waits_poll = sceIoGetstat("ux0:/data/azahar/esperas_con_sondeo.txt", &flag) >= 0;
+        WriteCrashLog("hilos", g_waits_poll ? "esperas de pthread: las del VitaSDK (sondeo cada "
+                                              "500 us, esperas_con_sondeo.txt)"
+                                            : "esperas de pthread: duermen de verdad");
     }
 
     // El hilo principal es el que emula la CPU del 3DS, y esa es la parte de

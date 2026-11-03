@@ -42,6 +42,27 @@ extern std::atomic<bool> g_allow_vs_escapes;
 constexpr u32 kCgFloatAddress = 1;
 constexpr u32 kCgFlat = 2;
 constexpr u32 kCgRelCache = 4;
+/**
+ * kCgInlineOnce (0.4.3.1): en linea solo las subrutinas que se llaman UNA vez
+ * (casi todas: 45 de 48 en un shader de 19 KB de Kirby Triple Deluxe). No
+ * crece como kCgFlat y el compilador de la consola tarda un 10-17 % menos con
+ * el mismo binario (banco del 01-11: 8,7 -> 7,8 s uno de 19 KB, 3,1 -> 2,6 s
+ * uno de 17 KB, instrucciones identicas).
+ */
+constexpr u32 kCgInlineOnce = 8;
+/**
+ * kCgUnifiedInputs (0.4.3.2): el texto del shader no depende de COMO llegan las
+ * entradas. Toda entrada que lee el programa es un atributo vs_in<registro>, y
+ * el registro es vs_in<r> * vs_in_keep<r> + vs_in_fill<r> (uniforms, 0 o 1 por
+ * componente el primero): las de un flujo con menos componentes, las del
+ * atributo por defecto y las que no carga nadie salen de vs_in_fill. Asi el
+ * MISMO programa de la PICA con otra disposicion de atributos es el mismo
+ * shader y se compila una vez: en tres juegos (Kirby TD, Luigi's Mansion,
+ * Zafiro Alfa) 314 fuentes de vertices eran 174 distintas. Las entradas que no
+ * vienen de un flujo se atan a un byte del primer flujo (ver
+ * AccelerateDrawBatch): U8, nunca NaN, y multiplicado por cero.
+ */
+constexpr u32 kCgUnifiedInputs = 16;
 extern std::atomic<u32> g_cg_variant;
 
 /// La compilacion de este traductor (fecha y hora de su .cpp): el indice de

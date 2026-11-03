@@ -4,6 +4,7 @@
 
 #pragma once
 
+#include <atomic>
 #include "common/common_types.h"
 
 struct SceGxmTexture;
@@ -91,5 +92,17 @@ void NoteVertexProgram(const void* program, u64 source_hash, u32 bytes);
 
 /// Justo ANTES de sceGxmDraw: si el que cuelga la GPU es ese, tiene que estar.
 void Record(const DrawInfo& info);
+
+/**
+ * Cuanto del ultimo segundo ha estado trabajando el chip de la GPU (0.4.3.5), en
+ * decimas de por ciento (0-1000), para el overlay. Lo pone el cronometro del
+ * chip; vale -1 si el cronometro esta apagado (sin_cronometro_gpu.txt) o aun no
+ * ha cerrado su primer segundo.
+ */
+int ChipBusyTenths();
+
+/// Lo que ChipBusyTenths() lee. Aparte de la funcion para que el cronometro lo
+/// ponga sin pasar por ningun cerrojo.
+extern std::atomic<int> g_chip_busy_tenths;
 
 } // namespace Gxm::BlackBox

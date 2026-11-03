@@ -87,6 +87,8 @@ target_link_options(azahar PRIVATE
     -Wl,--wrap=pthread_mutex_lock
     -Wl,--wrap=pthread_join
     -Wl,--wrap=pthread_detach
+    # 0.4.3.8: las esperas de pthread duermen de verdad (ver main.cpp).
+    -Wl,--wrap=pte_osSemaphoreCancellablePend
     # std::__throw_system_error(int): por aqui pasan TODAS las excepciones de
     # este tipo, vengan de std::thread, std::mutex o std::call_once.
     -Wl,--wrap=_ZSt20__throw_system_errori

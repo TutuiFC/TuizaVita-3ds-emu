@@ -675,7 +675,7 @@ public:
     void AddLine(fmt::format_string<Args...> text, Args&&... args) {
         const std::string line = fmt::format(text, std::forward<Args>(args)...);
         if (!line.empty()) {
-            source.append(static_cast<std::size_t>(scope.depth) * 4, ' ');
+            source.append(static_cast<std::size_t>(scope.depth) * indent_width, ' ');
         }
         source += line;
         source += '\n';
@@ -692,6 +692,17 @@ public:
     Scope scope;
 
 private:
+    /**
+     * UN ESPACIO POR NIVEL CON kCgInlineOnce (0.4.3.3). Las subrutinas en linea
+     * anidan bloques, y a cuatro espacios por nivel la sangria era casi la
+     * mitad del texto: un shader de piel de Zafiro Alfa de 20,7 KB de codigo
+     * salia de 36,5 KB, se pasaba del tope (vs_tope_kb, que mide el texto) y
+     * se compilaba la variante sin subrutinas en linea, mas lenta. Las de
+     * siempre siguen con cuatro: su texto es la clave de lo que ya esta en la
+     * cache de la tarjeta.
+     */
+    const std::size_t indent_width =
+        (g_cg_variant.load(std::memory_order_relaxed) & kCgInlineOnce) != 0 ? 1 : 4;
     std::string source;
 };
 
@@ -720,11 +731,17 @@ private:
  */
 class CgGenerator {
 public:
+    /// Para kCgInlineOnce (0.4.3.1): una subrutina por su tramo.
+    using SubroutineId = std::pair<u32, u32>;
+
     CgGenerator(const std::set<Subroutine>& subroutines_, const ProgramCode& program_code_,
                 const SwizzleData& swizzle_data_, u32 main_offset_, const RegGetter& input_getter_,
-                const RegGetter& output_getter_)
+                const RegGetter& output_getter_,
+                std::map<SubroutineId, u32>* call_counts_ = nullptr,
+                const std::set<SubroutineId>* inline_once_ = nullptr)
         : subroutines{subroutines_}, program_code{program_code_}, swizzle_data{swizzle_data_},
-          main_offset{main_offset_}, input_getter{input_getter_}, output_getter{output_getter_} {
+          main_offset{main_offset_}, input_getter{input_getter_}, output_getter{output_getter_},
+          call_counts{call_counts_}, inline_once{inline_once_} {
         Generate();
     }
 
@@ -934,8 +951,17 @@ private:
         ForgetRelReads();
     }
 
+    /// Esta va en linea por kCgInlineOnce (se llama una sola vez).
+    [[nodiscard]] bool InlinedOnce(const Subroutine& subroutine) const {
+        return inline_once != nullptr &&
+               inline_once->count(SubroutineId{subroutine.begin, subroutine.end}) != 0;
+    }
+
     void CallSubroutineBody(const Subroutine& subroutine) {
-        if (Flat()) {
+        if (call_counts != nullptr) {
+            (*call_counts)[SubroutineId{subroutine.begin, subroutine.end}]++;
+        }
+        if (Flat() || InlinedOnce(subroutine)) {
             /**
              * Subrutina EN LINEA (0.1.7.3). Todo esta dentro de exec_shader, asi
              * que un END del cuerpo ("return true;") sale del programa entero,
@@ -1542,7 +1568,9 @@ private:
         // En linea (kCgFlat) no hay funciones que declarar.
         if (!Flat()) {
             for (const auto& subroutine : subroutines) {
-                shader.AddLine("bool {}();", subroutine.GetName());
+                if (!InlinedOnce(subroutine)) {
+                    shader.AddLine("bool {}();", subroutine.GetName());
+                }
             }
         }
         shader.AddNewLine();
@@ -1567,6 +1595,9 @@ private:
         }
 
         for (const auto& subroutine : subroutines) {
+            if (InlinedOnce(subroutine)) {
+                continue; // ya esta en su unica llamada
+            }
             shader.AddLine("bool {}() {{", subroutine.GetName());
             ++shader.scope;
             // Sin etiquetas: los saltos se rechazan en el analisis, asi que
@@ -1600,6 +1631,9 @@ private:
     u32 range_end = PROGRAM_END;
     /// Profundidad de subrutinas en linea (kCgFlat).
     u32 inline_depth = 0;
+    /// Ver kCgInlineOnce: la pasada que cuenta llamadas y la que las mete en linea.
+    std::map<SubroutineId, u32>* call_counts = nullptr;
+    const std::set<SubroutineId>* inline_once = nullptr;
 };
 
 } // Anonymous namespace
@@ -1688,8 +1722,37 @@ std::optional<std::string> GenerateVertexShader(const Pica::ShaderSetup& setup,
         return "";
     };
 
-    CgGenerator generator{subroutines,       setup.GetProgramCode(), setup.GetSwizzleData(),
-                          config.state.main_offset, input_getter,    output_getter};
+    /**
+     * kCgInlineOnce (0.4.3.1): una primera pasada, igual que la normal, solo para
+     * contar desde cuantos sitios se llama cada subrutina; en la de verdad, las
+     * de un solo sitio van en linea. Las llamadas de dentro de una subrutina en
+     * linea se escriben igual que en su definicion, asi que las cuentas valen.
+     */
+    const u32 variant_bits = g_cg_variant.load(std::memory_order_relaxed);
+    std::set<CgGenerator::SubroutineId> called_once;
+    const bool inline_once = (variant_bits & kCgInlineOnce) != 0 && (variant_bits & kCgFlat) == 0;
+    if (inline_once) {
+        std::map<CgGenerator::SubroutineId, u32> counts;
+        CgGenerator counting{subroutines,       setup.GetProgramCode(), setup.GetSwizzleData(),
+                             config.state.main_offset, input_getter,    output_getter,
+                             &counts};
+        if (counting.Failed()) {
+            return reject(counting.Reason());
+        }
+        for (const auto& [id, count] : counts) {
+            if (count == 1) {
+                called_once.insert(id);
+            }
+        }
+    }
+    CgGenerator generator{subroutines,
+                          setup.GetProgramCode(),
+                          setup.GetSwizzleData(),
+                          config.state.main_offset,
+                          input_getter,
+                          output_getter,
+                          nullptr,
+                          inline_once ? &called_once : nullptr};
     if (generator.Failed()) {
         return reject(generator.Reason());
     }
@@ -1714,6 +1777,22 @@ std::optional<std::string> GenerateVertexShader(const Pica::ShaderSetup& setup,
     out += "uniform float vs_b[16];\n";
     // Atributos por defecto, indexados por REGISTRO de entrada (ver VSInputs).
     out += "uniform float4 vs_default[16];\n\n";
+    const bool unified_inputs = (variant_bits & kCgUnifiedInputs) != 0;
+    if (unified_inputs) {
+        /**
+         * Ver kCgUnifiedInputs. Sueltos y solo los de las entradas usadas
+         * (0.4.3.3): con dos arrays de 16 el compilador perdia sitio para el
+         * programa secundario y el shader de una entrada salia con 40
+         * temporales en vez de 12 (banco del 01-11).
+         */
+        for (u32 i = 0; i < 16; i++) {
+            if (used_inputs[i]) {
+                out += fmt::format("uniform float4 vs_in_keep{0};\nuniform float4 vs_in_fill{0};\n",
+                                   i);
+            }
+        }
+        out += "\n";
+    }
     const bool w_buffer = g_cg_wbuffer.load(std::memory_order_relaxed);
     if (w_buffer) {
         // Escala y desplazamiento de profundidad de la PICA (ver g_cg_wbuffer).
@@ -1777,7 +1856,7 @@ std::optional<std::string> GenerateVertexShader(const Pica::ShaderSetup& setup,
      */
     out += "void main(";
     for (u32 i = 0; i < 16; i++) {
-        if (used_inputs[i] && inputs[i].kind == VSInputSource::Array) {
+        if (used_inputs[i] && (unified_inputs || inputs[i].kind == VSInputSource::Array)) {
             out += fmt::format("float4 vs_in{},\n          ", i);
         }
     }
@@ -1815,6 +1894,18 @@ std::optional<std::string> GenerateVertexShader(const Pica::ShaderSetup& setup,
      */
     for (u32 i = 0; i < 16; i++) {
         if (!used_inputs[i]) {
+            continue;
+        }
+        if (unified_inputs) {
+            /**
+             * Ver kCgUnifiedInputs: entrada * mantener + relleno, con mantener a
+             * 0 o 1 por componente. Una multiplicacion y no una seleccion
+             * (0.4.3.3): con ?: el compilador tardaba un 20-45 % mas que con la
+             * fuente normal y con esto un 0-8 %. Lo que se descarta nunca es
+             * NaN: el atributo de relleno es U8 y las componentes que GXM pone
+             * en las que faltan son 0 o 1.
+             */
+            out += fmt::format("    vs_in_reg{0} = vs_in{0} * vs_in_keep{0} + vs_in_fill{0};\n", i);
             continue;
         }
         switch (inputs[i].kind) {

@@ -485,6 +485,9 @@ std::atomic<u32> g_pipeline_hits{0};
 std::atomic<u32> g_layout_hits{0};
 /// Programas de vertices leidos de la cache por el indice, sin traducir (0.3.2.8).
 std::atomic<u32> g_vs_index_hits{0};
+/// Ver ENTRADAS UNIFICADAS (0.4.3.2): programas que no compilaron nada.
+std::atomic<u32> g_vs_unified_reused{0};
+std::atomic<u32> g_vs_unified_shared{0};
 std::atomic<unsigned long long> g_vs_build_us{0};
 std::atomic<unsigned long long> g_vs_generate_us{0};
 std::atomic<unsigned long long> g_vs_build_max_us{0};
@@ -3446,6 +3449,17 @@ struct RasterizerGXM::HwShaderCache {
         /// Compilandose en el hilo de compilacion (0.1.9.6): hasta que acabe,
         /// el lote va por la CPU.
         std::shared_ptr<CgJob> job;
+        /// Ver kCgUnifiedInputs (0.4.3.2): sus entradas se eligen con estos, uno
+        /// por registro de entrada usado.
+        bool unified = false;
+        std::array<const SceGxmProgramParameter*, 16> uniform_keep{};
+        std::array<const SceGxmProgramParameter*, 16> uniform_fill{};
+        std::array<UniformSlot, 16> uniform_keep_slot{}, uniform_fill_slot{};
+        /// El trabajo es de otro programa con la misma fuente unificada: al acabar
+        /// se vuelve a construir (y se lee la copia de la cache).
+        bool job_shared = false;
+        /// La fuente unificada que compila el trabajo de este (0 si no).
+        u64 unified_hash = 0;
     };
 
     static constexpr unsigned long long kAsyncVsWindowUs = 1000000;
@@ -3517,8 +3531,31 @@ struct RasterizerGXM::HwShaderCache {
                     }
                     return nullptr;
                 }
+                if (found.job_shared) {
+                    // Ver ENTRADAS UNIFICADAS: la salida es del que lo compilo; este
+                    // se vuelve a construir y la lee de la cache.
+                    found.job.reset();
+                    found.job_shared = false;
+                    Build(found, key, setup, config, inputs, write_lighting, write_w);
+                    if (found.job != nullptr) {
+                        *out_reason = "vs compilando";
+                        return nullptr;
+                    }
+                    if (!found.usable) {
+                        *out_reason = found.reason;
+                        return nullptr;
+                    }
+                    return &found;
+                }
                 const SceShaccCgCompileOutput* output = found.job->output;
                 const u32 variant = found.job->used_variant;
+                if (found.unified_hash != 0) {
+                    if (output == nullptr || (variant & Pica::Shader::Generator::GXM::kCgUnifiedInputs) == 0) {
+                        unified_failed.insert(found.unified_hash);
+                    }
+                    unified_jobs.erase(found.unified_hash);
+                    found.unified_hash = 0;
+                }
                 std::string used_source;
                 for (std::size_t i = 0; output != nullptr && i < found.job->variants.size(); i++) {
                     if (found.job->variants[i] == variant) {
@@ -3803,7 +3840,122 @@ private:
                 }
             }
         }
+        /**
+         * Y LA DE LAS SUBRUTINAS DE UNA LLAMADA EN LINEA (0.4.3.1, ver
+         * kCgInlineOnce): la primera que se compila, porque al compilador le
+         * cuesta un 10-17 % menos y da el mismo binario. Se busca DESPUES de
+         * las de siempre, asi que lo que ya hay en la cache de la tarjeta sigue
+         * valiendo y nadie tiene que volver a compilar sus juegos.
+         */
+        static constexpr const char* kOnceName = "azahar_gxm_vsi.cg";
+        constexpr u32 kOnceVariant = kCgFloatAddress | kCgRelCache | kCgInlineOnce;
+        std::optional<std::string> once;
+        // Siempre que se vaya a compilar algo: tambien cuando la de siempre no
+        // cabe y se compila la de lecturas compartidas (los de piel de Zafiro).
+        {
+            once = generate(kOnceVariant);
+            const std::string& plain = shared.has_value() ? *shared : *first;
+            if (once.has_value() && (*once == plain || once->size() > kMaxCompileSource)) {
+                once.reset();
+            }
+        }
+        if (once.has_value()) {
+            for (const bool from_card : {false, true}) {
+                if (const SceShaccCgCompileOutput* cached =
+                        LoadCgCache(SCE_SHACCCG_PROFILE_VP, kOnceName, once->c_str(), from_card)) {
+                    Finish(program, cached, kOnceVariant);
+                    if (program.usable) {
+                        AddVsIndex(IndexKey(key), *once, kOnceVariant);
+                    }
+                    return;
+                }
+            }
+        }
+        /**
+         * ENTRADAS UNIFICADAS (0.4.3.2, ver kCgUnifiedInputs). Despues de las de
+         * siempre (lo que ya esta en la cache de la tarjeta sigue valiendo): la
+         * unificada se busca en la cache, y si otra disposicion del mismo programa
+         * ya la esta compilando, este espera a ese mismo trabajo en vez de pedir
+         * otro. Si no compila, esa fuente no se vuelve a probar en la sesion.
+         * Hace falta algun atributo de un flujo para atar a el los demas.
+         */
+        constexpr u32 kUnifiedVariant = kOnceVariant | kCgUnifiedInputs;
+        static constexpr const char* kUnifiedName = "azahar_gxm_vsu.cg";
+        static const bool unified_on = [] {
+            SceIoStat off{};
+            const bool on =
+                sceIoGetstat("ux0:/data/azahar/sin_entradas_unificadas.txt", &off) < 0;
+            Common::VitaNote("gxm vs", on ? "entradas unificadas: si"
+                                          : "entradas unificadas: no "
+                                            "(sin_entradas_unificadas.txt)");
+            return on;
+        }();
+        std::optional<std::string> unified;
+        u64 unified_hash = 0;
+        bool any_array = false;
+        for (const auto& input : inputs) {
+            any_array = any_array || input.kind == VSInputSource::Array;
+        }
+        if (unified_on && any_array) {
+            unified = generate(kUnifiedVariant);
+            if (unified.has_value() && unified->size() > kMaxCompileSource) {
+                unified.reset();
+            }
+            if (unified.has_value()) {
+                unified_hash = Common::ComputeHash64(unified->data(), unified->size());
+                if (unified_failed.count(unified_hash) != 0) {
+                    unified.reset();
+                }
+            }
+        }
+        if (unified.has_value()) {
+            for (const bool from_card : {false, true}) {
+                if (const SceShaccCgCompileOutput* cached = LoadCgCache(
+                        SCE_SHACCCG_PROFILE_VP, kUnifiedName, unified->c_str(), from_card)) {
+                    Finish(program, cached, kUnifiedVariant);
+                    if (program.usable) {
+                        AddVsIndex(IndexKey(key), *unified, kUnifiedVariant);
+                        const u32 reused =
+                            g_vs_unified_reused.fetch_add(1, std::memory_order_relaxed) + 1;
+                        if (reused <= 40) {
+                            NoteFmt("gxm vs", "unificada de la cache para otra disposicion ({})",
+                                    reused);
+                        }
+                    }
+                    return;
+                }
+            }
+            if (const auto pending = unified_jobs.find(unified_hash); pending != unified_jobs.end()) {
+                if (auto shared_job = pending->second.lock();
+                    shared_job != nullptr && !shared_job->done.load(std::memory_order_acquire)) {
+                    program.job = std::move(shared_job);
+                    program.job_shared = true;
+                    program.job->demand.fetch_add(4, std::memory_order_relaxed);
+                    const u32 shared_count =
+                        g_vs_unified_shared.fetch_add(1, std::memory_order_relaxed) + 1;
+                    if (shared_count <= 40) {
+                        NoteFmt("gxm vs", "unificada: espera a la compilacion de otra disposicion "
+                                          "({})",
+                                shared_count);
+                    }
+                    return;
+                }
+                unified_jobs.erase(pending);
+            }
+        }
         auto job = std::make_shared<CgJob>();
+        if (unified.has_value()) {
+            job->sources.push_back(std::move(*unified));
+            job->variants.push_back(kUnifiedVariant);
+            job->names.push_back(kUnifiedName);
+            unified_jobs[unified_hash] = job;
+            program.unified_hash = unified_hash;
+        }
+        if (once.has_value()) {
+            job->sources.push_back(std::move(*once));
+            job->variants.push_back(kOnceVariant);
+            job->names.push_back(kOnceName);
+        }
         if (too_big) {
             static u32 shared_notes = 0;
             if (shared_notes < 4) {
@@ -3876,6 +4028,19 @@ private:
             const std::string name = fmt::format("vs_in{}", reg);
             program.inputs[reg] = sceGxmProgramFindParameterByName(program.gxp, name.c_str());
         }
+        program.unified = (used_variant & Pica::Shader::Generator::GXM::kCgUnifiedInputs) != 0;
+        if (program.unified) {
+            for (u32 reg = 0; reg < 16; reg++) {
+                const std::string keep = fmt::format("vs_in_keep{}", reg);
+                const std::string fill = fmt::format("vs_in_fill{}", reg);
+                program.uniform_keep[reg] =
+                    sceGxmProgramFindParameterByName(program.gxp, keep.c_str());
+                program.uniform_fill[reg] =
+                    sceGxmProgramFindParameterByName(program.gxp, fill.c_str());
+                program.uniform_keep_slot[reg] = ProbeUniform(program.uniform_keep[reg], 4);
+                program.uniform_fill_slot[reg] = ProbeUniform(program.uniform_fill[reg], 4);
+            }
+        }
         program.usable = true;
         static bool noted_first = false;
         if (!noted_first) {
@@ -3887,6 +4052,10 @@ private:
     SceGxmShaderPatcher* patcher;
     std::unordered_map<u64, std::unique_ptr<Program>> programs;
     std::unordered_map<u64, SceGxmVertexProgram*> linked;
+    /// Ver ENTRADAS UNIFICADAS: lo que se esta compilando, por su fuente, y lo
+    /// que no compilo.
+    std::unordered_map<u64, std::weak_ptr<CgJob>> unified_jobs;
+    std::unordered_set<u64> unified_failed;
 
 public:
     /// Booleanos que lee cada programa (UsedBoolUniforms), por su clave
@@ -9624,6 +9793,40 @@ bool RasterizerGXM::AccelerateDrawBatch(bool is_indexed) {
                                 (static_cast<u64>(out.format) << 24) |
                                 (static_cast<u64>(out.componentCount) << 16) | out.regIndex);
         }
+        /**
+         * Ver kCgUnifiedInputs: las entradas que lee el programa y no vienen de un
+         * flujo, a un byte del primer flujo (memoria que se copia entera, con su
+         * relleno a 16). El shader no las usa: toma vs_in_fill. En U8 se leen como
+         * mucho 4 bytes, y la conversion a float (el camino convertido) ni las lee.
+         */
+        if (program->unified) {
+            if (stream_count == 0) {
+                return HwVsReject("vs unificado sin flujos");
+            }
+            for (u32 reg = 0; reg < 16; reg++) {
+                if (inputs[reg].kind == VSInputSource::Array || program->inputs[reg] == nullptr) {
+                    continue;
+                }
+                const u8 declared = static_cast<u8>(std::clamp<u32>(
+                    sceGxmProgramParameterGetComponentCount(program->inputs[reg]), 1, 4));
+                AttributeSource& alias = attribute_sources[attribute_count];
+                alias = {};
+                alias.stream = 0;
+                alias.format = static_cast<u8>(PipelineRegs::VertexAttributeFormat::UBYTE);
+                alias.offset = 0;
+                alias.components = 0;
+                alias.declared = declared;
+                SceGxmVertexAttribute& out = gxm_attributes[attribute_count++];
+                out.streamIndex = 0;
+                out.offset = 0;
+                out.format = SCE_GXM_ATTRIBUTE_FORMAT_U8;
+                out.componentCount = declared;
+                out.regIndex =
+                    static_cast<u16>(sceGxmProgramParameterGetResourceIndex(program->inputs[reg]));
+                layout_key = Common::HashCombine(
+                    layout_key, 0xA11A5000ull | (static_cast<u64>(reg) << 4) | declared);
+            }
+        }
         for (u32 stream = 0; stream < stream_count; stream++) {
             layout_key = Common::HashCombine(layout_key, gxm_streams[stream].stride);
         }
@@ -10043,6 +10246,34 @@ bool RasterizerGXM::AccelerateDrawBatch(bool is_indexed) {
             }
             PutUniform(vertex_uniforms, program->uniform_default, program->uniform_default_slot,
                        16 * 4, defaults);
+        }
+        if (program->unified) {
+            // Ver kCgUnifiedInputs: lo mismo que escribia el texto del shader.
+            for (u32 reg = 0; reg < 16; reg++) {
+                if (program->uniform_keep[reg] == nullptr ||
+                    program->uniform_fill[reg] == nullptr) {
+                    continue;
+                }
+                float k[4]{};
+                float f[4]{};
+                if (inputs[reg].kind == VSInputSource::Array) {
+                    const u32 components = inputs[reg].components;
+                    for (u32 c = 0; c < 4; c++) {
+                        k[c] = c < components ? 1.0f : 0.0f;
+                        f[c] = c < components ? 0.0f : (c == 3 ? 1.0f : 0.0f);
+                    }
+                } else if (inputs[reg].kind == VSInputSource::Default) {
+                    const auto& value = pica.input_default_attributes[input_attribute[reg]];
+                    f[0] = value.x.ToFloat32();
+                    f[1] = value.y.ToFloat32();
+                    f[2] = value.z.ToFloat32();
+                    f[3] = value.w.ToFloat32();
+                }
+                PutUniform(vertex_uniforms, program->uniform_keep[reg],
+                           program->uniform_keep_slot[reg], 4, k);
+                PutUniform(vertex_uniforms, program->uniform_fill[reg],
+                           program->uniform_fill_slot[reg], 4, f);
+            }
         }
         if (program->uniform_wbuf != nullptr) {
             const auto& depth = regs.rasterizer;

@@ -17,6 +17,15 @@ namespace Common {
  */
 std::string VitaThreadSummary();
 
+/**
+ * Cuanto ha trabajado cada uno de los tres nucleos de usuario desde la llamada
+ * anterior, en por cientos (0.4.3.5), para el overlay. Sale de idleClock del
+ * sistema: es el uso REAL del nucleo, de cualquier hilo, no solo los nuestros.
+ * Con su propio estado, aparte del de VitaThreadSummary. Devuelve false en la
+ * primera llamada (no hay con que comparar) o si la consola no contesta.
+ */
+bool VitaCoreUsage(double percent[3]);
+
 } // namespace Common
 
 #endif
