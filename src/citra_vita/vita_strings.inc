@@ -702,6 +702,80 @@ TR(kThreadDied, "A thread died from an exception:", "Un hilo murió por una exce
    "Un fil ha mort per una excepció:", "Un thread est mort sur une exception :",
    "Ein Thread starb an einer Ausnahme:", "Un thread è morto per un'eccezione:",
    "Uma thread morreu por uma exceção:")
+// --- Menu de la partida (START y SELECT seguidos, 0.4.6.1) -----------------------
+TR(kGameMenuTitle, "Game menu", "Menú de la partida", "Menú de la partida", "Menu de la partie",
+   "Spielmenü", "Menu di gioco", "Menu do jogo")
+TR(kGameMenuResume, "Back to the game", "Volver al juego", "Tornar al joc", "Retour au jeu",
+   "Zurück zum Spiel", "Torna al gioco", "Voltar ao jogo")
+TR(kGameMenuResolution, "Resolution", "Resolución", "Resolució", "Résolution", "Auflösung",
+   "Risoluzione", "Resolução")
+TR(kGameMenuFps, "FPS", "FPS", "FPS", "FPS", "FPS", "FPS", "FPS")
+TR(kGameMenuFpsLimited, "Limited", "Limitados", "Limitats", "Limités", "Begrenzt", "Limitati",
+   "Limitados")
+TR(kGameMenuMute, "Mute the game", "Silenciar el juego", "Silenciar el joc", "Couper le son",
+   "Ton aus", "Disattiva l'audio", "Silenciar o jogo")
+TR(kGameMenuMainMenu, "Back to main menu", "Volver al menú principal", "Tornar al menú principal",
+   "Retour au menu principal", "Zurück zum Hauptmenü", "Torna al menu principale",
+   "Voltar ao menu principal")
+TR(kGameMenuExit, "Exit the emulator", "Salir del emulador", "Sortir de l'emulador",
+   "Quitter l'émulateur", "Emulator beenden", "Esci dall'emulatore", "Sair do emulador")
+TR(kGameMenuHintResolution, "Steps of 0.25x. Applied on return. Above 2x it can run slow.",
+   "Pasos de 0,25x. Se aplica al volver. Por encima de 2x puede ir lento.",
+   "Passos de 0,25x. S'aplica en tornar. Per sobre de 2x pot anar lent.",
+   "Par pas de 0,25x. Appliquée au retour. Au-delà de 2x, cela peut ramer.",
+   "In 0,25x-Schritten. Gilt nach der Rückkehr. Über 2x kann es ruckeln.",
+   "A passi di 0,25x. Si applica al ritorno. Oltre 2x può andare lento.",
+   "Passos de 0,25x. Aplicada ao voltar. Acima de 2x pode ficar lento.")
+TR(kGameMenuLayout, "Screen layout", "Disposición de pantallas", "Disposició de pantalles",
+   "Disposition des écrans", "Bildschirmanordnung", "Disposizione schermi", "Disposição dos ecrãs")
+TR(kGameMenuAudio, "Stretch audio", "Alargar el audio", "Allargar l'àudio", "Étirer le son",
+   "Ton dehnen", "Allunga l'audio", "Esticar o áudio")
+TR(kGameMenuAudioStretched, "Yes (fewer glitches)", "Sí (menos fallos)", "Sí (menys errors)",
+   "Oui (moins de défauts)", "Ja (weniger Fehler)", "Sì (meno difetti)", "Sim (menos falhas)")
+TR(kGameMenuAudioDirect, "No (direct)", "No (directo)", "No (directe)", "Non (direct)",
+   "Nein (direkt)", "No (diretto)", "Não (direto)")
+TR(kGameMenuHintLayout, "How the two screens are placed. It changes right away.",
+   "Cómo se colocan las dos pantallas. Cambia al momento.",
+   "Com es col·loquen les dues pantalles. Canvia a l'instant.",
+   "Placement des deux écrans. Le changement est immédiat.",
+   "Wie die beiden Bildschirme liegen. Wirkt sofort.",
+   "Come sono disposti i due schermi. Cambia subito.",
+   "Como ficam os dois ecrãs. Muda logo.")
+TR(kGameMenuHintAudio, "Stretched: smooth sound, but lower pitch when the game runs slow.",
+   "Alargado: sonido continuo, pero más grave si el juego va lento.",
+   "Allargat: so continu, però més greu si el joc va lent.",
+   "Étiré : son continu, mais plus grave si le jeu est lent.",
+   "Gedehnt: gleichmäßiger Ton, aber tiefer, wenn das Spiel langsam läuft.",
+   "Allungato: suono continuo, ma più grave se il gioco è lento.",
+   "Esticado: som contínuo, mas mais grave se o jogo for lento.")
+TR(kGameMenuHintFps, "Unlimited: the game can run faster than normal.",
+   "Sin límite: el juego puede ir más rápido de lo normal.",
+   "Sense límit: el joc pot anar més ràpid del normal.",
+   "Illimité : le jeu peut aller plus vite que la normale.",
+   "Unbegrenzt: Das Spiel kann schneller als normal laufen.",
+   "Illimitati: il gioco può andare più veloce del normale.",
+   "Sem limite: o jogo pode ir mais rápido que o normal.")
+TR(kGameMenuHintMute, "Only the sound of the game. It stays that way in your next games.",
+   "Solo el sonido del juego. Se queda así en las próximas partidas.",
+   "Només el so del joc. Es queda així a les properes partides.",
+   "Seulement le son du jeu. Il reste ainsi pour les prochaines parties.",
+   "Nur der Spielton. Bleibt auch bei den nächsten Spielen so.",
+   "Solo l'audio del gioco. Resta così nelle prossime partite.",
+   "Só o som do jogo. Fica assim nas próximas partidas.")
+TR(kGameMenuHintExit, "Anything you have not saved in the game will be lost.",
+   "Lo que no hayas guardado en el juego se pierde.",
+   "El que no hagis desat al joc es perd.",
+   "Ce qui n'est pas sauvegardé dans le jeu sera perdu.",
+   "Nicht im Spiel Gespeichertes geht verloren.",
+   "Ciò che non hai salvato nel gioco andrà perso.",
+   "O que não guardou no jogo perde-se.")
+TR(kGameMenuFooter, "UP/DOWN: choose   LEFT/RIGHT: change   CROSS: accept   CIRCLE: back to the game",
+   "ARRIBA/ABAJO: elegir   IZQ/DER: cambiar   EQUIS: aceptar   CÍRCULO: volver al juego",
+   "AMUNT/AVALL: triar   ESQ/DRETA: canviar   CREU: acceptar   CERCLE: tornar al joc",
+   "HAUT/BAS : choisir   GAUCHE/DROITE : modifier   CROIX : accepter   ROND : retour au jeu",
+   "OBEN/UNTEN: wählen   LINKS/RECHTS: ändern   KREUZ: bestätigen   KREIS: zurück zum Spiel",
+   "SU/GIÙ: scegli   SIN/DES: cambia   CROCE: accetta   CERCHIO: torna al gioco",
+   "CIMA/BAIXO: escolher   ESQ/DIR: mudar   CRUZ: aceitar   CÍRCULO: voltar ao jogo")
 TR(kExitCombo, "START + SELECT: back to menu", "START + SELECT: volver al menú",
    "START + SELECT: tornar al menú", "START + SELECT : retour au menu",
    "START + SELECT: zurück zum Menü", "START + SELECT: torna al menu",

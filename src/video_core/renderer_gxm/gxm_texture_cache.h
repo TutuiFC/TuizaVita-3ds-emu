@@ -183,6 +183,8 @@ public:
     void ReleaseUpTo(u32 completed_fence);
 
 private:
+    static constexpr u32 kChangedStreak = 3;
+
     struct Entry {
         bool valid = false;
         u64 key = 0;
@@ -210,6 +212,9 @@ private:
         u32 dirty_end = 0;
         u32 stride = 0;
         std::vector<u64> band_hashes;
+        /// Revalidaciones seguidas que la han encontrado cambiada. Ver LAS QUE SIEMPRE CAMBIAN.
+        u8 changed_streak = 0;
+        u8 changed_skips = 0;
         /// El patron de relleno que tienen sus bytes, si se sabe (0 si no), y
         /// el del relleno que la marco, hasta revalidarla (ver InvalidateFill).
         u64 fill_tag = 0;

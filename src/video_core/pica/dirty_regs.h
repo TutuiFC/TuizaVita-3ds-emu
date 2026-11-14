@@ -13,7 +13,13 @@ namespace Pica {
 
 union DirtyRegs {
     void Set(u32 reg_id) {
+        // De 32 bits (0.4.6.2): el de 64 en un Cortex-A9 son dos cargas, dos
+        // escrituras y un desplazamiento con ramas, en cada registro que cambia.
+#if defined(__PSVITA__) && defined(__ARMEL__)
+        dwords[reg_id >> 5] |= 1U << (reg_id & 0x1f);
+#else
         qwords[reg_id >> 6] |= 1ULL << (reg_id & 0x3f);
+#endif
     }
 
     void SetRange(u32 start_reg_id, u32 count) {
@@ -136,6 +142,7 @@ union DirtyRegs {
         u128 shader;
     };
     std::array<u64, 12> qwords;
+    std::array<u32, 24> dwords;
 };
 static_assert(sizeof(DirtyRegs) == 12 * sizeof(u64));
 

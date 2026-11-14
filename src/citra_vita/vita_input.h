@@ -15,6 +15,13 @@ void Shutdown();
 /// Rellena Settings con el mapeo de botones Vita -> 3DS.
 void ApplyDefaultMapping();
 
+/// START y SELECT seguidos piden el menu de la partida (0.4.6.1): true una sola
+/// vez por peticion. Lo mira EmuWindow_Vita::PollEvents.
+bool TakeGameMenuRequest();
+/// El juego no ve estos botones hasta que se suelten: lo pulsado en el menu de la
+/// partida no tiene que llegarle al cerrarlo.
+void SwallowButtons(unsigned int buttons);
+
 /// Botones de la Vita que el piloto automatico tiene pulsados (0.3.8.2, ver
 /// RunPilotIfAny en main.cpp). Se suman a los del mando en cada lectura.
 void SetPilotButtons(unsigned int buttons);

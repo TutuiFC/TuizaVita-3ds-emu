@@ -47,6 +47,8 @@ public:
     /// La mezcla de cada tick en otro nucleo (0.3.1.5, ver Impl::TickAsync).
     /// Lo pone el frontend desde ajustes.txt ("dsp_hilo").
     static std::atomic<bool> async_mix;
+    /// El AAC de la tuberia binaria en otro hilo (0.4.4.7, ajuste aac_hilo).
+    static std::atomic<bool> async_aac;
 
 private:
     struct Impl;

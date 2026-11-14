@@ -187,6 +187,16 @@ else()
     vita_create_self(azahar.self azahar)
 endif()
 
+# Los shaders ya compilados de cada juego (0.4.6.8), en app0:/packs/: la primera vez que se
+# abre un juego se vuelcan a la cache del usuario y no hay que compilar nada de eso. Ver
+# SeedFromShippedPack en gxm_cg.cpp. Se hacen con scratchpad/hacer_paquetes.py.
+file(GLOB AZ_PACKS CONFIGURE_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/paquetes/juego_*.pak)
+set(AZ_PACK_ARGS "")
+foreach(pack ${AZ_PACKS})
+    get_filename_component(pack_name ${pack} NAME)
+    list(APPEND AZ_PACK_ARGS FILE ${pack} packs/${pack_name})
+endforeach()
+
 vita_create_vpk(azahar.vpk ${VITA_TITLEID} azahar.self
     VERSION ${VITA_VERSION}
     NAME ${VITA_APP_NAME}
@@ -203,4 +213,10 @@ vita_create_vpk(azahar.vpk ${VITA_TITLEID} azahar.self
     # (reserva_r_*, ver LA RESERVA RAPIDA); los reserva_f*.gxp viejos ya no se usan.
     FILE ${CMAKE_CURRENT_SOURCE_DIR}/reserva/reserva_r_f.gxp reserva_r_f.gxp
     FILE ${CMAKE_CURRENT_SOURCE_DIR}/reserva/reserva_r_fl.gxp reserva_r_fl.gxp
+    # El shader de vertices generico (0.4.7.0): ver EL SHADER DE VERTICES GENERICO.
+    FILE ${CMAKE_CURRENT_SOURCE_DIR}/reserva/vs_generico_0.gxp vs_generico_0.gxp
+    FILE ${CMAKE_CURRENT_SOURCE_DIR}/reserva/vs_generico_1.gxp vs_generico_1.gxp
+    FILE ${CMAKE_CURRENT_SOURCE_DIR}/reserva/vs_generico_2.gxp vs_generico_2.gxp
+    FILE ${CMAKE_CURRENT_SOURCE_DIR}/reserva/vs_generico_3.gxp vs_generico_3.gxp
+    ${AZ_PACK_ARGS}
 )

@@ -638,9 +638,27 @@ void CgFree(void* pointer) {
  */
 std::string CacheDirChoice() {
     SceIoStat flag{};
-    return sceIoGetstat("ux0:/data/azahar/cache_prueba.txt", &flag) >= 0
-               ? "ux0:/data/azahar/shadercache_prueba"
-               : "ux0:/data/azahar/shadercache";
+    if (sceIoGetstat("ux0:/data/azahar/cache_prueba.txt", &flag) < 0) {
+        return "ux0:/data/azahar/shadercache";
+    }
+    /**
+     * Con "fria<algo>" al principio del fichero (0.4.6.7), esa carpeta propia
+     * (shadercache_prueba_fria<algo>): vacia la primera vez, para medir la primera
+     * compilacion de un juego sin tocar ni la cache del usuario ni la de pruebas.
+     */
+    char text[48] = {};
+    if (const SceUID fd = sceIoOpen("ux0:/data/azahar/cache_prueba.txt", SCE_O_RDONLY, 0); fd >= 0) {
+        sceIoRead(fd, text, sizeof(text) - 1);
+        sceIoClose(fd);
+    }
+    if (std::strncmp(text, "fria", 4) == 0) {
+        std::string name = "ux0:/data/azahar/shadercache_prueba_";
+        for (const char* c = text; *c != ' ' && (std::isalnum(static_cast<unsigned char>(*c)) != 0 || *c == '_'); c++) {
+            name += *c;
+        }
+        return name;
+    }
+    return "ux0:/data/azahar/shadercache_prueba";
 }
 const std::string g_cache_dir = CacheDirChoice();
 const char* const kCacheDir = g_cache_dir.c_str();
@@ -848,7 +866,31 @@ const SceShaccCgCompileOutput* FromPreloaded(const CacheHeader& want,
 const SceShaccCgCompileOutput* LoadCachedFromCard(const CacheHeader& want,
                                                   const std::string& path);
 
+/**
+ * SHADERS DE FRAGMENTOS ESCRITOS A MANO (0.4.4.6). Si existe la carpeta
+ * ux0:/data/azahar/usse, un <hash>_1.gxp de ahi (con la misma cabecera AZGX que
+ * el de la cache) se usa en lugar del que compilo Cg. Es para probar USSE
+ * nuestro en un juego de verdad sin tocar la cache del usuario.
+ */
+constexpr const char* kUsseOverrideDir = "ux0:/data/azahar/usse";
+const bool g_usse_override = [] {
+    SceIoStat stat{};
+    return sceIoGetstat(kUsseOverrideDir, &stat) >= 0;
+}();
+
 const SceShaccCgCompileOutput* LoadCached(const CacheHeader& want, const std::string& path) {
+    if (g_usse_override && want.profile == static_cast<u32>(SCE_SHACCCG_PROFILE_FP)) {
+        const std::string name = path.substr(path.find_last_of('/') + 1);
+        const std::string override_path = std::string(kUsseOverrideDir) + "/" + name;
+        SceIoStat stat{};
+        if (sceIoGetstat(override_path.c_str(), &stat) >= 0) {
+            if (const SceShaccCgCompileOutput* output = LoadCachedFromCard(want, override_path)) {
+                Common::VitaNote("usse", fmt::format("sustituto {}", name).c_str());
+                return output;
+            }
+            Common::VitaNote("usse", fmt::format("sustituto {} NO vale (cabecera)", name).c_str());
+        }
+    }
     {
         const std::lock_guard lock{g_preload_mutex};
         const auto it = g_preloaded.find(path);
@@ -1736,6 +1778,10 @@ void PurgeUnoptimizedPrograms() {
  * cabecera con la fuente), y las que ya no estan en la carpeta (programas
  * borrados a proposito, ver PurgeUnoptimizedPrograms) se descartan.
  */
+/// Los paquetes de serie del juego (ver LOS PAQUETES DE SERIE mas abajo).
+std::unordered_map<std::string, std::vector<u8>> g_shipped;
+std::unordered_set<std::string> g_shipped_paths;
+std::atomic<u32> g_shipped_hits{0};
 constexpr u32 kPackMagic = 0x4B505A41u; // "AZPK"
 constexpr u32 kPackVersion = 1;
 
@@ -1799,7 +1845,7 @@ void WritePackLocked(const std::string& path) {
     std::vector<u8> data(12);
     u32 count = 0;
     for (const auto& [entry, file] : g_preloaded) {
-        if (entry.size() > 0xFFFF) {
+        if (entry.size() > 0xFFFF || g_shipped_paths.count(entry) != 0) {
             continue;
         }
         const u16 path_len = static_cast<u16>(entry.size());
@@ -1829,6 +1875,36 @@ void WritePackLocked(const std::string& path) {
     }
     sceIoRemove(path.c_str());
     sceIoRename(temp.c_str(), path.c_str());
+}
+
+/**
+ * LOS PAQUETES DE SERIE (0.4.6.8). Compilar los shaders de un juego la primera vez son
+ * decenas de segundos de dibujos que faltan, interfaz rota y 16-20 FPS (Pokemon X, 06-11:
+ * 58 compilaciones, las de vertices de 2 a 9,5 s cada una). Un shader compilado no depende
+ * de la consola: en el VPK, en app0:/packs/, va el paquete de cada juego que tengo ya
+ * compilado (nombre de fichero -> binario). Se lee de ahi en cada arranque (unos 1,5 s por
+ * 3 MB) y se suma a la precarga, SIN escribirlo en la tarjeta: la primera version volcaba
+ * los 727 de Pokemon X a ficheros sueltos y tardaba 86 s, a unos 120 ms por fichero.
+ * Cada binario se valida contra su fuente al usarlo (LoadCgCache), asi que uno que ya no
+ * case con el traductor se ignora. Lo de la tarjeta, si esta, manda.
+ */
+
+void LoadShippedPack(u64 program_id) {
+    g_shipped.clear();
+    g_shipped_paths.clear();
+    // Para probar en frio (0.4.7.0): ux0:/data/azahar/sin_paquetes.txt los ignora.
+    SceIoStat off{};
+    if (sceIoGetstat("ux0:/data/azahar/sin_paquetes.txt", &off) >= 0) {
+        Common::VitaNote("gxm cache", "paquete de serie ignorado (sin_paquetes.txt)");
+        return;
+    }
+    std::unordered_map<std::string, std::vector<u8>> shipped;
+    ReadPack(fmt::format("app0:/packs/juego_{:016x}.pak", program_id), shipped);
+    for (auto& [name, bytes] : shipped) {
+        const std::string path = fmt::format("{}/{}", kCacheDir, name);
+        g_shipped_paths.insert(path);
+        g_shipped.emplace(path, std::move(bytes));
+    }
 }
 
 std::string g_game_prefix;
@@ -2014,6 +2090,10 @@ u32 PreloadCgCache(u64 program_id, const std::function<void(u32, u32)>& progress
         g_game_prefix = fmt::format("{}/juego_{:016x}", kCacheDir, program_id);
     }
     sceIoMkdir(kCacheDir, 0777);
+    {
+        const std::lock_guard lock{g_preload_mutex};
+        LoadShippedPack(program_id);
+    }
     const SceUID list_fd = sceIoOpen(g_game_list_path.c_str(), SCE_O_RDONLY, 0);
     if (list_fd >= 0) {
         std::string text;
@@ -2093,8 +2173,28 @@ u32 PreloadCgCache(u64 program_id, const std::function<void(u32, u32)>& progress
         g_game_list.insert(path);
         g_preloaded.emplace(path, std::move(file));
     }
+    u32 from_shipped = 0;
+    {
+        const std::lock_guard lock{g_preload_mutex};
+        for (auto& [path, bytes] : g_shipped) {
+            if (g_preloaded.count(path) != 0 ||
+                total_bytes + bytes.size() > kMaxPreloadBytes) {
+                continue;
+            }
+            total_bytes += bytes.size();
+            from_shipped++;
+            g_game_list.insert(path);
+            g_preloaded.emplace(path, std::move(bytes));
+        }
+        g_shipped.clear();
+    }
     if (progress) {
         progress(total, total);
+    }
+    if (from_shipped != 0) {
+        Common::VitaNote("gxm cache",
+                         fmt::format("paquete de serie: {} shaders de app0:/packs", from_shipped)
+                             .c_str());
     }
     Common::VitaNote("gxm cache",
                      fmt::format("precarga: {} de {} shaders, {} KB en {} ms ({} del paquete, "
@@ -2122,7 +2222,8 @@ u32 PreloadCgCache(u64 program_id, const std::function<void(u32, u32)>& progress
             g_card_index_ready = dir >= 0;
             if (g_card_index_ready) {
                 for (auto it = g_preloaded.begin(); it != g_preloaded.end();) {
-                    if (g_card_files.count(it->first) == 0) {
+                    if (g_card_files.count(it->first) == 0 &&
+                        g_shipped_paths.count(it->first) == 0) {
                         it = g_preloaded.erase(it);
                         dropped++;
                     } else {
@@ -2175,6 +2276,10 @@ const SceShaccCgCompileOutput* LoadCgCache(SceShaccCgTargetProfile profile, cons
         if (it != g_preloaded.end()) {
             cached = FromPreloaded(key, it->second);
         }
+        // Ver EL PAQUETE DE SERIE, AL DIA: lo que sale de el.
+        if (cached != nullptr && g_shipped_paths.count(path) != 0) {
+            g_shipped_hits.fetch_add(1, std::memory_order_relaxed);
+        }
     }
     if (cached != nullptr) {
         NoteCache(fmt::format("{} leido de la cache en {} us", name,
@@ -2183,7 +2288,51 @@ const SceShaccCgCompileOutput* LoadCgCache(SceShaccCgTargetProfile profile, cons
     return cached;
 }
 
+/**
+ * FUENTES DE VERTICES RETOCADAS A MANO (0.4.4.6). Con la carpeta
+ * ux0:/data/azahar/vs_sustituto, un <hash>.cg de ahi (el hash es el de la fuente
+ * generada, el nombre del .gxp de la cache) se compila en su lugar: para probar
+ * en la consola cambios del generador antes de escribirlos. Mientras exista la
+ * carpeta el indice de vertices ni se lee ni se escribe, asi que nada de la
+ * prueba se queda apuntado para las partidas normales.
+ */
+constexpr const char* kVsOverrideDir = "ux0:/data/azahar/vs_sustituto";
+const bool g_vs_override = [] {
+    SceIoStat stat{};
+    return sceIoGetstat(kVsOverrideDir, &stat) >= 0;
+}();
+
+bool VsOverrideSource(std::string& source) {
+    if (!g_vs_override) {
+        return false;
+    }
+    const u64 hash = Common::ComputeHash64(source.data(), source.size());
+    const std::string path = fmt::format("{}/{:016x}.cg", kVsOverrideDir, hash);
+    const SceUID fd = sceIoOpen(path.c_str(), SCE_O_RDONLY, 0);
+    if (fd < 0) {
+        return false;
+    }
+    std::string text;
+    char buffer[4096];
+    int read = 0;
+    while ((read = sceIoRead(fd, buffer, sizeof(buffer))) > 0) {
+        text.append(buffer, static_cast<std::size_t>(read));
+    }
+    sceIoClose(fd);
+    if (text.empty()) {
+        return false;
+    }
+    Common::VitaNote("vs sustituto", fmt::format("{:016x}: {} bytes de la carpeta", hash,
+                                                 text.size())
+                                         .c_str());
+    source = std::move(text);
+    return true;
+}
+
 const SceShaccCgCompileOutput* LoadCgCacheIndexed(u64 key, u32* variant) {
+    if (g_vs_override) {
+        return nullptr;
+    }
     VsIndexRecord record{};
     {
         const std::lock_guard lock{g_preload_mutex};
@@ -2212,6 +2361,9 @@ const SceShaccCgCompileOutput* LoadCgCacheIndexed(u64 key, u32* variant) {
 }
 
 void AddVsIndex(u64 key, const std::string& source, u32 variant) {
+    if (g_vs_override) {
+        return;
+    }
     VsIndexRecord record{};
     record.key = key;
     record.hash_city = Common::ComputeHash64(source.data(), source.size());
@@ -2650,12 +2802,17 @@ const SceShaccCgCompileOutput* LoadProgramFile(const char* path) {
         sceIoClose(fd);
         return nullptr;
     }
-    void* memory = std::malloc(sizeof(SceShaccCgCompileOutput) + static_cast<std::size_t>(size));
+    // El binario alineado a 64 (0.4.7.0): con malloc quedaba a 8, y el
+    // parcheador rechazo asi una de las variantes del generico (0x805b0022).
+    void* memory =
+        std::malloc(sizeof(SceShaccCgCompileOutput) + 64 + static_cast<std::size_t>(size));
     if (memory == nullptr) {
         sceIoClose(fd);
         return nullptr;
     }
-    u8* program = static_cast<u8*>(memory) + sizeof(SceShaccCgCompileOutput);
+    u8* program = reinterpret_cast<u8*>(
+        (reinterpret_cast<uintptr_t>(memory) + sizeof(SceShaccCgCompileOutput) + 63) &
+        ~static_cast<uintptr_t>(63));
     const int got = sceIoRead(fd, program, static_cast<SceSize>(size));
     sceIoClose(fd);
     if (got != static_cast<int>(size) || std::memcmp(program, "GXP", 4) != 0) {
@@ -3010,6 +3167,25 @@ void CgMarkStarved() {
 }
 
 void CgSubmit(std::shared_ptr<CgJob> job, bool urgent) {
+    /**
+     * EL PAQUETE DE SERIE, AL DIA (0.4.7.0). Si cambia el traductor, cambia el
+     * hash de cada fuente y con el su nombre: el paquete viejo deja de
+     * encontrarse sin dar ningun error, y el juego vuelve a compilar como sin
+     * paquete. Con paquete, cada compilacion se cuenta: muchas quieren decir
+     * que hay que regenerarlo (scratchpad/hacer_paquetes.py).
+     */
+    if (!g_shipped_paths.empty()) {
+        static std::atomic<u32> compiled{0};
+        const u32 n = compiled.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (n == 1 || n == 10 || n == 50 || n == 200) {
+            Common::VitaNote("gxm cache",
+                             fmt::format("paquete de serie: {} shaders sacados de el, {} "
+                                         "compilados porque no estaban (si son muchos, el "
+                                         "paquete esta viejo)",
+                                         g_shipped_hits.load(std::memory_order_relaxed), n)
+                                 .c_str());
+        }
+    }
     std::lock_guard lock{g_jobs_mutex};
     if (!g_worker_started) {
         g_worker_started = true;
@@ -3079,8 +3255,12 @@ CgActivity GetCgActivity() {
 
 namespace {
 /// Una compilacion del banco: sin cache, sin marcas, sin lista negra.
+int g_bench_fx = -1;
+int g_bench_warn = -1;
+
 std::string BenchCompile(bool vertex, const std::string& source, int opt, int fastmath,
-                         int fastprecision, int fastint, int nostdlib, int slot = -1) {
+                         int fastprecision, int fastint, int nostdlib, int slot = -1,
+                         const std::string& save_path = {}) {
     if (!EnsureCgReady()) {
         return "sin compilador";
     }
@@ -3110,6 +3290,14 @@ std::string BenchCompile(bool vertex, const std::string& source, int opt, int fa
     options.useFastprecision = fastprecision;
     options.useFastint = fastint;
     options.noStdlib = nostdlib;
+    // Para el banco (0.4.7.0): "fx=" y "warn=" en la linea de hacer.txt.
+    if (g_bench_fx >= 0) {
+        options.useFx = g_bench_fx;
+    }
+    if (g_bench_warn >= 0) {
+        options.warningLevel = g_bench_warn;
+        options.performanceWarnings = 0;
+    }
     SceKernelThreadInfo before{};
     before.size = sizeof(before);
     sceKernelGetThreadInfo(sceKernelGetThreadId(), &before);
@@ -3171,9 +3359,19 @@ std::string BenchCompile(bool vertex, const std::string& source, int opt, int fa
                              u32_at(20));
     }
     const std::string text = fmt::format(
-        "{} | reloj {} ms, CPU {} ms | {} bytes de binario | {} | {} reservas, {} MB pedidos | {}",
+        "{} | reloj {} ms, CPU {} ms | {} bytes de binario | {} | {} reservas, {} MB pedidos | {} "
+        "| fx {} avisos {}/{}",
         ok ? "OK" : "FALLO", wall_ms, (after.runClocks - before.runClocks) / 1000,
-        ok ? output->programSize : 0, header, g_alloc_calls, g_alloc_total >> 20, diagnostic);
+        ok ? output->programSize : 0, header, g_alloc_calls, g_alloc_total >> 20, diagnostic,
+        options.useFx, options.warningLevel, options.performanceWarnings);
+    // El binario, para llevarlo ya compilado en la VPK (0.4.7.0, ver
+    // reserva/vs_generico.cg).
+    if (ok && !save_path.empty()) {
+        if (std::FILE* bin = std::fopen(save_path.c_str(), "wb")) {
+            std::fwrite(output->programData, 1, output->programSize, bin);
+            std::fclose(bin);
+        }
+    }
     if (output != nullptr) {
         sceShaccCgDestroyCompileOutput(output);
     }
@@ -3215,6 +3413,14 @@ void RunCgBenchIfAny() {
         std::sscanf(spec.c_str(), "%255s %7s O=%d fastmath=%d fastprecision=%d fastint=%d "
                                   "nostdlib=%d",
                     file, profile, &opt, &fastmath, &fastprecision, &fastint, &nostdlib);
+        g_bench_fx = -1;
+        g_bench_warn = -1;
+        if (const char* fx = std::strstr(spec.c_str(), "fx=")) {
+            g_bench_fx = std::atoi(fx + 3);
+        }
+        if (const char* warn = std::strstr(spec.c_str(), "warn=")) {
+            g_bench_warn = std::atoi(warn + 5);
+        }
         const auto read_source = [&](const char* name) {
             std::string text;
             if (std::FILE* in = std::fopen((std::string(kDir) + name).c_str(), "rb")) {
@@ -3292,7 +3498,8 @@ void RunCgBenchIfAny() {
         const std::string result =
             source.empty() ? std::string("no se pudo leer")
                            : BenchCompile(std::strcmp(profile, "fp") != 0, source, opt,
-                                          fastmath, fastprecision, fastint, nostdlib);
+                                          fastmath, fastprecision, fastint, nostdlib, -1,
+                                          std::string(kDir) + file + ".gxp");
         Common::VitaNote("banco cg", fmt::format("{} -> {}", spec, result).c_str());
         if (out != nullptr) {
             std::fprintf(out, "%s -> %s\n", spec.c_str(), result.c_str());

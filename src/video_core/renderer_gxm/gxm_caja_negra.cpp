@@ -205,7 +205,11 @@ void WriteReport(const Box& box) {
     const SceUID fd = sceIoOpen(kReportPath, SCE_O_WRONLY | SCE_O_CREAT | SCE_O_TRUNC, 0777);
     if (fd >= 0) {
         sceIoWrite(fd, g_report, static_cast<SceSize>(n));
+        // A la tarjeta YA (0.4.4.5): el GPUCRASH reinicia la consola enseguida y
+        // sin esto los de Yo-kai Watch 3 del 03-11 no llegaron a escribirse.
+        sceIoSyncByFd(fd, 0);
         sceIoClose(fd);
+        sceIoSync("ux0:", 0);
     }
     Common::VitaNote("gxm caja negra", "la GPU no avanza: escrito gpu_colgada.txt");
     // Lo que se compile ahora no tiene la culpa de lo que pase despues (0.4.2.2).
@@ -620,11 +624,17 @@ void* BoxMain(void*) {
         const u32 done = g_fence != nullptr ? *g_fence : 0;
         box.now_ms = now;
         box.fence_done = done;
-        if (done != last_done) {
+        const u32 sent = box.fence_sent;
+        /**
+         * PARADA = CON TRABAJO PENDIENTE (0.4.4.7). Sin nada pendiente (todo lo
+         * mandado ya hecho) el reloj de la parada no corre: Pokemon X tardo 1,6
+         * s en abrir su partida (fs:USER::OpenArchive) sin mandar escenas, y al
+         * volver a dibujar esto lo daba por GPU colgada.
+         */
+        if (done != last_done || static_cast<s32>(sent - done) <= 0) {
             last_done = done;
             box.last_advance_ms = now;
         }
-        const u32 sent = box.fence_sent;
         if (box.stalled == 0 && static_cast<s32>(sent - done) > 0 &&
             now - box.last_advance_ms > kStallMs) {
             box.stalled = 1;

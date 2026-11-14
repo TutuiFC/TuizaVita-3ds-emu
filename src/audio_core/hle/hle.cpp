@@ -6,6 +6,7 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <deque>
 #include <mutex>
 #include <pthread.h>
 
@@ -147,6 +148,35 @@ private:
 
     std::function<void(Service::DSP::InterruptType type, DspPipe pipe)> interrupt_handler{};
 
+    /**
+     * EL AAC EN OTRO HILO (0.4.4.7, DspHle::async_aac). Cada peticion de la
+     * tuberia binaria se decodificaba en el hilo de emulacion: en Pokemon X,
+     * 40 por segundo de ~1,3 ms ("dsp::DSP::WriteProcessPipe 47-63 ms/s").
+     * Ahora PipeWrite la encola para AacMain (nucleo 2) y programa aac_event a
+     * kAacLatencyUs de tiempo emulado: ese evento, ya en el hilo de emulacion,
+     * entrega la respuesta y la interrupcion, en el mismo orden. Si el hilo no
+     * ha acabado, el evento se repite kAacRetryUs despues (sin bloquear).
+     * El resultado es el mismo, solo se solapa con la emulacion.
+     */
+    static constexpr int kAacLatencyUs = 2000;
+    static constexpr int kAacRetryUs = 300;
+    bool aac_started = false;
+    bool aac_failed = false;
+    bool aac_stop = false;
+    bool aac_busy = false;
+    pthread_t aac_thread{};
+    std::mutex aac_mutex;
+    std::condition_variable aac_cv;
+    std::condition_variable aac_done_cv;
+    std::deque<HLE::BinaryMessage> aac_requests;
+    std::deque<HLE::BinaryMessage> aac_responses;
+    Core::TimingEventType* aac_event{};
+    bool StartAac();
+    static void* AacEntry(void* self);
+    void AacMain();
+    void AacDeliver();
+    void AacDrain();
+
     bool mixer_started = false;
     bool mixer_failed = false;
     pthread_t mixer_thread{};
@@ -226,12 +256,23 @@ DspHle::Impl::Impl(DspHle& parent_, Memory::MemorySystem& memory, Core::Timing& 
         });
     publish_event = core_timing.RegisterEvent("AudioCore::DspHle::publish_event",
                                               [this](u64, s64) { this->PublishCallback(); });
+    aac_event = core_timing.RegisterEvent("AudioCore::DspHle::aac_event",
+                                          [this](u64, s64) { this->AacDeliver(); });
     core_timing.ScheduleEvent(audio_frame_ticks, tick_event);
 }
 
 DspHle::Impl::~Impl() {
     core_timing.UnscheduleEvent(tick_event, 0);
     core_timing.UnscheduleEvent(publish_event, 0);
+    core_timing.UnscheduleEvent(aac_event, 0);
+    if (aac_started) {
+        {
+            const std::lock_guard lock{aac_mutex};
+            aac_stop = true;
+        }
+        aac_cv.notify_all();
+        pthread_join(aac_thread, nullptr);
+    }
     if (mixer_started) {
         {
             const std::lock_guard lock{mixer_mutex};
@@ -383,6 +424,15 @@ void DspHle::Impl::PipeWrite(DspPipe pipe_number, std::span<const u8> buffer) {
             UNIMPLEMENTED();
             return;
         }
+        if (DspHle::async_aac.load(std::memory_order_relaxed) && StartAac()) {
+            {
+                const std::lock_guard lock{aac_mutex};
+                aac_requests.push_back(request);
+            }
+            aac_cv.notify_one();
+            core_timing.ScheduleEvent(usToCycles(kAacLatencyUs), aac_event);
+            break;
+        }
 #ifdef __PSVITA__
         const unsigned long long decode_begin = Common::VitaMicros();
 #endif
@@ -420,6 +470,7 @@ void DspHle::Impl::Initialize() {
     for (auto& s : sources) {
         s.Reset();
     }
+    AacDrain();
     aac_decoder->Reset();
     ResetPipes();
 }
@@ -447,6 +498,7 @@ void DspHle::Impl::Wakeup() {
     for (auto& s : sources) {
         s.Wakeup();
     }
+    AacDrain();
     aac_decoder->Reset();
     ResetPipes();
 }
@@ -574,6 +626,100 @@ bool DspHle::Impl::Tick() {
     }
 
     return is_on;
+}
+
+bool DspHle::Impl::StartAac() {
+    if (aac_started) {
+        return true;
+    }
+    if (aac_failed) {
+        return false;
+    }
+    pthread_attr_t attr;
+    pthread_attr_init(&attr);
+    pthread_attr_setstacksize(&attr, 256 * 1024);
+    const int rc = pthread_create(&aac_thread, &attr, &AacEntry, this);
+    aac_started = rc == 0;
+    aac_failed = !aac_started;
+    pthread_attr_destroy(&attr);
+#ifdef __PSVITA__
+    Common::VitaNote("dsp", aac_started
+                                ? "aac: decodificacion en otro hilo (nucleo 2)"
+                                : "aac: no se pudo crear su hilo; se decodifica en el de emulacion");
+#endif
+    return aac_started;
+}
+
+void* DspHle::Impl::AacEntry(void* self) {
+    static_cast<Impl*>(self)->AacMain();
+    return nullptr;
+}
+
+void DspHle::Impl::AacMain() {
+#ifdef __PSVITA__
+    Common::VitaPinThreadToUserCore(2, "aac");
+    // Por debajo de la mezcla: una peticion son ~1,3 ms y la mezcla tiene plazo.
+    Common::VitaSetThreadPriority(Common::kVitaPriorityHelper + 1, "aac");
+    // El FPSCR es por hilo: el mismo modo que el de emulacion, que decodificaba antes.
+    Common::VitaEnableFastFloatMode();
+#endif
+    while (true) {
+        HLE::BinaryMessage request{};
+        {
+            std::unique_lock lock{aac_mutex};
+            aac_cv.wait(lock, [this] { return aac_stop || !aac_requests.empty(); });
+            if (aac_stop) {
+                return;
+            }
+            request = aac_requests.front();
+            aac_requests.pop_front();
+            aac_busy = true;
+        }
+#ifdef __PSVITA__
+        const unsigned long long decode_begin = Common::VitaMicros();
+#endif
+        const HLE::BinaryMessage response = aac_decoder->ProcessRequest(request);
+#ifdef __PSVITA__
+        Common::FrameStats::Add(Common::FrameStats::aac_us, decode_begin);
+#endif
+        {
+            const std::lock_guard lock{aac_mutex};
+            aac_responses.push_back(response);
+            aac_busy = false;
+        }
+        aac_done_cv.notify_all();
+    }
+}
+
+void DspHle::Impl::AacDeliver() {
+    HLE::BinaryMessage response{};
+    {
+        std::unique_lock lock{aac_mutex};
+        // Sin nada pendiente (p. ej. tras cargar un estado) no se espera nada.
+        if (aac_responses.empty() && aac_requests.empty() && !aac_busy) {
+            return;
+        }
+        // Aun decodificando: se vuelve a mirar un poco despues, sin parar la
+        // emulacion (con espera bloqueante eran 44 ms/s en Pokemon X).
+        if (aac_responses.empty()) {
+            core_timing.ScheduleEvent(usToCycles(kAacRetryUs), aac_event);
+            return;
+        }
+        response = aac_responses.front();
+        aac_responses.pop_front();
+    }
+    auto& pipe = pipe_data[static_cast<u32>(DspPipe::Binary)];
+    pipe.resize(sizeof(response));
+    std::memcpy(pipe.data(), &response, sizeof(response));
+    interrupt_handler(InterruptType::Pipe, DspPipe::Binary);
+}
+
+void DspHle::Impl::AacDrain() {
+    if (!aac_started) {
+        return;
+    }
+    std::unique_lock lock{aac_mutex};
+    aac_done_cv.wait(lock, [this] { return aac_requests.empty() && !aac_busy; });
 }
 
 bool DspHle::Impl::StartMixer() {
@@ -997,6 +1143,7 @@ void DspHle::Impl::AudioTickCallback(s64 cycles_late) {
 }
 
 std::atomic<bool> DspHle::async_mix{true};
+std::atomic<bool> DspHle::async_aac{true};
 
 DspHle::DspHle(Core::System& system, Memory::MemorySystem& memory, Core::Timing& timing)
     : DspInterface(system), impl(std::make_unique<Impl>(*this, memory, timing)) {}

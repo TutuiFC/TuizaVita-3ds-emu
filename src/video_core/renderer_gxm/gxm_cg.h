@@ -99,6 +99,8 @@ const SceShaccCgCompileOutput* LoadCgCache(SceShaccCgTargetProfile profile, cons
  */
 const SceShaccCgCompileOutput* LoadCgCacheIndexed(u64 key, u32* variant);
 void AddVsIndex(u64 key, const std::string& source, u32 variant);
+/// Ver kVsOverrideDir (0.4.4.6): cambia 'source' por la de vs_sustituto si la hay.
+bool VsOverrideSource(std::string& source);
 
 /**
  * Un programa ya compilado en un fichero .gxp suelto (0.4.2.5, el shader de

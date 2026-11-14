@@ -39,6 +39,9 @@
 #include "core/hle/kernel/shared_memory.h"
 #include "core/hle/kernel/svc.h"
 #include "core/hle/kernel/svc_wrapper.h"
+#ifdef __PSVITA__
+#include "core/arm/native/arm_native.h"
+#endif
 #include "core/hle/kernel/thread.h"
 #include "core/hle/kernel/timer.h"
 #include "core/hle/kernel/vm_manager.h"
@@ -1701,8 +1704,56 @@ Result SVC::CancelTimer(Handle handle) {
 }
 
 /// Sleep the current thread
+#ifdef __PSVITA__
+/// Cuanto duermen los SleepThread del juego (0.4.5.2): 0, <10, <50, <100, <500, <1000,
+/// <5000 us y el resto. Solo lo toca el hilo de emulacion. Ver SvcCostsText.
+std::array<u32, 8> g_sleep_hist{};
+/// La tormenta de sueños cortos: ver SVC::SleepThread. Solo el hilo de emulacion.
+u64 g_sleep_window_start = 0;
+u32 g_sleep_window_count = 0;
+bool g_sleep_storm = false;
+#endif
+
 void SVC::SleepThread(s64 nanoseconds) {
     LOG_TRACE(Kernel_SVC, "called nanoseconds={}", nanoseconds);
+
+#ifdef __PSVITA__
+    {
+        const s64 us = nanoseconds / 1000;
+        const u32 bucket = nanoseconds <= 0 ? 0u
+                           : us < 10        ? 1u
+                           : us < 50        ? 2u
+                           : us < 100       ? 3u
+                           : us < 500       ? 4u
+                           : us < 1000      ? 5u
+                           : us < 5000      ? 6u
+                                            : 7u;
+        g_sleep_hist[bucket]++;
+        /**
+         * LOS SUENOS CORTISIMOS (0.4.5.4, ajuste svc_sueno_min=, en us; 0 lo apaga).
+         * En la consola de verdad un hilo que duerme unas decenas de us en bucle no
+         * cuesta casi nada. Aqui cada vuelta es salir del mundo nativo, un evento,
+         * replanificar y volver a entrar, dos veces: Kirby Triple Deluxe hace ~7.000
+         * por segundo y su juego iba de 32 a 46 FPS durmiendolos a 1 ms.
+         *
+         * Solo en una TORMENTA, que es lo que cuesta: mas de 600 sueños cortos por
+         * segundo emulado. Un juego que duerma poco de vez en cuando sigue exacto.
+         */
+        if (nanoseconds > 0 && nanoseconds < Core::Native::min_sleep_ns) {
+            constexpr u64 kWindowTicks = BASE_CLOCK_RATE_ARM11 / 10;
+            const u64 now = kernel.timing.GetGlobalTicks();
+            if (now - g_sleep_window_start >= kWindowTicks) {
+                g_sleep_storm = g_sleep_window_count >= (g_sleep_storm ? 30u : 60u);
+                g_sleep_window_count = 0;
+                g_sleep_window_start = now;
+            }
+            g_sleep_window_count++;
+            if (g_sleep_storm) {
+                nanoseconds = Core::Native::min_sleep_ns;
+            }
+        }
+    }
+#endif
 
     ThreadManager& thread_manager = kernel.GetCurrentThreadManager();
 
@@ -2643,6 +2694,12 @@ std::string Core::TakeSvcProfile() {
     text += fmt::format(" | cerrojo hle {:.1f} ms por s",
                         static_cast<double>(Kernel::g_hle_lock_us.exchange(0)) * 8.0 * 1000.0 /
                             static_cast<double>(wall));
+    text += fmt::format(" | suenos us: 0:{} <10:{} <50:{} <100:{} <500:{} <1000:{} <5000:{} mas:{} {}",
+                        Kernel::g_sleep_hist[0], Kernel::g_sleep_hist[1], Kernel::g_sleep_hist[2],
+                        Kernel::g_sleep_hist[3], Kernel::g_sleep_hist[4], Kernel::g_sleep_hist[5],
+                        Kernel::g_sleep_hist[6], Kernel::g_sleep_hist[7],
+                        Kernel::g_sleep_storm ? "TORMENTA" : "");
+    Kernel::g_sleep_hist.fill(0);
     return text;
 }
 #endif

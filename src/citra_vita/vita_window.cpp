@@ -148,10 +148,21 @@ void EmuWindow_Vita::PollEvents() {
     sceCtrlPeekBufferPositive(0, &pad, 1);
     pad.buttons |= VitaFrontend::Input::PilotButtons();
 
-    // START + SELECT a la vez sale de la emulacion y vuelve al menu de ROMs.
-    // Hacen falta las dos porque cada una por separado es un boton del 3DS.
-    if ((pad.buttons & SCE_CTRL_START) && (pad.buttons & SCE_CTRL_SELECT)) {
+    // El piloto automatico sale con las dos a la vez al acabar su guion. Las manos
+    // abren el menu de la partida: START y SELECT seguidos, ver vita_input.cpp.
+    const unsigned int pilot = VitaFrontend::Input::PilotButtons();
+    const bool menu_wanted = VitaFrontend::Input::TakeGameMenuRequest();
+    if ((pilot & SCE_CTRL_START) && (pilot & SCE_CTRL_SELECT)) {
         should_exit = true;
+    } else if (menu_wanted && game_menu && frames_presented > 0) {
+        game_menu_open.store(true, std::memory_order_relaxed);
+        game_menu();
+        game_menu_open.store(false, std::memory_order_relaxed);
+        // El menu espera al refresco aunque el juego no lo haga, y se ha quedado
+        // en pantalla: el fotograma siguiente se presenta aunque sea igual.
+        applied_vblank_wait = -1;
+        has_presented = false;
+        return;
     }
 
     UpdateFrameSkipControl(pad.buttons);
@@ -219,10 +230,11 @@ void EmuWindow_Vita::UpdateFrameSkipControl(unsigned int buttons) {
             stretch_combo_held = true;
             auto& system = Core::System::GetInstance();
             if (system.IsPoweredOn()) {
-                audio_stretching = !audio_stretching;
-                system.DSP().EnableStretching(audio_stretching);
-                Common::VitaNote("tecla", audio_stretching ? "SELECT+IZQUIERDA: sonido estirado"
-                                                           : "SELECT+IZQUIERDA: sonido directo");
+                const bool stretched = !g_audio_stretch.load(std::memory_order_relaxed);
+                g_audio_stretch.store(stretched, std::memory_order_relaxed);
+                system.DSP().EnableStretching(stretched);
+                Common::VitaNote("tecla", stretched ? "SELECT+IZQUIERDA: sonido estirado"
+                                                    : "SELECT+IZQUIERDA: sonido directo");
             }
         }
         return;
@@ -681,7 +693,10 @@ void EmuWindow_Vita::PresentScreens() {
     }
     const unsigned long long swap_begin = Common::VitaMicros();
     Common::VitaStageSlot().store("presentar: swap", std::memory_order_relaxed);
-    vita2d_swap_buffers();
+    {
+        const Common::ScopedGpuTag tag{Common::kGpuTagPresentSwap};
+        vita2d_swap_buffers();
+    }
     Common::FrameStats::Add(Common::FrameStats::swap_us, swap_begin);
 
     Common::FrameStats::frames.fetch_add(1, std::memory_order_relaxed);
@@ -1464,7 +1479,8 @@ void EmuWindow_Vita::DrawStatsOverlay() {
                                 "esc {} vol {} | gx tri {:.0f}% rell {:.0f}% tran {:.0f}% "
                                 "(ms/fot {:.1f} {:.1f} {:.1f}) | "
                                 "par {:.0f} ins {:.0f} rap {:.0f}% | copia gpu {} de verdad {} | relleno gpu {} "
-                                "sinc soft {} | saltados por compilar {} (vs {}) reserva {}",
+                                "sinc soft {} | saltados por compilar {} (vs {}) reserva {} vs generico {} (coste {}k, sin presupuesto {}) "
+                                "| vs propios: {} lotes, {} hechos, {} no",
                                 stats_triangles_per_frame, stats_tri_gpu, stats_tri_sw,
                                 stats_gpu_batches, stats_hw_vs_batches, stats_hw_vs_rejects,
                                 Gxm::RasterizerGXM::TakeRejectSummary(),
@@ -1485,7 +1501,17 @@ void EmuWindow_Vita::DrawStatsOverlay() {
                                 Gxm::RasterizerGXM::skipped_vs_batches.exchange(
                                     0, std::memory_order_relaxed),
                                 Gxm::RasterizerGXM::reserve_batches.exchange(
-                                    0, std::memory_order_relaxed))
+                                    0, std::memory_order_relaxed),
+                                Gxm::RasterizerGXM::generic_vs_batches.exchange(
+                                    0, std::memory_order_relaxed),
+                                Gxm::RasterizerGXM::generic_vs_cost.exchange(
+                                    0, std::memory_order_relaxed) / 1000,
+                                Gxm::RasterizerGXM::generic_vs_over.exchange(
+                                    0, std::memory_order_relaxed),
+                                Gxm::RasterizerGXM::usse_vs_batches.exchange(
+                                    0, std::memory_order_relaxed),
+                                Gxm::RasterizerGXM::usse_vs_built.load(std::memory_order_relaxed),
+                                Gxm::RasterizerGXM::usse_vs_failed.load(std::memory_order_relaxed))
                         .c_str());
                 // Lo que cuesta cargar modelos nuevos (0.2.1.1): texturas
                 // decodificadas o revisadas, y las esperas enteras a la GPU.
@@ -1526,6 +1552,10 @@ void EmuWindow_Vita::DrawStatsOverlay() {
                                 stats_gpu_writeback_ms,
                                 stats_gpu_present_ms - stats_gpu_flush_ms)
                         .c_str());
+                Common::VitaStartGpuSampler();
+                if (const std::string samples = Common::VitaTakeGpuSamples(); !samples.empty()) {
+                    Common::VitaNote("gpu muestras", samples.c_str());
+                }
                 Common::VitaNote("lote fases", Gxm::RasterizerGXM::TakeBatchProfile().c_str());
                 Common::VitaNote("esperas gpu", stats_gpu_waits.c_str());
                 Common::VitaNote("superficies",
@@ -2158,7 +2188,8 @@ void EmuWindow_Vita::DrawStatsOverlay() {
         append_whole(" ins ", stats_instrs_per_vertex);
         append_whole(" rap ", stats_fast_percent);
         // snd = sonido con estirado (est) o directo (dir). SELECT + IZQUIERDA.
-        const char* snd_label = audio_stretching ? " snd est" : " snd dir";
+        const char* snd_label =
+            g_audio_stretch.load(std::memory_order_relaxed) ? " snd est" : " snd dir";
         for (std::size_t i = 0; snd_label[i] != '\0'; i++) {
             line_pres[n++] = snd_label[i];
         }

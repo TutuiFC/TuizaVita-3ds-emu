@@ -35,6 +35,26 @@ extern std::atomic<bool> g_fs_half_tev;
 extern std::atomic<bool> g_fs_tev_exact;
 
 /**
+ * Las tablas de luz de cada luz se leen en lote, de cuatro en cuatro (0.4.4.6,
+ * ajuste fs_lut_vector=1, el de serie). Mismas cuentas, en vectores: en el USSE
+ * una instruccion cuesta lo mismo con uno que con cuatro componentes.
+ */
+extern std::atomic<bool> g_fs_lut_vector;
+
+/**
+ * El alfa sin redondear entre etapas TAMBIEN con prueba de alfa (0.4.4.6, ajuste
+ * fs_alfa_exacto=0, el de serie). La prueba sigue redondeando el alfa final a
+ * 8 bits antes de comparar; solo cambia algun pixel justo en el umbral. En el
+ * escenario de Pokemon X el shader que cubre el 60 % de la pantalla tenia una
+ * fase entera para el alfa con tres redondeos. Con fs_alfa_exacto=1, exacto.
+ */
+extern std::atomic<bool> g_fs_alpha_exact;
+
+/// Color y alfa de cada etapa TEV en una sola cuenta vec4 cuando se puede
+/// (0.4.4.7, ajuste fs_tev_junto=1, el de serie). Ver TryWriteFusedStage.
+extern std::atomic<bool> g_fs_tev_fuse;
+
+/**
  * Generador del shader de fragmentos de la PICA en Cg para el backend GXM.
  *
  * Es el tercer hermano de glsl_fs_shader_gen.cpp y spv_fs_shader_gen.cpp:

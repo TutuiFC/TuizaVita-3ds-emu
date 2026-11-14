@@ -30,6 +30,7 @@
 #include <array>
 #include <atomic>
 #include <cstdint>
+#include <string>
 
 namespace Common {
 
@@ -263,6 +264,62 @@ inline std::atomic<const char*> vita_stage{"-"};
  * por el hilo actual en cada etapa costaria una llamada al kernel.
  */
 inline std::atomic<const char*> vita_gpu_stage{"-"};
+
+/**
+ * EL MUESTREADOR DEL HILO DE LA GPU (0.4.5.2, ajuste gpu_muestreo=1). Los cronometros
+ * de las fases leen el reloj, una llamada al kernel de ~0,75 us cada una, y falsean
+ * justo lo que miden: en una fase de 10 us, un 15 % es el propio cronometro, y lo que
+ * queda fuera de ellos no sale en ninguna parte. Aqui el hilo solo escribe un byte con
+ * la fase en la que esta, y otro hilo, en otro nucleo, lo lee unas mil veces por
+ * segundo. No cuesta nada y no tiene sesgo: el reparto es de todo el tiempo del hilo.
+ */
+enum VitaGpuTag : unsigned char {
+    kGpuTagIdle = 0,
+    kGpuTagCommand,
+    kGpuTagDecode,
+    kGpuTagSpecial,
+    kGpuTagBatchQuestions,
+    kGpuTagBatchVs,
+    kGpuTagBatchLink,
+    kGpuTagBatchData,
+    kGpuTagBatchState,
+    kGpuTagBatchUniforms,
+    kGpuTagBatchEnd,
+    kGpuTagBatchTextures,
+    kGpuTagBatchDraw,
+    kGpuTagPresent,
+    kGpuTagSpecialUniform,
+    kGpuTagSpecialProgram,
+    kGpuTagCpuVertices,
+    kGpuTagFill,
+    kGpuTagTransfer,
+    kGpuTagDma,
+    kGpuTagChipWait,
+    kGpuTagPresentSwap,
+    kGpuTagCount,
+};
+inline volatile unsigned char vita_gpu_tag = kGpuTagIdle;
+/// El registro que se esta atendiendo en kGpuTagSpecial (0.4.6.2): el muestreador reparte
+/// "registros" por registro. Una escritura por registro especial, no cuesta nada.
+inline volatile unsigned short vita_gpu_reg = 0;
+/// Ordenes del camino rapido de la lista (0.4.6.5), para el reparto: ciclos por orden.
+inline volatile unsigned int vita_gpu_cmds = 0;
+/// La fase, solo mientras dure esto: las esperas caen dentro de cualquier otra, y sin
+/// separarlas el "ocupado" del muestreador mezcla trabajo de la CPU con el chip parado.
+struct ScopedGpuTag {
+    explicit ScopedGpuTag(unsigned char tag) : before{vita_gpu_tag} {
+        vita_gpu_tag = tag;
+    }
+    ~ScopedGpuTag() {
+        vita_gpu_tag = before;
+    }
+    unsigned char before;
+};
+inline bool vita_gpu_sampler_on = false;
+/// Lo arranca una vez, si el ajuste esta puesto. Sin el, no hace nada.
+void VitaStartGpuSampler();
+/// El reparto desde la ultima vez, en texto, y a cero. Vacio sin muestreador.
+std::string VitaTakeGpuSamples();
 inline std::atomic<std::uintptr_t> vita_gpu_stack_lo{0};
 inline std::atomic<std::uintptr_t> vita_gpu_stack_hi{0};
 

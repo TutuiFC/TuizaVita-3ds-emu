@@ -5,6 +5,7 @@
 #pragma once
 
 #include <atomic>
+#include <functional>
 #include <memory>
 #include <string>
 #include <psp2/kernel/processmgr.h>
@@ -41,6 +42,10 @@ inline std::atomic<bool> g_skip_repeated_frames{true};
 /// puede pasar del 100 % de velocidad. Con la espera, como mucho 60 por segundo.
 inline std::atomic<bool> g_unlimited_speed{false};
 
+/// El estirado de audio (SoundTouch) encendido o no (0.4.6.6): lo cambian el menu de la
+/// partida y SELECT + IZQUIERDA, y se guarda como audio_estirado= en ajustes.txt.
+inline std::atomic<bool> g_audio_stretch{true};
+
 /**
  * Ventana de emulacion para PS Vita.
  *
@@ -64,6 +69,24 @@ public:
     /// True cuando el usuario ha pedido salir de la emulacion.
     bool ShouldExit() const {
         return should_exit.load(std::memory_order_relaxed);
+    }
+
+    /// Sale de la emulacion, como lo hacia START + SELECT (0.4.6.1).
+    void RequestExit() {
+        should_exit.store(true, std::memory_order_relaxed);
+    }
+
+    /**
+     * El menu de la partida (0.4.6.1). Lo pone RunGame y lo llama PollEvents, que
+     * es el unico sitio donde se puede usar vita2d en plena partida sin mas: en el
+     * hilo que presenta, con la escena del rasterizador cerrada. Bloquea mientras
+     * esta abierto, y el hilo de emulacion espera mirando GameMenuOpen.
+     */
+    void SetGameMenu(std::function<void()> menu) {
+        game_menu = std::move(menu);
+    }
+    bool GameMenuOpen() const {
+        return game_menu_open.load(std::memory_order_relaxed);
     }
 
     /// Fotogramas presentados desde que arranco el juego. Sirve para distinguir
@@ -155,6 +178,8 @@ private:
     /// Atomicos desde 0.2.0.0: con la GPU en otro nucleo, la presentacion (que
     /// los escribe) y el bucle de main.cpp (que los lee) van en hilos distintos.
     std::atomic<bool> should_exit{false};
+    std::function<void()> game_menu;
+    std::atomic<bool> game_menu_open{false};
     /// Lo ultimo que se le dijo a vita2d_set_vblank_wait (ver g_unlimited_speed).
     int applied_vblank_wait = 1;
     bool is_touching = false;
@@ -175,7 +200,6 @@ private:
     /// Las ~30 lineas de diagnostico (0.2.2.2). Sin esto, una sola linea con
     /// los FPS: ver DrawStatsOverlay.
     bool stats_overlay_full = false;
-    bool audio_stretching = true;
     /// Estadisticas del JIT para el overlay (ver DrawStatsOverlay).
     bool stats_jit_on = false;
     double stats_jit_percent = 0.0;

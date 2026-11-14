@@ -40,6 +40,9 @@ public:
     /// Draw the current batch of triangles
     virtual void DrawTriangles() = 0;
 
+    /// La GPU va a avisar al juego de que ha acabado (interrupcion P3D).
+    virtual void BeforeP3dInterrupt() {}
+
     /// Notify rasterizer that all caches should be flushed to 3DS memory
     virtual void FlushAll() = 0;
 

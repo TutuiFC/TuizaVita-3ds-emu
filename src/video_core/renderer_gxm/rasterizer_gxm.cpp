@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <arm_neon.h>
 #include <bit>
+#include <bitset>
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
@@ -38,6 +39,7 @@
 #include "video_core/renderer_gxm/gxm_cg.h"
 #include "video_core/renderer_gxm/gxm_presenter.h"
 #include "video_core/renderer_gxm/gxm_texture_cache.h"
+#include "video_core/renderer_gxm/usse_vs_gen.h"
 #include "video_core/renderer_software/sw_rasterizer.h"
 #include "video_core/shader/generator/cg_fs_shader_gen.h"
 #include "video_core/shader/generator/cg_vs_shader_gen.h"
@@ -84,7 +86,7 @@ std::atomic<u32> RasterizerGXM::direct_uniforms{1};
 std::atomic<u32> RasterizerGXM::vertex_upload_cache{1};
 std::atomic<u32> RasterizerGXM::vs_compile_limit_kb{23};
 std::atomic<u32> RasterizerGXM::state_shadow_enabled{1};
-std::atomic<u32> RasterizerGXM::resolution_scale{2};
+std::atomic<u32> RasterizerGXM::resolution_scale{4};
 std::atomic<u32> RasterizerGXM::gpu_transfers{0};
 std::atomic<u32> RasterizerGXM::transfer_materialized{0};
 std::atomic<u32> RasterizerGXM::gpu_texture_transfers{0};
@@ -506,6 +508,14 @@ std::atomic<u32> RasterizerGXM::software_syncs{0};
 std::atomic<u32> RasterizerGXM::skipped_batches{0};
 std::atomic<u32> RasterizerGXM::reserve_batches{0};
 std::atomic<u32> RasterizerGXM::skipped_vs_batches{0};
+std::atomic<u32> RasterizerGXM::generic_vs_batches{0};
+std::atomic<u32> RasterizerGXM::generic_vs{0};
+std::atomic<u32> RasterizerGXM::usse_vs{0};
+std::atomic<u32> RasterizerGXM::usse_vs_batches{0};
+std::atomic<u32> RasterizerGXM::usse_vs_built{0};
+std::atomic<u32> RasterizerGXM::usse_vs_failed{0};
+std::atomic<u64> RasterizerGXM::generic_vs_cost{0};
+std::atomic<u32> RasterizerGXM::generic_vs_over{0};
 RasterizerGXM* RasterizerGXM::s_instance = nullptr;
 
 const char* RasterizerGXM::Ablation::Name(u32 value) {
@@ -1155,7 +1165,7 @@ struct RasterizerGXM::Surface {
     u32 color_stride = 0;
     /// Escala en mitades (resolution_scale al crearla): Phys() da nuestros
     /// pixeles. width/height son siempre los del invitado.
-    u32 scale = 2;
+    u32 scale = 4;
     /// Formato de la superficie de color, como SCE_GXM_COLOR_FORMAT_*.
     /// Para presentar directo (4.6) hace falta saberlo: el del invitado y el
     /// nuestro no son el mismo enum aunque describan lo mismo.
@@ -1251,7 +1261,7 @@ struct RasterizerGXM::ScreenCopy {
     u32 stride = 0;
     u32 bpp = 4;
     /// La de la superficie de origen, en mitades: la copia es pixel a pixel.
-    u32 scale = 2;
+    u32 scale = 4;
     Pica::PixelFormat input_format = Pica::PixelFormat::RGBA8;
     Pica::PixelFormat output_format = Pica::PixelFormat::RGBA8;
     /// Tiene la ultima copia a esa pantalla...
@@ -1549,9 +1559,9 @@ void CopyTiledGuestImpl(u8* guest, u8* linear, u32 width, u32 height, u32 linear
 }
 
 /// Medida en pixeles nuestros de 'guest' pixeles del invitado, con la escala
-/// en mitades (ver RasterizerGXM::resolution_scale).
+/// en CUARTOS (0.4.6.6: 2 = 0.5x, 4 = 1x, 10 = 2.5x; ver RasterizerGXM::resolution_scale).
 constexpr u32 Phys(u32 guest, u32 scale) {
-    return guest * scale / 2;
+    return guest * scale / 4;
 }
 
 /**
@@ -1732,6 +1742,275 @@ u32 UsedFloatUniforms(const Pica::ShaderSetup& setup) {
         }
     }
     return std::min<u32>(count, 96);
+}
+
+/**
+ * EL SHADER DE VERTICES GENERICO (0.4.7.0). Mientras se compila el shader de
+ * vertices traducido de un programa nuevo (segundos o minutos en esta consola),
+ * sus lotes se saltaban o iban por la CPU: objetos que faltan, parpadeos y el
+ * juego a pedales la primera vez que sale cada cosa. Este es UNO para todos: un
+ * interprete del juego de instrucciones de la PICA escrito en Cg
+ * (reserva/vs_generico.cg), ya compilado en el VPK, que lee el programa de una
+ * tabla en memoria de la GPU (el buffer de uniformes 1). Es lento por vertice,
+ * pero solo hasta que llega el de verdad.
+ *
+ * La tabla, en float4: dos por instruccion desde 0 (kGenericVsMaxInstr como
+ * mucho) y, justo despues de la ultima que se alcanza, los patrones de swizzle
+ * que se usan (en Pokemon X pasan de 49), 13 cada uno: tres matrices 4x4 (fuentes 1, 2 y 3; la fila i elige la componente
+ * i, con el signo) y la mascara de destino. Instruccion aritmetica: a = (tipo,
+ * destino, fuente 1, fuente 2), b = (fuente 3 o comparacion x*8+y, patron, a que
+ * fuente va el registro de direccion, cual). De flujo: a = (tipo, destino,
+ * instrucciones, condicion op*4+refx*2+refy), b = (booleano, entero). Los tipos,
+ * los del shader. El destino de una salida ya es su atributo (output_map), o -1.
+ */
+constexpr u32 kGenericVsTableVec4 = 2688;
+constexpr u32 kGenericVsMaxInstr = 1024;
+
+/// Codifica el programa en 'table' (kGenericVsTableVec4 float4). Null si vale, o
+/// por que no: algo que el interprete no hace o que no cabe. El generico tiene
+/// ocho entradas (con dieciseis el compilador no acaba): cada registro de entrada
+/// que se lee va a una ranura, y 'slot_of_reg' dice cual (-1 si no se lee).
+const char* EncodeGenericVs(const Pica::ShaderSetup& setup,
+                            const Pica::Shader::Generator::PicaVSConfig& config,
+                            const Pica::Shader::Generator::GXM::VSInputs& inputs, float* table,
+                            std::array<s8, 16>& slot_of_reg, u32& reachable) {
+    using Pica::Shader::Generator::GXM::VSInputSource;
+    using nihstro::OpCode;
+    const auto& code = setup.GetProgramCode();
+    const auto& swizzle = setup.GetSwizzleData();
+    const auto& state = config.state;
+    std::memset(table, 0, kGenericVsTableVec4 * 4 * sizeof(float));
+    // Lo que no se alcanza se queda en END (tipo 30).
+    for (u32 pc = 0; pc < kGenericVsMaxInstr; pc++) {
+        table[pc * 8] = 30.0f;
+    }
+    // Los patrones se numeran al verlos y se colocan al final (ver arriba).
+    std::array<s16, 128> pattern_slot;
+    pattern_slot.fill(-1);
+    std::array<u32, 128> pattern_word{};
+    u32 patterns = 0;
+    u32 last_pc = 0;
+    std::bitset<kGenericVsMaxInstr> seen;
+    std::vector<u32> pending{state.main_offset};
+    // Las entradas, a su ranura (Pokemon X lee registros 8-15, 06-11); las
+    // temporales y los uniformes, tal cual.
+    slot_of_reg.fill(-1);
+    u32 slots_used = 0;
+    const auto map_source = [&](u32& reg) {
+        if (reg >= 16) {
+            return true;
+        }
+        // Un registro que no llena nada vale cero (como en el traductor): el
+        // codigo 200 del shader, sin ranura.
+        if (inputs[reg].kind != VSInputSource::Array &&
+            inputs[reg].kind != VSInputSource::Default) {
+            reg = 200;
+            return true;
+        }
+        if (slot_of_reg[reg] < 0) {
+            if (slots_used >= 8) {
+                return false;
+            }
+            slot_of_reg[reg] = static_cast<s8>(slots_used++);
+        }
+        reg = static_cast<u32>(slot_of_reg[reg]);
+        return true;
+    };
+    while (!pending.empty()) {
+        const u32 pc = pending.back();
+        pending.pop_back();
+        if (pc >= kGenericVsMaxInstr) {
+            return "vs generico: programa largo";
+        }
+        if (seen[pc]) {
+            continue;
+        }
+        seen[pc] = true;
+        last_pc = std::max(last_pc, pc);
+        const u32 w = code[pc];
+        u32 op = w >> 26;
+        if (op >= 0x38) {
+            op = 0x38;
+        } else if (op >= 0x30) {
+            op = 0x30;
+        } else if (op == 0x2F) {
+            op = 0x2E;
+        }
+        float* const a = table + pc * 8;
+        float* const b = a + 4;
+        // De momento el desplazamiento del patron (13 float4 cada uno); la base
+        // se suma al final.
+        const auto pattern = [&](u32 id) -> int {
+            if (pattern_slot[id] < 0) {
+                pattern_slot[id] = static_cast<s16>(patterns);
+                pattern_word[patterns] = swizzle[id];
+                patterns++;
+            }
+            return pattern_slot[id] * 13;
+        };
+        const auto dest_code = [&state](u32 dest) -> float {
+            if (dest >= 16) {
+                return static_cast<float>(dest);
+            }
+            return state.output_map[dest] < state.num_outputs
+                       ? static_cast<float>(state.output_map[dest])
+                       : -1.0f;
+        };
+        float kind = 0.0f;
+        switch (static_cast<OpCode::Id>(op)) {
+        case OpCode::Id::ADD: kind = 1; break;
+        case OpCode::Id::DP3: kind = 2; break;
+        case OpCode::Id::DP4: kind = 3; break;
+        case OpCode::Id::DPH: case OpCode::Id::DPHI: kind = 4; break;
+        case OpCode::Id::EX2: kind = 6; break;
+        case OpCode::Id::LG2: kind = 7; break;
+        case OpCode::Id::MUL: kind = 9; break;
+        case OpCode::Id::SGE: case OpCode::Id::SGEI: kind = 10; break;
+        case OpCode::Id::SLT: case OpCode::Id::SLTI: kind = 11; break;
+        case OpCode::Id::FLR: kind = 12; break;
+        case OpCode::Id::MAX: kind = 13; break;
+        case OpCode::Id::MIN: kind = 14; break;
+        case OpCode::Id::RCP: kind = 15; break;
+        case OpCode::Id::RSQ: kind = 16; break;
+        case OpCode::Id::MOVA: kind = 17; break;
+        case OpCode::Id::MOV: kind = 18; break;
+        case OpCode::Id::CMP: kind = 19; break;
+        case OpCode::Id::MADI: case OpCode::Id::MAD: kind = 20; break;
+        case OpCode::Id::END: kind = 30; break;
+        case OpCode::Id::NOP: kind = 31; break;
+        case OpCode::Id::JMPC: kind = 32; break;
+        case OpCode::Id::JMPU: kind = 33; break;
+        case OpCode::Id::CALL: kind = 34; break;
+        case OpCode::Id::CALLC: kind = 35; break;
+        case OpCode::Id::CALLU: kind = 36; break;
+        case OpCode::Id::IFU: kind = 37; break;
+        case OpCode::Id::IFC: kind = 38; break;
+        case OpCode::Id::LOOP: kind = 39; break;
+        case OpCode::Id::BREAK: kind = 40; break;
+        case OpCode::Id::BREAKC: kind = 41; break;
+        default:
+            return "vs generico: instruccion sin interpretar";
+        }
+        a[0] = kind;
+        if (kind == 20) {
+            const bool inverted = op == static_cast<u32>(OpCode::Id::MADI);
+            u32 src1 = (w >> 17) & 0x1F;
+            u32 src2 = inverted ? (w >> 12) & 0x1F : (w >> 10) & 0x7F;
+            u32 src3 = inverted ? (w >> 5) & 0x7F : (w >> 5) & 0x1F;
+            if (!map_source(src1) || !map_source(src2) || !map_source(src3)) {
+                return "vs generico: mas de ocho entradas";
+            }
+            const int base = pattern(w & 0x1F);
+            a[1] = dest_code((w >> 24) & 0x1F);
+            a[2] = static_cast<float>(src1);
+            a[3] = static_cast<float>(src2);
+            b[0] = static_cast<float>(src3);
+            b[1] = static_cast<float>(base);
+            b[2] = inverted ? 2.0f : 1.0f;
+            b[3] = static_cast<float>((w >> 22) & 3);
+            pending.push_back(pc + 1);
+        } else if (kind < 30) {
+            const bool inverted = op == static_cast<u32>(OpCode::Id::DPHI) ||
+                                  op == static_cast<u32>(OpCode::Id::SGEI) ||
+                                  op == static_cast<u32>(OpCode::Id::SLTI);
+            u32 src1 = inverted ? (w >> 14) & 0x1F : (w >> 12) & 0x7F;
+            u32 src2 = inverted ? (w >> 7) & 0x7F : (w >> 7) & 0x1F;
+            const bool unary = kind == 6 || kind == 7 || kind == 12 || kind == 15 ||
+                               kind == 16 || kind == 17 || kind == 18;
+            if (!map_source(src1)) {
+                return "vs generico: mas de ocho entradas";
+            }
+            // La segunda de una de un operando es basura: no gasta ranura.
+            if (unary) {
+                src2 = 16;
+            } else if (!map_source(src2)) {
+                return "vs generico: mas de ocho entradas";
+            }
+            const int base = pattern(w & 0x7F);
+            a[1] = (kind == 17 || kind == 19) ? -1.0f : dest_code((w >> 21) & 0x1F);
+            a[2] = static_cast<float>(src1);
+            a[3] = static_cast<float>(src2);
+            b[0] = kind == 19 ? static_cast<float>(((w >> 24) & 7) * 8 + ((w >> 21) & 7)) : 0.0f;
+            b[1] = static_cast<float>(base);
+            b[2] = inverted ? 1.0f : 0.0f;
+            b[3] = static_cast<float>((w >> 19) & 3);
+            pending.push_back(pc + 1);
+        } else {
+            const u32 num = w & 0xFF;
+            const u32 dest = (w >> 10) & 0xFFF;
+            a[1] = static_cast<float>(dest);
+            a[2] = static_cast<float>(num);
+            a[3] = static_cast<float>(((w >> 22) & 3) * 4 + ((w >> 25) & 1) * 2 + ((w >> 24) & 1));
+            b[0] = static_cast<float>((w >> 22) & 0xF);
+            b[1] = static_cast<float>((w >> 22) & 3);
+            if (kind != 30) {
+                pending.push_back(pc + 1);
+            }
+            if (kind >= 32 && kind <= 36) {
+                pending.push_back(dest);
+                if (kind >= 34 && dest + num > kGenericVsMaxInstr) {
+                    return "vs generico: programa largo";
+                }
+            } else if (kind == 37 || kind == 38) {
+                pending.push_back(dest);
+                pending.push_back(dest + num);
+            } else if (kind == 39) {
+                pending.push_back(dest + 1);
+            }
+        }
+    }
+    reachable = static_cast<u32>(seen.count());
+    // Los patrones, detras de la ultima instruccion que se alcanza.
+    const u32 base = (last_pc + 1) * 2;
+    if (base + patterns * 13 > kGenericVsTableVec4) {
+        return "vs generico: no cabe en la tabla";
+    }
+    for (u32 pc = 0; pc <= last_pc; pc++) {
+        float* const a = table + pc * 8;
+        if (seen[pc] && a[0] < 29.5f) {
+            a[5] += static_cast<float>(base);
+        }
+    }
+    static constexpr u32 kNegate[3] = {4, 13, 22};
+    static constexpr u32 kSelect[3] = {11, 20, 29};
+    for (u32 n = 0; n < patterns; n++) {
+        float* const p = table + (base + n * 13) * 4;
+        const u32 word = pattern_word[n];
+        std::memset(p, 0, 13 * 4 * sizeof(float));
+        for (u32 src = 0; src < 3; src++) {
+            const float sign = ((word >> kNegate[src]) & 1) != 0 ? -1.0f : 1.0f;
+            for (u32 i = 0; i < 4; i++) {
+                const u32 sel = (word >> (kSelect[src] - 2 * i)) & 3;
+                p[(src * 4 + i) * 4 + sel] = sign;
+            }
+        }
+        for (u32 i = 0; i < 4; i++) {
+            p[12 * 4 + i] = (word & (8u >> i)) != 0 ? 1.0f : 0.0f;
+        }
+    }
+    return nullptr;
+}
+
+/// vs_outmap y vs_entry del generico: de que componente de que atributo sale
+/// cada salida (atributo*4+componente, o -1 para el uno de lo no mapeado).
+void GenericVsConsts(const Pica::Shader::Generator::PicaVSConfig& config, float* out) {
+    const auto maps = config.state.gs_state.GetSemanticMaps();
+    const auto at = [&](u32 semantic) -> float {
+        const u32 attrib = maps[semantic].attribute_index;
+        if (attrib >= config.state.gs_state.gs_output_attributes_count) {
+            return -1.0f;
+        }
+        return static_cast<float>(attrib * 4 + maps[semantic].component_index);
+    };
+    // Posicion, color, coordenadas 0 y 1, coordenada 2 y W de la 0, cuaternion,
+    // vista (los numeros de VSOutputAttributes::Semantic).
+    static constexpr int kOrder[24] = {0,  1,  2,  3,  8,  9,  10, 11, 12, 13, 14, 15,
+                                       22, 23, 16, -1, 4,  5,  6,  7,  18, 19, 20, -1};
+    for (u32 i = 0; i < 24; i++) {
+        out[i] = kOrder[i] < 0 ? -1.0f : at(static_cast<u32>(kOrder[i]));
+    }
+    out[24] = static_cast<float>(config.state.main_offset);
+    out[25] = out[26] = out[27] = 0.0f;
 }
 } // Anonymous namespace
 
@@ -2018,6 +2297,9 @@ struct RasterizerGXM::PipelineCache {
         const SceGxmProgramParameter* fog_lut = nullptr;
         const SceGxmProgramParameter* fog_color = nullptr;
         const SceGxmProgramParameter* tex_border_color = nullptr;
+        /// Ancho, alto y sesgo de la textura de sombra (0.4.6.4).
+        const SceGxmProgramParameter* shadow_params = nullptr;
+        UniformSlot shadow_params_slot;
         /// Tablas de busqueda de la iluminacion, como textura de 256x24.
         const SceGxmProgramParameter* lighting_lut = nullptr;
         u8 lighting_lut_unit = 0;
@@ -2571,7 +2853,8 @@ struct RasterizerGXM::PipelineCache {
         // la escriben las variantes _proj. Mismo razonamiento que arriba.
         const bool needs_w =
             config.texture.texture0_type.Value() ==
-            Pica::TexturingRegs::TextureConfig::Projection2D;
+                Pica::TexturingRegs::TextureConfig::Projection2D ||
+            config.texture.texture0_type.Value() == Pica::TexturingRegs::TextureConfig::Shadow2D;
         if (needs_w && FormatFor(needs_lighting, true).program == nullptr) {
             return fail("sin vs de textura proyectada");
         }
@@ -2663,6 +2946,7 @@ struct RasterizerGXM::PipelineCache {
         entry->fog_lut = sceGxmProgramFindParameterByName(gxp, "fog_lut");
         entry->fog_color = sceGxmProgramFindParameterByName(gxp, "fog_color");
         entry->tex_border_color = sceGxmProgramFindParameterByName(gxp, "tex_border_color");
+        entry->shadow_params = sceGxmProgramFindParameterByName(gxp, "shadow_params");
         entry->lighting_lut = sceGxmProgramFindParameterByName(gxp, "lighting_lut");
         if (entry->lighting_lut != nullptr) {
             entry->lighting_lut_unit =
@@ -2686,6 +2970,7 @@ struct RasterizerGXM::PipelineCache {
         entry->fog_lut_slot = ProbeUniform(entry->fog_lut, 256);
         entry->fog_color_slot = ProbeUniform(entry->fog_color, 3);
         entry->tex_border_color_slot = ProbeUniform(entry->tex_border_color, 12);
+        entry->shadow_params_slot = ProbeUniform(entry->shadow_params, 3);
         entry->light_specular_0_slot = ProbeUniform(entry->light_specular_0, 32);
         entry->light_specular_1_slot = ProbeUniform(entry->light_specular_1, 32);
         entry->light_diffuse_slot = ProbeUniform(entry->light_diffuse, 32);
@@ -3091,14 +3376,30 @@ struct RasterizerGXM::PipelineCache {
             return nullptr;
         }
         const bool lit_variant = config.lighting.enable != 0;
-        if (config.texture.texture0_type.Value() ==
-                Pica::TexturingRegs::TextureConfig::Projection2D ||
-            (lit_variant && lit.program == nullptr)) {
+        // Por que no sirve (0.4.7.0): para saber que lotes se saltan aun.
+        const auto refuse = [](u32 why) -> const Entry* {
+            static constexpr const char* kWhy[4] = {"textura proyectada", "textura de sombra",
+                                                    "luz sin su programa", "aun no esta lista"};
+            static u32 counts[4] = {};
+            const u32 n = ++counts[why];
+            if (n == 1 || n == 100 || n == 10000) {
+                NoteFmt("gxm reserva", "no sirve ({}): {} lotes", kWhy[why], n);
+            }
             return nullptr;
+        };
+        if (config.texture.texture0_type.Value() ==
+            Pica::TexturingRegs::TextureConfig::Projection2D) {
+            return refuse(0);
+        }
+        if (config.texture.texture0_type.Value() == Pica::TexturingRegs::TextureConfig::Shadow2D) {
+            return refuse(1);
+        }
+        if (lit_variant && lit.program == nullptr) {
+            return refuse(2);
         }
         ReserveProgram& program = reserve[lit_variant ? 1 : 0];
         if (!ReserveReady(program)) {
-            return nullptr;
+            return refuse(3);
         }
         const u64 key = (static_cast<u64>(lit_variant ? 1u : 0u) << 32) | blend_bits;
         Entry* entry = nullptr;
@@ -3541,6 +3842,18 @@ struct RasterizerGXM::HwShaderCache {
         bool job_shared = false;
         /// La fuente unificada que compila el trabajo de este (0 si no).
         u64 unified_hash = 0;
+        /// El generico (0.4.7.0, ver EncodeGenericVs): sus uniformes propios y el
+        /// buffer de uniformes que lleva la tabla del programa.
+        bool generic = false;
+        const SceGxmProgramParameter* uniform_outmap = nullptr;
+        const SceGxmProgramParameter* uniform_entry = nullptr;
+        UniformSlot uniform_outmap_slot, uniform_entry_slot;
+        u32 table_buffer = 1;
+        /// El propio (0.4.7.1, ver Own): el contenedor es nuestro (no hay salida
+        /// del compilador) y vive aqui mientras este registrado.
+        bool own = false;
+        std::vector<u8> own_gxp;
+        u64 own_hash = 0;
     };
 
     static constexpr unsigned long long kAsyncVsWindowUs = 1000000;
@@ -3569,6 +3882,25 @@ struct RasterizerGXM::HwShaderCache {
             if (program->output != nullptr) {
                 ReleaseCgOutput(program->output);
             }
+        }
+        for (auto& [key, program] : own_programs) {
+            if (program->registered) {
+                sceGxmShaderPatcherUnregisterProgram(patcher, program->id);
+            }
+        }
+        for (auto& generic : generic_vs) {
+            if (generic.program.registered) {
+                sceGxmShaderPatcherUnregisterProgram(patcher, generic.program.id);
+            }
+            if (generic.program.output != nullptr) {
+                ReleaseCgOutput(generic.program.output);
+            }
+        }
+        if (generic_memory != nullptr) {
+            sceGxmUnmapMemory(generic_memory);
+        }
+        if (generic_block >= 0) {
+            sceKernelFreeMemBlock(generic_block);
         }
     }
 
@@ -3731,7 +4063,8 @@ struct RasterizerGXM::HwShaderCache {
             vertex_program = nullptr;
         }
         // Tambien el fallo: nullptr en el mapa es "no se puede", sin reintentar.
-        BlackBox::NoteVertexProgram(vertex_program, CgOutputHash(program.output),
+        BlackBox::NoteVertexProgram(vertex_program,
+                                    program.own ? program.own_hash : CgOutputHash(program.output),
                                     program.gxp != nullptr ? sceGxmProgramGetSize(program.gxp) : 0);
         linked.emplace(key, vertex_program);
         return vertex_program;
@@ -3798,6 +4131,9 @@ private:
             auto source = GenerateVertexShader(setup, config, extra, inputs, write_lighting,
                                                write_w, &generator_reason);
             g_cg_variant.store(0, std::memory_order_relaxed);
+            if (source.has_value()) {
+                Gxm::VsOverrideSource(*source);
+            }
             if (g_dump_vs && source.has_value()) {
                 DumpVsSource(*source);
             }
@@ -4071,6 +4407,25 @@ private:
         CgSubmit(std::move(job));
     }
 
+    /// Los parametros del programa ya registrado, por nombre: los mismos en el de
+    /// Cg y en el propio.
+    static void BindParameters(Program& program) {
+        program.uniform_f = sceGxmProgramFindParameterByName(program.gxp, "vs_f");
+        program.uniform_i = sceGxmProgramFindParameterByName(program.gxp, "vs_i");
+        program.uniform_b = sceGxmProgramFindParameterByName(program.gxp, "vs_b");
+        program.uniform_default = sceGxmProgramFindParameterByName(program.gxp, "vs_default");
+        program.uniform_wbuf = sceGxmProgramFindParameterByName(program.gxp, "vs_wbuf");
+        program.uniform_f_slot = ProbeUniform(program.uniform_f, 96 * 4);
+        program.uniform_i_slot = ProbeUniform(program.uniform_i, 16);
+        program.uniform_b_slot = ProbeUniform(program.uniform_b, 16);
+        program.uniform_default_slot = ProbeUniform(program.uniform_default, 16 * 4);
+        program.uniform_wbuf_slot = ProbeUniform(program.uniform_wbuf, 2);
+        for (u32 reg = 0; reg < 16; reg++) {
+            const std::string name = fmt::format("vs_in{}", reg);
+            program.inputs[reg] = sceGxmProgramFindParameterByName(program.gxp, name.c_str());
+        }
+    }
+
     /// Registra en el parcheador lo que salio del compilador (o de la cache).
     void Finish(Program& program, const SceShaccCgCompileOutput* output, u32 used_variant) {
         program.output = output;
@@ -4095,20 +4450,7 @@ private:
             return;
         }
         program.registered = true;
-        program.uniform_f = sceGxmProgramFindParameterByName(program.gxp, "vs_f");
-        program.uniform_i = sceGxmProgramFindParameterByName(program.gxp, "vs_i");
-        program.uniform_b = sceGxmProgramFindParameterByName(program.gxp, "vs_b");
-        program.uniform_default = sceGxmProgramFindParameterByName(program.gxp, "vs_default");
-        program.uniform_wbuf = sceGxmProgramFindParameterByName(program.gxp, "vs_wbuf");
-        program.uniform_f_slot = ProbeUniform(program.uniform_f, 96 * 4);
-        program.uniform_i_slot = ProbeUniform(program.uniform_i, 16);
-        program.uniform_b_slot = ProbeUniform(program.uniform_b, 16);
-        program.uniform_default_slot = ProbeUniform(program.uniform_default, 16 * 4);
-        program.uniform_wbuf_slot = ProbeUniform(program.uniform_wbuf, 2);
-        for (u32 reg = 0; reg < 16; reg++) {
-            const std::string name = fmt::format("vs_in{}", reg);
-            program.inputs[reg] = sceGxmProgramFindParameterByName(program.gxp, name.c_str());
-        }
+        BindParameters(program);
         program.unified = (used_variant & Pica::Shader::Generator::GXM::kCgUnifiedInputs) != 0;
         if (program.unified) {
             for (u32 reg = 0; reg < 16; reg++) {
@@ -4130,8 +4472,446 @@ private:
         }
     }
 
+public:
+    /**
+     * EL PROGRAMA PROPIO (0.4.7.1, ver usse_vs_gen.h). El mismo programa de la
+     * PICA traducido directamente a USSE, sin compilador: se hace en el momento
+     * (decenas o cientos de microsegundos) y se registra como cualquier otro.
+     * Lleva los mismos parametros con los mismos nombres que el de Cg (vs_f,
+     * vs_i, vs_b, vs_default, vs_wbuf, vs_in<registro>), asi que el resto del
+     * lote no distingue uno de otro. No esta optimizado: es para dibujar YA
+     * mientras el de Cg compila, y para los que Cg no puede compilar.
+     *
+     * Los fallos se recuerdan como en los demas niveles. 'why' dice por que no.
+     */
+    const Program* Own(u64 key, const Pica::ShaderSetup& setup,
+                       const Pica::Shader::Generator::PicaVSConfig& config,
+                       const Pica::Shader::Generator::GXM::VSInputs& inputs, bool write_lighting,
+                       bool write_w, bool w_buffer, const char** why) {
+        const auto it = own_programs.find(key);
+        if (it != own_programs.end()) {
+            if (!it->second->usable) {
+                *why = it->second->reason;
+                return nullptr;
+            }
+            return it->second.get();
+        }
+        if (own_programs.size() >= kMaxPrograms) {
+            *why = "vs propio: tope de programas";
+            return nullptr;
+        }
+        auto owned = std::make_unique<Program>();
+        Program& program = *owned;
+        program.own = true;
+        program.reason = "vs propio";
+        program.used_f = UsedFloatUniforms(setup);
+        const unsigned long long begin = Common::VitaMicros();
+
+        Usse::VsRequest request;
+        request.code = setup.GetProgramCode().data();
+        request.swizzle = setup.GetSwizzleData().data();
+        request.main_offset = config.state.main_offset;
+        for (u32 reg = 0; reg < 16; reg++) {
+            const u32 attribute = config.state.output_map[reg];
+            request.output_attr[reg] = attribute < 16 ? static_cast<s8>(attribute) : s8{-1};
+        }
+        const auto semantic_maps = config.state.gs_state.GetSemanticMaps();
+        for (u32 semantic = 0; semantic < 24; semantic++) {
+            const auto& map = semantic_maps[semantic];
+            request.semantic[semantic] =
+                map.attribute_index < 16
+                    ? static_cast<s8>(map.attribute_index * 4 + map.component_index)
+                    : s8{-1};
+        }
+        for (u32 reg = 0; reg < 16; reg++) {
+            request.inputs[reg].kind = inputs[reg].kind;
+            request.inputs[reg].components = inputs[reg].components;
+        }
+        request.lit = write_lighting;
+        request.proj = write_w;
+        request.wbuffer = w_buffer;
+
+        Usse::VsResult result;
+        const bool generated = Usse::GenerateVs(request, result);
+        const unsigned long long spent = Common::VitaMicros() - begin;
+        const auto fail = [&](const char* reason, int rc) -> const Program* {
+            program.reason = reason;
+            program.gxp = nullptr;
+            RasterizerGXM::usse_vs_failed.fetch_add(1, std::memory_order_relaxed);
+            static u32 fail_notes = 0;
+            if (fail_notes < 12) {
+                fail_notes++;
+                NoteFmt("gxm vs", "propio {:016x}: {} (rc {:#x}, {} instr, {} bytes)", key, reason,
+                        static_cast<u32>(rc), result.instructions, program.own_gxp.size());
+            }
+            // Los dos primeros que GXM no acepta, a la tarjeta: para mirarlos en el PC.
+            static u32 dumped = 0;
+            if (rc != 0 && dumped < 2 && !program.own_gxp.empty()) {
+                const std::string path =
+                    fmt::format("ux0:/data/azahar/usse_fallo_{}.gxp", dumped++);
+                const SceUID fd =
+                    sceIoOpen(path.c_str(), SCE_O_WRONLY | SCE_O_CREAT | SCE_O_TRUNC, 0777);
+                if (fd >= 0) {
+                    sceIoWrite(fd, program.own_gxp.data(), program.own_gxp.size());
+                    sceIoClose(fd);
+                }
+            }
+            *why = program.reason;
+            own_programs.emplace(key, std::move(owned));
+            return nullptr;
+        };
+        if (!generated) {
+            return fail(result.reason != nullptr ? result.reason : "vs propio: traducir", 0);
+        }
+        program.own_gxp = std::move(result.gxp);
+        program.own_hash =
+            Common::ComputeHash64(program.own_gxp.data(), program.own_gxp.size());
+        program.gxp = reinterpret_cast<const SceGxmProgram*>(program.own_gxp.data());
+        if (const int rc = sceGxmProgramCheck(program.gxp); rc != 0) {
+            return fail("vs propio: GXM no lo da por bueno", rc);
+        }
+        if (const int rc = sceGxmShaderPatcherRegisterProgram(patcher, program.gxp, &program.id);
+            rc != 0) {
+            return fail("vs propio: registrar", rc);
+        }
+        program.registered = true;
+        BindParameters(program);
+        program.usable = true;
+        const u32 built = RasterizerGXM::usse_vs_built.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (built <= 24) {
+            NoteFmt("gxm vs",
+                    "propio {:016x}: {} instrucciones, {} bytes, {} us (temporales {}, PA {}, SA {})",
+                    key, result.instructions, program.own_gxp.size(), spent, result.temp_words,
+                    result.pa_words, result.sa_words);
+        }
+        const Program* const ready = owned.get();
+        own_programs.emplace(key, std::move(owned));
+        return ready;
+    }
+
+    /// Un propio que no enlaza con ninguna disposicion: que no se vuelva a probar.
+    void DisableOwn(u64 key, const char* reason) {
+        const auto it = own_programs.find(key);
+        if (it != own_programs.end()) {
+            it->second->usable = false;
+            it->second->reason = reason;
+        }
+    }
+
+    /// Ver EncodeGenericVs: el programa generico de una variante de salidas
+    /// (luz*2+proyeccion), leido del VPK la primera vez que hace falta.
+    const Program* Generic(u32 variant) {
+        // Las cuatro a la vez, la primera vez que hace falta una: registrar una
+        // de 20 KB en mitad del juego fallaba (0x805b0022, 06-11).
+        if (!generic_vs[0].tried) {
+            for (u32 v = 0; v < 4; v++) {
+                generic_vs[v].tried = true;
+                LoadGeneric(generic_vs[v].program, v);
+            }
+        }
+        const GenericVs& generic = generic_vs[variant & 3];
+        return generic.program.usable ? &generic.program : nullptr;
+    }
+
+    /**
+     * El generico para el programa 'key': la vista del programa (el de la
+     * variante con sus entradas en los registros que lee este, ver
+     * EncodeGenericVs) y su tabla en memoria de la GPU; o null (y por que). Una
+     * tabla por programa, en kGenericSlots huecos que se reciclan: uno que no se
+     * haya usado en kGenericQuietPresents presentaciones ya no lo lee la GPU.
+     */
+    const Program* GenericFor(u64 key, u32 variant, const Pica::ShaderSetup& setup,
+                              const Pica::Shader::Generator::PicaVSConfig& config,
+                              const Pica::Shader::Generator::GXM::VSInputs& inputs, u32 present,
+                              u32 vertices, const void** out_table, const char** why) {
+        const Program* base = Generic(variant);
+        if (base == nullptr) {
+            *why = "vs generico sin programa";
+            return nullptr;
+        }
+        std::array<s8, 16> slot_of_reg;
+        u32 reachable = 0;
+        const void* table =
+            GenericTable(key, setup, config, inputs, present, slot_of_reg, reachable, why);
+        if (table == nullptr) {
+            return nullptr;
+        }
+        /**
+         * EL PRESUPUESTO (0.4.7.0). El interprete cuesta en el chip cientos de
+         * instrucciones por cada una de la PICA: un modelo grande de Pokemon X
+         * llego a 261 ms en una sola superficie (y con eso el perro guardian de
+         * la GPU anda cerca). Vertices x instrucciones alcanzables, por lote y
+         * por presentacion; lo que no cabe se salta como antes.
+         */
+        if (present != budget_present) {
+            budget_present = present;
+            budget_left = kGenericFrameBudget;
+        }
+        const u64 cost = static_cast<u64>(vertices) * std::max<u32>(reachable, 1);
+        if (cost > kGenericBatchBudget || cost > budget_left) {
+            RasterizerGXM::generic_vs_over.fetch_add(1, std::memory_order_relaxed);
+            *why = "vs generico sin presupuesto";
+            return nullptr;
+        }
+        budget_left -= cost;
+        RasterizerGXM::generic_vs_cost.fetch_add(cost, std::memory_order_relaxed);
+        const u64 view_key = Common::HashCombine(key, 0x6E0E0000ull | variant);
+        auto it = generic_views.find(view_key);
+        if (it == generic_views.end()) {
+            auto view = std::make_unique<Program>(*base);
+            // La vista no es duena de nada: el programa es el de la variante.
+            view->registered = false;
+            view->output = nullptr;
+            view->inputs = {};
+            view->uniform_keep = {};
+            view->uniform_fill = {};
+            /**
+             * GXM no enlaza un programa con entradas sin atributo (0x805b0003): las
+             * ranuras que este programa no usa van a registros que no lee, y el
+             * camino unificado les pone el atributo de relleno (con keep y fill a
+             * cero si el registro no tiene fuente).
+             */
+            std::array<bool, 8> slot_used{};
+            for (const s8 slot : slot_of_reg) {
+                if (slot >= 0) {
+                    slot_used[slot] = true;
+                }
+            }
+            u32 free_reg = 0;
+            for (u32 slot = 0; slot < 8; slot++) {
+                if (slot_used[slot]) {
+                    continue;
+                }
+                while (free_reg < 16 && slot_of_reg[free_reg] >= 0) {
+                    free_reg++;
+                }
+                if (free_reg >= 16) {
+                    break;
+                }
+                slot_of_reg[free_reg++] = static_cast<s8>(slot);
+            }
+            for (u32 reg = 0; reg < 16; reg++) {
+                const s8 slot = slot_of_reg[reg];
+                if (slot < 0) {
+                    continue;
+                }
+                view->inputs[reg] = base->inputs[slot];
+                view->uniform_keep[reg] = base->uniform_keep[slot];
+                view->uniform_fill[reg] = base->uniform_fill[slot];
+                view->uniform_keep_slot[reg] = base->uniform_keep_slot[slot];
+                view->uniform_fill_slot[reg] = base->uniform_fill_slot[slot];
+            }
+            it = generic_views.emplace(view_key, std::move(view)).first;
+        }
+        *out_table = table;
+        return it->second.get();
+    }
+
+    const void* GenericTable(u64 key, const Pica::ShaderSetup& setup,
+                             const Pica::Shader::Generator::PicaVSConfig& config,
+                             const Pica::Shader::Generator::GXM::VSInputs& inputs, u32 present,
+                             std::array<s8, 16>& slot_of_reg, u32& reachable,
+                             const char** why) {
+        for (u32 i = 0; i < kGenericSlots; i++) {
+            if (generic_slots[i].used && generic_slots[i].key == key) {
+                generic_slots[i].present = present;
+                slot_of_reg = generic_slots[i].slot_of_reg;
+                reachable = generic_slots[i].reachable;
+                return generic_memory + i * kGenericTableBytes;
+            }
+        }
+        if (generic_bad.count(key) != 0) {
+            *why = "vs generico no sirve";
+            return nullptr;
+        }
+        if (!EnsureGenericMemory()) {
+            *why = "vs generico sin memoria";
+            return nullptr;
+        }
+        static float table[kGenericVsTableVec4 * 4];
+        if (const char* bad =
+                EncodeGenericVs(setup, config, inputs, table, slot_of_reg, reachable)) {
+            generic_bad.insert(key);
+            static u32 bad_notes = 0;
+            if (bad_notes < 8) {
+                bad_notes++;
+                u32 arrays = 0;
+                u32 defaults = 0;
+                for (const auto& input : inputs) {
+                    arrays += input.kind == Pica::Shader::Generator::GXM::VSInputSource::Array;
+                    defaults +=
+                        input.kind == Pica::Shader::Generator::GXM::VSInputSource::Default;
+                }
+                NoteFmt("gxm vs generico", "{:016x}: {} ({} de flujo, {} por defecto)", key, bad,
+                        arrays, defaults);
+            }
+            *why = bad;
+            return nullptr;
+        }
+        u32 at = kGenericSlots;
+        for (u32 i = 0; i < kGenericSlots; i++) {
+            const GenericSlot& slot = generic_slots[i];
+            if (!slot.used) {
+                at = i;
+                break;
+            }
+            if (present - slot.present >= kGenericQuietPresents &&
+                (at == kGenericSlots || slot.present < generic_slots[at].present)) {
+                at = i;
+            }
+        }
+        if (at == kGenericSlots) {
+            *why = "vs generico sin hueco";
+            return nullptr;
+        }
+        u8* const dest = generic_memory + at * kGenericTableBytes;
+        std::memcpy(dest, table, kGenericTableBytes);
+        generic_slots[at] = {key, present, true, slot_of_reg, reachable};
+        return dest;
+    }
+
+private:
+    struct GenericVs {
+        Program program;
+        bool tried = false;
+    };
+    struct GenericSlot {
+        u64 key = 0;
+        u32 present = 0;
+        bool used = false;
+        std::array<s8, 16> slot_of_reg{};
+        u32 reachable = 0;
+    };
+    static constexpr u32 kGenericTableBytes = kGenericVsTableVec4 * 16;
+    static constexpr u32 kGenericSlots = 32;
+    static constexpr u32 kGenericQuietPresents = 8;
+    /**
+     * Medido en Pokemon X (07-11): cada vertice x instruccion cuesta 30-40 ns de
+     * chip, y un modelo de personaje pasa de 300.000 (unos 10 ms). Con esto el
+     * generico se queda en unos 10 ms por presentacion como mucho.
+     */
+    static constexpr u64 kGenericFrameBudget = 300000;
+    static constexpr u64 kGenericBatchBudget = 300000;
+    u32 budget_present = ~0u;
+    u64 budget_left = 0;
+
+
+    void LoadGeneric(Program& program, u32 variant) {
+        program.reason = "vs generico";
+        const std::string app = fmt::format("app0:/vs_generico_{}.gxp", variant);
+        const std::string data = fmt::format("ux0:/data/azahar/vs_generico_{}.gxp", variant);
+        program.output = LoadProgramFile(app.c_str());
+        if (program.output == nullptr) {
+            program.output = LoadProgramFile(data.c_str());
+        }
+        if (program.output == nullptr) {
+            NoteFmt("gxm vs generico", "falta {}: sin generico", app);
+            return;
+        }
+        // Ver EL REGISTRO PUEDE FALLAR (la reserva): hasta tres copias.
+        int rc = -1;
+        for (u32 attempt = 0; attempt < 3 && program.output != nullptr; attempt++) {
+            program.gxp = reinterpret_cast<const SceGxmProgram*>(program.output->programData);
+            const int check = sceGxmProgramCheck(program.gxp);
+            rc = sceGxmShaderPatcherRegisterProgram(patcher, program.gxp, &program.id);
+            if (rc == 0) {
+                break;
+            }
+            NoteFmt("gxm vs generico",
+                    "variante {}: no se registra, err {:#x}, check {:#x}, alineado +{}, intento {}",
+                    variant, static_cast<u32>(rc), static_cast<u32>(check),
+                    static_cast<u32>(reinterpret_cast<uintptr_t>(program.gxp) & 63u), attempt + 1);
+            ReleaseCgOutput(program.output);
+            program.gxp = nullptr;
+            program.output = LoadProgramFile(app.c_str());
+            if (program.output == nullptr) {
+                program.output = LoadProgramFile(data.c_str());
+            }
+        }
+        if (rc != 0) {
+            if (program.output != nullptr) {
+                ReleaseCgOutput(program.output);
+            }
+            program.output = nullptr;
+            program.gxp = nullptr;
+            return;
+        }
+        program.registered = true;
+        const auto find = [&program](const char* name) {
+            return sceGxmProgramFindParameterByName(program.gxp, name);
+        };
+        program.uniform_f = find("vs_f");
+        program.uniform_i = find("vs_i");
+        program.uniform_b = find("vs_b");
+        program.uniform_outmap = find("vs_outmap");
+        program.uniform_entry = find("vs_entry");
+        program.uniform_f_slot = ProbeUniform(program.uniform_f, 96 * 4);
+        program.uniform_i_slot = ProbeUniform(program.uniform_i, 16);
+        program.uniform_b_slot = ProbeUniform(program.uniform_b, 16);
+        program.uniform_outmap_slot = ProbeUniform(program.uniform_outmap, 24);
+        program.uniform_entry_slot = ProbeUniform(program.uniform_entry, 4);
+        for (u32 reg = 0; reg < 8; reg++) {
+            program.inputs[reg] = find(fmt::format("vs_in{}", reg).c_str());
+            program.uniform_keep[reg] = find(fmt::format("vs_in_keep{}", reg).c_str());
+            program.uniform_fill[reg] = find(fmt::format("vs_in_fill{}", reg).c_str());
+            program.uniform_keep_slot[reg] = ProbeUniform(program.uniform_keep[reg], 4);
+            program.uniform_fill_slot[reg] = ProbeUniform(program.uniform_fill[reg], 4);
+        }
+        const SceGxmProgramParameter* table = find("vs_prog");
+        if (table == nullptr || program.uniform_f == nullptr || program.uniform_i == nullptr ||
+            program.uniform_b == nullptr || program.uniform_outmap == nullptr ||
+            program.uniform_entry == nullptr) {
+            NoteFmt("gxm vs generico", "variante {}: le faltan parametros", variant);
+            return;
+        }
+        program.table_buffer = sceGxmProgramParameterGetContainerIndex(table);
+        program.unified = true;
+        program.generic = true;
+        program.usable = true;
+        NoteFmt("gxm vs generico", "variante {} lista ({} bytes, tabla en el buffer {})", variant,
+                program.output->programSize, program.table_buffer);
+    }
+
+    bool EnsureGenericMemory() {
+        if (generic_memory_tried) {
+            return generic_memory != nullptr;
+        }
+        generic_memory_tried = true;
+        const SceSize bytes = (kGenericSlots * kGenericTableBytes + 0xFFFu) & ~0xFFFu;
+        const SceUID uid = sceKernelAllocMemBlock(
+            "azahar_vs_generico", SCE_KERNEL_MEMBLOCK_TYPE_USER_RW_UNCACHE, bytes, nullptr);
+        if (uid < 0) {
+            NoteFmt("gxm vs generico", "sin memoria para las tablas: err {:#x}",
+                    static_cast<u32>(uid));
+            return false;
+        }
+        void* base = nullptr;
+        if (sceKernelGetMemBlockBase(uid, &base) < 0 ||
+            sceGxmMapMemory(base, bytes,
+                            static_cast<SceGxmMemoryAttribFlags>(SCE_GXM_MEMORY_ATTRIB_READ)) <
+                0) {
+            sceKernelFreeMemBlock(uid);
+            NoteFmt("gxm vs generico", "no se pudo mapear la memoria de las tablas");
+            return false;
+        }
+        generic_block = uid;
+        generic_memory = static_cast<u8*>(base);
+        return true;
+    }
+
+    std::array<GenericVs, 4> generic_vs{};
+    std::array<GenericSlot, kGenericSlots> generic_slots{};
+    std::unordered_set<u64> generic_bad;
+    std::unordered_map<u64, std::unique_ptr<Program>> generic_views;
+    SceUID generic_block = -1;
+    u8* generic_memory = nullptr;
+    bool generic_memory_tried = false;
+
     SceGxmShaderPatcher* patcher;
     std::unordered_map<u64, std::unique_ptr<Program>> programs;
+    /// Los propios (ver Own), por la misma clave. Aparte de 'programs': el de Cg
+    /// se sigue pidiendo y compilando igual, y cuando llega sustituye a este.
+    std::unordered_map<u64, std::unique_ptr<Program>> own_programs;
     std::unordered_map<u64, SceGxmVertexProgram*> linked;
     /// Ver ENTRADAS UNIFICADAS: lo que se esta compilando, por su fuente, y lo
     /// que no compilo.
@@ -4745,10 +5525,41 @@ void PatcherHostFree(void* /*user_data*/, void* memory) {
  * del rasterizador; el presentador sigue con el de vita2d.
  */
 bool RasterizerGXM::CreateShaderPatcher() {
-    constexpr SceSize kBufferBytes = 1u * 1024u * 1024u;
+    /**
+     * EL SHADER DE VERTICES GENERICO, APAGADO SALVO CON vs_generico.txt (0.4.7.0).
+     * Dibuja bien, pero en este chip cuesta unas 300 veces lo de un programa
+     * compilado: los modelos que faltan mientras se compila costaban 10-60 ms
+     * por fotograma (Pokemon X a 5-9 FPS), y con un presupuesto que no hunda
+     * los FPS apenas dibuja nada util. Los paquetes de serie ya quitan la
+     * compilacion donde los hay. Con el encendido, el buffer pasa a 4 MB: con 1
+     * MB solo se registraba UNO de los cuatro (los otros, 0x805b0022).
+     */
+    SceIoStat generic_flag{};
+    const bool generic_on = sceIoGetstat("ux0:/data/azahar/vs_generico.txt", &generic_flag) >= 0;
+    generic_vs.store(generic_on ? 1u : 0u, std::memory_order_relaxed);
+    /**
+     * SHADERS DE VERTICES PROPIOS, APAGADOS SALVO CON usse_vs.txt (0.4.7.1, ver
+     * usse_vs_gen.h). Hasta que esten probados en consola con juegos de verdad no
+     * se encienden solos: un programa de USSE mal hecho puede colgar la GPU. El
+     * primer caracter del fichero es el modo ('2': siempre el propio, para
+     * comparar pantallas); cualquier otra cosa, el modo 1.
+     */
+    {
+        u32 mode = 0;
+        const SceUID flag = sceIoOpen("ux0:/data/azahar/usse_vs.txt", SCE_O_RDONLY, 0);
+        if (flag >= 0) {
+            char first = 0;
+            mode = sceIoRead(flag, &first, 1) == 1 && first == '2' ? 2u : 1u;
+            sceIoClose(flag);
+        }
+        usse_vs.store(mode, std::memory_order_relaxed);
+        NoteFmt("gxm vs", "shaders de vertices propios (usse_vs.txt): {}",
+                mode == 0 ? "no" : mode == 2 ? "siempre (pruebas)" : "si");
+    }
+    const SceSize kBufferBytes = (generic_on ? 4u : 1u) * 1024u * 1024u;
     constexpr SceSize kVertexUsseBytes = 2u * 1024u * 1024u;
     constexpr SceSize kFragmentUsseBytes = 2u * 1024u * 1024u;
-    constexpr std::array<SceSize, 3> sizes{kBufferBytes, kVertexUsseBytes, kFragmentUsseBytes};
+    const std::array<SceSize, 3> sizes{kBufferBytes, kVertexUsseBytes, kFragmentUsseBytes};
     const auto fail = [this](const char* what, int rc) {
         NoteFmt("gxm init", "parcheador propio: {} err {:#x}; se usa el de vita2d", what,
                 static_cast<u32>(rc));
@@ -4803,7 +5614,8 @@ bool RasterizerGXM::CreateShaderPatcher() {
         own_patcher = nullptr;
         return fail("crear", rc);
     }
-    Common::VitaNote("gxm init", "parcheador propio: 1 MB de buffer y 2+2 MB de USSE");
+    NoteFmt("gxm init", "parcheador propio: {} MB de buffer y 2+2 MB de USSE{}", kBufferBytes >> 20,
+            generic_on ? " (shader de vertices generico encendido)" : "");
     return true;
 }
 
@@ -5120,6 +5932,7 @@ void RasterizerGXM::WaitFence(u32 fence, GpuWait why) {
      * de la valla (memoria sin cache, ~100 ns cada una) cubren los primeros
      * ~150 us sin llamar al sistema; "yield" no duerme, solo avisa al nucleo.
      */
+    const Common::ScopedGpuTag tag{Common::kGpuTagChipWait};
     for (u32 spin = 0; spin < 1500; spin++) {
         if (FenceDone(fence)) {
             return;
@@ -5150,6 +5963,7 @@ void RasterizerGXM::WaitGpu(GpuWait why) {
     // sceGxmFinish es idempotente: si la GPU ya ha terminado, vuelve ya.
     const unsigned long long finish_begin = Common::VitaMicros();
     const Common::ScopedVitaStage stage{"gxm espera a la gpu"};
+    const Common::ScopedGpuTag tag{Common::kGpuTagChipWait};
     sceGxmFinish(context);
     const unsigned long long waited = Common::VitaMicros() - finish_begin;
     Common::FrameStats::finish_us.fetch_add(waited, std::memory_order_relaxed);
@@ -5209,7 +6023,7 @@ void RasterizerGXM::WriteBack(Surface& surface, u32 site) {
     TrimLazyFills(surface.guest_address, surface.guest_stride * surface.height);
     u8* linear = static_cast<u8*>(surface.color_buffer.Data());
     u32 linear_stride = surface.color_stride * surface.rt_bpp;
-    if (surface.scale != 2) {
+    if (surface.scale != 4) {
         const u32 row_bytes = surface.width * surface.rt_bpp;
         scale_scratch.resize(static_cast<std::size_t>(row_bytes) * surface.height);
         Resample(linear, linear_stride, Phys(surface.width, surface.scale),
@@ -5242,7 +6056,7 @@ void RasterizerGXM::Reload(Surface& surface) {
     if (guest == nullptr) {
         return;
     }
-    if (surface.scale == 2) {
+    if (surface.scale == 4) {
         CopyTiledGuest(guest, static_cast<u8*>(surface.color_buffer.Data()), surface.width,
                        surface.height, surface.color_stride * surface.rt_bpp, surface.bpp, false);
         return;
@@ -5716,7 +6530,7 @@ void RasterizerGXM::MaterializeCopy(ScreenCopy& copy) {
         for (u32 y = 0; y < copy.height; y++) {
             const u32 source_row = copy.height - 1 - y;
             u8* out = scale_scratch.data() + static_cast<std::size_t>(y) * row_bytes;
-            if (copy.scale == 2) {
+            if (copy.scale == 4) {
                 std::memcpy(out, src + static_cast<std::size_t>(source_row) * src_stride,
                             row_bytes);
                 continue;
@@ -5734,7 +6548,7 @@ void RasterizerGXM::MaterializeCopy(ScreenCopy& copy) {
     } else {
         for (u32 y = 0; y < copy.height; y++) {
             // CDRAM se lee sin cache: la fila de una vez y despues de memoria normal.
-            if (copy.scale == 2) {
+            if (copy.scale == 4) {
                 std::memcpy(row, src + static_cast<std::size_t>(y) * src_stride,
                             copy.width * copy.bpp);
             } else {
@@ -7170,6 +7984,37 @@ void RasterizerGXM::ClearDepthIfNeeded(Surface& surface) {
                                               SCE_GXM_DEPTH_STENCIL_FORCE_LOAD_DISABLED);
 }
 
+void RasterizerGXM::BeforeP3dInterrupt() {
+    /**
+     * LO DIBUJADO EN LA MEMORIA DEL JUEGO, ANTES DE AVISARLE (0.4.5.5). En la consola,
+     * cuando llega la interrupcion la GPU ya ha escrito en memoria, y a partir de ahi
+     * el juego puede liberar ese bloque y reutilizarlo. Aqui una superficie se quedaba
+     * en la GPU y se volcaba mucho despues, encima de lo que hubiera ya. Mario Kart 7
+     * dibuja las caras de los Mii (64x64 y 32x32) en bloques de su heap, separados solo
+     * por 128 bytes de cabecera: al llegar al tope de superficies (FlushPending) se
+     * volcaban todas sobre el heap ya reutilizado, su lista de bloques libres quedaba
+     * con un puntero a cero, y el juego se colgaba para siempre en el logo.
+     *
+     * Solo las de la FCRAM. Las de la VRAM no las reutiliza el heap del juego, y esperar
+     * aqui por ellas en cada lista seria perder todo lo que da tenerlas en la GPU.
+     */
+    for (auto& surface : surfaces) {
+        if (!surface->dirty || surface->guest_address < Memory::FCRAM_PADDR) {
+            continue;
+        }
+        if (surface.get() == open_surface) {
+            EndScene();
+        }
+        WriteBack(*surface, kWritebackP3d);
+        if (textures != nullptr) {
+            texture_marks[4].fetch_add(
+                textures->InvalidateRange(surface->guest_address,
+                                          surface->guest_stride * surface->height),
+                std::memory_order_relaxed);
+        }
+    }
+}
+
 void RasterizerGXM::FlushPending() {
     ApplyLazyFills(0, 0xFFFFFFFFu);
     MaterializeAllCopies();
@@ -7304,7 +8149,32 @@ void RasterizerGXM::FlushForPresent() {
                                                        std::memory_order_relaxed);
 }
 
+void RasterizerGXM::DropSurfaces() {
+    FlushPending();
+    // Un blit de copia de pantalla puede seguir leyendo alguna.
+    const Common::ScopedVitaStage stage{"gxm tope de superficies"};
+    sceGxmFinish(context);
+    gpu_pending = false;
+    surfaces.clear();
+}
+
 RasterizerGXM::Surface* RasterizerGXM::CurrentSurface() {
+    /**
+     * LA RESOLUCION, EN PLENA PARTIDA (0.4.6.1). Cada superficie se queda con la
+     * escala con la que nacio, y las nuevas no casarian con las viejas: se sueltan
+     * todas como al llegar al tope, y las que sigan haciendo falta se recrean aqui
+     * abajo con la nueva leyendo del invitado. Lo cambia el menu de la partida con
+     * el juego parado, asi que esto se ejecuta en el primer lote al seguir.
+     */
+    const u32 wanted_scale = resolution_scale.load(std::memory_order_relaxed);
+    if (wanted_scale != surfaces_scale) {
+        if (!surfaces.empty()) {
+            DropSurfaces();
+            NoteOnce(fb_noted[13], "gxm fb", "resolucion cambiada en partida");
+        }
+        surfaces_scale = wanted_scale;
+    }
+
     const auto& config = pica.regs.internal.framebuffer.framebuffer;
 
     /**
@@ -7436,12 +8306,7 @@ RasterizerGXM::Surface* RasterizerGXM::CurrentSurface() {
          * se vuelca lo sucio y se sueltan todas; la que vuelva a hacer falta se
          * recrea leyendo del invitado, que es correcto aunque cueste.
          */
-        FlushPending();
-        // Un blit de copia de pantalla puede seguir leyendo alguna.
-        const Common::ScopedVitaStage stage{"gxm tope de superficies"};
-        sceGxmFinish(context);
-        gpu_pending = false;
-        surfaces.clear();
+        DropSurfaces();
         NoteOnce(fb_noted[7], "gxm fb", "tope de {} superficies", kMaxSurfaces);
     }
 
@@ -7473,8 +8338,8 @@ RasterizerGXM::Surface* RasterizerGXM::CurrentSurface() {
      * muro que dejo tg a 0 en 0.1.0.11 y 0.1.0.12.
      */
     u32 scale = resolution_scale.load(std::memory_order_relaxed);
-    if (scale != 1 && scale != 4) {
-        scale = 2;
+    if (scale < 2 || scale > 10) {
+        scale = 4;
     }
     const u32 phys_width = Phys(width, scale);
     const u32 phys_height = Phys(height, scale);
@@ -8269,7 +9134,7 @@ bool RasterizerGXM::SetupDrawState(Surface* surface, const Entry* pipeline,
      * el dialogo de error de NSMB2 se comia las primeras letras de cada linea.
      */
     const float guest_height = static_cast<float>(surface->height);
-    const float scale = static_cast<float>(surface->scale) * 0.5f;
+    const float scale = static_cast<float>(surface->scale) * 0.25f;
     const float viewport[6] = {(halfsize_x + corner_x) * scale, halfsize_x * scale,
                                (guest_height - halfsize_y - corner_y) * scale,
                                -halfsize_y * scale,  depth_offset,
@@ -8296,7 +9161,7 @@ bool RasterizerGXM::SetupDrawState(Surface* surface, const Entry* pipeline,
      * la escena, para que el presentador no herede el recorte de un juego.
      */
     RegionClip clip = MakeRegionClip(rasterizer, surface->width, surface->height);
-    if (surface->scale != 2 && (clip.mode == SCE_GXM_REGION_CLIP_OUTSIDE ||
+    if (surface->scale != 4 && (clip.mode == SCE_GXM_REGION_CLIP_OUTSIDE ||
                                 clip.mode == SCE_GXM_REGION_CLIP_INSIDE)) {
         // La caja es de pixeles del invitado, con los dos extremos dentro.
         const u32 s = surface->scale;
@@ -8452,6 +9317,8 @@ bool RasterizerGXM::SetupDrawState(Surface* surface, const Entry* pipeline,
     if (timed) {
         mark = Common::VitaMicros();
     }
+    const unsigned char tag_before_textures = Common::vita_gpu_tag;
+    Common::vita_gpu_tag = Common::kGpuTagBatchTextures;
     for (u32 i = 0; i < 3; i++) {
         if (pipeline->samplers[i] == nullptr) {
             continue;
@@ -8487,6 +9354,7 @@ bool RasterizerGXM::SetupDrawState(Surface* surface, const Entry* pipeline,
             }
         }
     }
+    Common::vita_gpu_tag = tag_before_textures;
     if (timed) {
         const unsigned long long now = Common::VitaMicros();
         state_texture_us += now - mark;
@@ -8589,6 +9457,18 @@ bool RasterizerGXM::SetupDrawState(Surface* surface, const Entry* pipeline,
                                   static_cast<f32>(fog.g) / 255.0f,
                                   static_cast<f32>(fog.b) / 255.0f, 1.0f};
             PutUniform(uniform_buffer, pipeline->fog_color, pipeline->fog_color_slot, 3, color);
+        }
+        if (pipeline->shadow_params != nullptr) {
+            static bool noted_shadow = false;
+            NoteOnce(noted_shadow, "gxm fs", "textura de sombra en la GPU");
+            // Ver LA TEXTURA DE SOMBRA en cg_fs_shader_gen.cpp. El sesgo, por dos y en
+            // unidades de la profundidad de 24 bits, como en TextureColor de software.
+            const auto& texturing = pica.regs.internal.texturing;
+            const f32 params[3] = {static_cast<f32>(texturing.texture0.width.Value()),
+                                   static_cast<f32>(texturing.texture0.height.Value()),
+                                   static_cast<f32>(texturing.shadow.bias.Value() << 1)};
+            PutUniform(uniform_buffer, pipeline->shadow_params, pipeline->shadow_params_slot, 3,
+                       params);
         }
         if (pipeline->tex_border_color != nullptr) {
             /**
@@ -8934,19 +9814,35 @@ void RasterizerGXM::ClearAll(bool flush) {
  * ("atascado") van todos por la CPU, o un compilador colgado dejaria esa
  * geometria sin dibujar toda la partida.
  */
-static bool LongCompileCpuAllowed(u32 frame) {
+/**
+ * Y TOPE DE VERTICES (0.4.4.6). Seis lotes eran 50 ms por fotograma en Pokemon
+ * X al llegar a una zona nueva: sus personajes son mallas con piel de miles de
+ * vertices, y el sombreado por la CPU (repartido en los tres nucleos) dejaba el
+ * juego a 2-5 fps y la CPU al 90 % mientras compilaba ("vtx 50.9" en crash.txt
+ * del 04-11). Ahora, ademas, como mucho kMaxCpuVertices por fotograma (~5 ms);
+ * lo que no quepa se salta hasta que acabe su shader. 'vertices' 0 = no cuenta.
+ */
+static bool LongCompileCpuAllowed(u32 frame, u32 vertices = 0) {
     // 24 con ux0:/data/azahar/vs_cpu_24.txt (0.4.2.2, para probar).
     static const u32 kMaxCpuBatches = [] {
         SceIoStat flag{};
         return sceIoGetstat("ux0:/data/azahar/vs_cpu_24.txt", &flag) >= 0 ? 24u : 6u;
     }();
+    static constexpr u32 kMaxCpuVertices = 2000;
     static u32 budget_frame = ~0u;
     static u32 used = 0;
+    static u32 used_vertices = 0;
     if (budget_frame != frame) {
         budget_frame = frame;
         used = 0;
+        used_vertices = 0;
     }
-    return used++ < kMaxCpuBatches;
+    if (used >= kMaxCpuBatches || used_vertices + vertices > kMaxCpuVertices) {
+        return false;
+    }
+    used++;
+    used_vertices += vertices;
+    return true;
 }
 
 /// "fs: <motivo>" como literal propio, para que reject_counts (que compara
@@ -9277,7 +10173,14 @@ bool RasterizerGXM::AccelerateDrawBatch(bool is_indexed) {
     }
     std::array<unsigned long long, kBatchPhases> phase_us{};
     unsigned long long phase_mark = profile ? Common::VitaMicros() : 0;
+    Common::vita_gpu_tag = Common::kGpuTagBatchQuestions;
+    struct TagRestore {
+        ~TagRestore() {
+            Common::vita_gpu_tag = Common::kGpuTagSpecial;
+        }
+    } const tag_restore;
     const auto phase = [&](u32 index) {
+        Common::vita_gpu_tag = static_cast<unsigned char>(Common::kGpuTagBatchVs + index);
         if (profile) {
             const unsigned long long now = Common::VitaMicros();
             phase_us[index] += now - phase_mark;
@@ -9649,6 +10552,9 @@ bool RasterizerGXM::AccelerateDrawBatch(bool is_indexed) {
         }
     }
     vs_lap(g_vs_cache_us);
+    // Ver EL SHADER DE VERTICES GENERICO: la tabla del lote y sus constantes.
+    const void* generic_table = nullptr;
+    float generic_consts[28];
     if (!memo.vs_valid) {
         /**
          * Donde vive cada atributo, con la misma cuenta que VertexLoader: cada
@@ -9734,8 +10640,19 @@ bool RasterizerGXM::AccelerateDrawBatch(bool is_indexed) {
         }
         const char* reason = nullptr;
         const HwShaderCache::Program*& program = layout.program;
-        program = hw_shaders->GetProgram(program_key, pica.vs_setup, vs_config, inputs,
-                                         pipeline->lit, pipeline->proj, &reason);
+        program = nullptr;
+        // Ver EL PROGRAMA PROPIO, mas abajo. En el modo de pruebas (2) va el
+        // primero y el de Cg ni se pide.
+        bool own_provisional = false;
+        if (usse_vs.load(std::memory_order_relaxed) == 2) {
+            const char* why = nullptr;
+            program = hw_shaders->Own(program_key, pica.vs_setup, vs_config, inputs,
+                                      pipeline->lit, pipeline->proj, w_buffer, &why);
+        }
+        if (program == nullptr) {
+            program = hw_shaders->GetProgram(program_key, pica.vs_setup, vs_config, inputs,
+                                             pipeline->lit, pipeline->proj, &reason);
+        }
         layout.specialized = false;
         /**
          * PROGRAMA ESPECIALIZADO CON LOS BOOLEANOS DEL LOTE (0.1.7.4).
@@ -9811,6 +10728,53 @@ bool RasterizerGXM::AccelerateDrawBatch(bool is_indexed) {
         // Las traducciones de este lote ya estan hechas (Build genera el
         // texto en este hilo, tambien las que compila en segundo plano).
         Pica::Shader::Generator::GXM::g_cg_wbuffer.store(false, std::memory_order_relaxed);
+        /**
+         * EL SHADER DE VERTICES GENERICO (0.4.7.0, ver EncodeGenericVs): mientras
+         * compila el de verdad (o si se ha atascado), el lote se dibuja con el
+         * interprete de la GPU en vez de saltarse o ir por la CPU.
+         */
+        if (program == nullptr && reason != nullptr && !w_buffer &&
+            generic_vs.load(std::memory_order_relaxed) != 0 &&
+            // Solo con el de fragmentos de verdad: con el de reserva (aproximado)
+            // un efecto de pantalla completa la tapaba entera de negro (Pokemon X,
+            // 06-11); esos lotes se siguen saltando como antes.
+            !pipeline->reserve &&
+            (std::strcmp(reason, "vs compilando") == 0 ||
+             std::strcmp(reason, "vs compilando largo") == 0 ||
+             std::strcmp(reason, "vs atascado") == 0)) {
+            const char* why = nullptr;
+            const HwShaderCache::Program* generic = hw_shaders->GenericFor(
+                program_key, (pipeline->lit ? 2u : 0u) | (pipeline->proj ? 1u : 0u),
+                pica.vs_setup, vs_config, inputs, presents_seen, num_vertices, &generic_table,
+                &why);
+            if (generic != nullptr && generic_table != nullptr) {
+                program = generic;
+                GenericVsConsts(vs_config, generic_consts);
+                generic_vs_batches.fetch_add(1, std::memory_order_relaxed);
+            }
+        }
+        /**
+         * EL PROGRAMA PROPIO (0.4.7.1, ver HwShaderCache::Own). Si el de Cg no
+         * esta (compilandose, atascado, demasiado grande, el compilador roto...),
+         * el lote ya no se salta ni va por la CPU: se dibuja con la traduccion
+         * directa a USSE, que se hace en el momento. Mientras el de Cg compila es
+         * PROVISIONAL (ni memo ni cache, como el generico: en cuanto este el de
+         * verdad, el siguiente lote tiene que verlo); si Cg no puede con el, se
+         * queda para siempre.
+         */
+        if (program == nullptr && reason != nullptr && generic_table == nullptr &&
+            usse_vs.load(std::memory_order_relaxed) != 0 &&
+            std::strcmp(reason, "vs con geometria") != 0) {
+            const char* why = nullptr;
+            if (const HwShaderCache::Program* own =
+                    hw_shaders->Own(program_key, pica.vs_setup, vs_config, inputs, pipeline->lit,
+                                    pipeline->proj, w_buffer, &why)) {
+                program = own;
+                own_provisional = std::strcmp(reason, "vs compilando") == 0 ||
+                                  std::strcmp(reason, "vs compilando largo") == 0 ||
+                                  std::strcmp(reason, "vs atascado") == 0;
+            }
+        }
         if (program == nullptr) {
             // Compilandose (el generico o su especializado): el lote se salta.
             if (reason != nullptr && std::strcmp(reason, "vs compilando") == 0 &&
@@ -9821,7 +10785,7 @@ bool RasterizerGXM::AccelerateDrawBatch(bool is_indexed) {
             }
             if (reason != nullptr && std::strcmp(reason, "vs compilando largo") == 0 &&
                 async_vs.load(std::memory_order_relaxed) != 0 &&
-                !LongCompileCpuAllowed(presents_seen)) {
+                !LongCompileCpuAllowed(presents_seen, num_vertices)) {
                 skipped_batches.fetch_add(1, std::memory_order_relaxed);
                 skipped_vs_batches.fetch_add(1, std::memory_order_relaxed);
                 return true;
@@ -9854,7 +10818,12 @@ bool RasterizerGXM::AccelerateDrawBatch(bool is_indexed) {
         attribute_sources = {};
         attribute_count = 0;
         stream_count = 0;
-        layout_key = program_key;
+        layout_key = generic_table != nullptr ? Common::HashCombine(program_key, 0x6E0E71C0ull)
+                                              : program_key;
+        if (program->own) {
+            // Otro programa del parcheador: sus enlazados no son los del de Cg.
+            layout_key = Common::HashCombine(layout_key, 0x055E0001ull);
+        }
         for (u32 reg = 0; reg < 16; reg++) {
             if (inputs[reg].kind != VSInputSource::Array || program->inputs[reg] == nullptr) {
                 continue;
@@ -9968,7 +10937,13 @@ bool RasterizerGXM::AccelerateDrawBatch(bool is_indexed) {
         converted = false;
         converted_stride = 0;
         if (vertex_program == nullptr) {
-            u64 converted_key = Common::HashCombine(program_key, 0xF32F32F3ull);
+            u64 converted_key = Common::HashCombine(
+                generic_table != nullptr ? Common::HashCombine(program_key, 0x6E0E71C0ull)
+                                         : program_key,
+                0xF32F32F3ull);
+            if (program->own) {
+                converted_key = Common::HashCombine(converted_key, 0x055E0001ull);
+            }
             for (u32 i = 0; i < attribute_count; i++) {
                 SceGxmVertexAttribute& out = gxm_attributes[i];
                 out.streamIndex = 0;
@@ -10003,16 +10978,31 @@ bool RasterizerGXM::AccelerateDrawBatch(bool is_indexed) {
             }
         }
         if (vertex_program == nullptr) {
-            hw_shaders->unlinkable.insert(program_key);
+            if (program->own) {
+                // El de Cg sigue su camino: solo se deja de probar el propio.
+                hw_shaders->DisableOwn(program_key, "vs propio: enlazar atributos");
+                NoteSkip(5, "vs propio: enlazar atributos");
+                if (own_provisional && async_vs.load(std::memory_order_relaxed) != 0) {
+                    skipped_batches.fetch_add(1, std::memory_order_relaxed);
+                    skipped_vs_batches.fetch_add(1, std::memory_order_relaxed);
+                    return true;
+                }
+                return HwVsReject("vs propio: enlazar atributos");
+            }
+            if (generic_table == nullptr) {
+                hw_shaders->unlinkable.insert(program_key);
+            }
             NoteSkip(5, "vs enlazar atributos");
             return HwVsReject("vs enlazar atributos");
         }
         layout.lit = pipeline->lit;
         layout.proj = pipeline->proj;
         layout.wbuffer = w_buffer;
-        memo.vs_valid = true;
+        // Con el generico (o el propio provisional) ni memo ni cache: en cuanto
+        // este el de verdad, el siguiente lote tiene que verlo.
+        memo.vs_valid = generic_table == nullptr && !own_provisional;
         // A la cache, para cuando el juego vuelva a este modelo.
-        if (layout_key_ok) {
+        if (layout_key_ok && generic_table == nullptr && !own_provisional) {
             const u32 at = memo.layout_cache_next;
             memo.layout_cache_next = (at + 1) % BatchMemo::kLayoutCacheSize;
             auto& slot = memo.layout_cache[at];
@@ -10401,6 +11391,16 @@ bool RasterizerGXM::AccelerateDrawBatch(bool is_indexed) {
             PutUniform(vertex_uniforms, program->uniform_wbuf, program->uniform_wbuf_slot, 2,
                        wbuf);
         }
+        if (program->generic) {
+            if (generic_table == nullptr) {
+                return HwVsReject("vs generico sin tabla");
+            }
+            PutUniform(vertex_uniforms, program->uniform_outmap, program->uniform_outmap_slot, 24,
+                       generic_consts);
+            PutUniform(vertex_uniforms, program->uniform_entry, program->uniform_entry_slot, 4,
+                       generic_consts + 24);
+            sceGxmSetVertexUniformBuffer(context, program->table_buffer, generic_table);
+        }
     }
     draw_lap(g_draw_vs_uniforms_us);
     // Ver EL COPIADOR DE VERTICES: la GPU puede leer desde sceGxmDraw.
@@ -10423,6 +11423,7 @@ bool RasterizerGXM::AccelerateDrawBatch(bool is_indexed) {
         BlackBox::Record(info);
     }
     draw_lap(g_draw_blackbox_us);
+    Common::vita_gpu_tag = Common::kGpuTagBatchDraw;
     const int rc = sceGxmDraw(context, primitive, SCE_GXM_INDEX_FORMAT_U16, draw_indices,
                               num_vertices);
     draw_lap(g_draw_call_us);
@@ -10441,6 +11442,9 @@ bool RasterizerGXM::AccelerateDrawBatch(bool is_indexed) {
     gpu_triangles.fetch_add(triangles, std::memory_order_relaxed);
     gpu_batches.fetch_add(1, std::memory_order_relaxed);
     hw_vs_batches.fetch_add(1, std::memory_order_relaxed);
+    if (program->own) {
+        usse_vs_batches.fetch_add(1, std::memory_order_relaxed);
+    }
     phase(5);
     if (profile) {
         for (u32 i = 0; i < kBatchPhases; i++) {
@@ -10512,7 +11516,7 @@ std::string RasterizerGXM::TakeCopySummary() {
         text += " -";
     }
     static constexpr const char* kSites[kWritebackSites] = {
-        "textura", "pendiente", "presentar", "lote soft", "vaciado", "vaciado+inv"};
+        "textura", "pendiente", "presentar", "lote soft", "vaciado", "vaciado+inv", "p3d"};
     text += " | volcados por:";
     any = false;
     for (u32 i = 0; i < kWritebackSites; i++) {

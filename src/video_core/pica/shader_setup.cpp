@@ -2,6 +2,9 @@
 // Licensed under GPLv2 or any later version
 // Refer to the license.txt file included.
 
+#include <array>
+#include <bit>
+#include <cstring>
 #include <limits>
 #include <utility>
 #include "common/assert.h"
@@ -78,8 +81,26 @@ std::optional<u32> ShaderSetup::WriteUniformFloatReg(ShaderRegs& config, u32 val
     const u32 index = uniform_setup.index.Value();
     const auto prev = std::exchange(uniforms.f[index], uniform);
     uniforms_dirty |= prev != uniform;
+    uniform_raw_mode[index] = 0;
     uniform_setup.index.Assign(index + 1);
     return index;
+}
+
+/**
+ * De f24 a los bits de un float, solo con enteros (0.4.6.2): f24::FromRaw acaba en un
+ * registro de VFP y de ahi a memoria por cada componente. Lo mismo que FromRaw para los
+ * normales y el cero; los raros (denormales, infinitos) van por el.
+ */
+static inline u32 F24ToF32Bits(u32 hex) {
+    const u32 sign = (hex >> 23) << 31;
+    if ((hex & 0x7FFFFF) == 0) {
+        return sign;
+    }
+    const u32 exponent = (hex >> 16) & 0x7F;
+    if (exponent - 1 < 0x7E) [[likely]] {
+        return sign | ((exponent + 64) << 23) | ((hex & 0xFFFF) << 7);
+    }
+    return std::bit_cast<u32>(f24::FromRaw(hex).ToFloat32());
 }
 
 std::optional<ShaderSetup::UniformWriteRange> ShaderSetup::WriteUniformFloatRegRange(
@@ -94,8 +115,86 @@ std::optional<ShaderSetup::UniformWriteRange> ShaderSetup::WriteUniformFloatRegR
 
     std::optional<u32> first_index;
     u32 written = 0;
+    u32 i = 0;
 
-    for (u32 i = 0; i < count; ++i) {
+    /**
+     * LOS UNIFORMES QUE NO CAMBIAN, SIN CONVERTIR (0.4.5.4). Cada uno pasaba por la cola,
+     * cuatro conversiones de f24 a float con sus ramas y una comparacion de coma flotante
+     * por componente, y luego se copiaba al de geometria; y los juegos reenvian casi los
+     * mismos antes de cada lote. Comparar lo que llega con lo que llego la otra vez son
+     * tres o cuatro enteros.
+     *
+     * LA COLA NUNCA ESTA VACIA AQUI (0.4.6.2). La primera palabra de una orden va antes de
+     * su cabecera, asi que entra sola por WriteUniformFloatReg y esto llega con ella en la
+     * cola: con "solo si la cola esta vacia" el atajo casi nunca se usaba. Ahora se acaba
+     * primero ese uniforme con las palabras que faltan.
+     */
+    if (raw_uniforms) {
+        const u32 words = is_float32 ? 4 : 3;
+        const u8 mode = is_float32 ? 2 : 1;
+        const u32 first = uniform_setup.index.Value();
+        u32 index = first;
+        const auto store = [&](const u32* in) {
+            auto& raw = uniform_raw[index];
+            if (uniform_raw_mode[index] == mode && raw[0] == in[0] && raw[1] == in[1] &&
+                raw[2] == in[2] && (!is_float32 || raw[3] == in[3])) {
+                return;
+            }
+            uniform_raw_mode[index] = mode;
+            raw[0] = in[0];
+            raw[1] = in[1];
+            raw[2] = in[2];
+            u32 bits[4];
+            if (is_float32) {
+                raw[3] = in[3];
+                for (u32 word = 0; word < 4; word++) {
+                    uniform_queue.buffer[word] = in[word];
+                }
+                const auto uniform = uniform_queue.Get(true);
+                std::memcpy(bits, &uniform, sizeof(bits));
+            } else {
+                bits[0] = F24ToF32Bits(in[2] & 0xFFFFFF);
+                bits[1] = F24ToF32Bits(((in[1] & 0xFFFF) << 8) | (in[2] >> 24));
+                bits[2] = F24ToF32Bits(((in[0] & 0xFF) << 16) | (in[1] >> 16));
+                bits[3] = F24ToF32Bits(in[0] >> 8);
+            }
+            auto* out = reinterpret_cast<u32*>(&uniforms.f[index]);
+            if (out[0] != bits[0] || out[1] != bits[1] || out[2] != bits[2] || out[3] != bits[3]) {
+                out[0] = bits[0];
+                out[1] = bits[1];
+                out[2] = bits[2];
+                out[3] = bits[3];
+                uniforms_dirty = true;
+            }
+        };
+        if (uniform_queue.index != 0 && uniform_queue.index < words && index < uniforms.f.size()) {
+            u32 queued = uniform_queue.index;
+            while (queued < words && i < count) {
+                uniform_queue.buffer[queued++] = values[i++];
+            }
+            uniform_queue.index = queued;
+            if (queued == words) {
+                uniform_queue.index = 0;
+                const std::array<u32, 4> whole = uniform_queue.buffer;
+                store(whole.data());
+                ++index;
+            }
+        }
+        if (uniform_queue.index == 0) {
+            while (i + words <= count && index < uniforms.f.size()) {
+                store(values + i);
+                ++index;
+                i += words;
+            }
+        }
+        if (index != first) {
+            uniform_setup.index.Assign(index);
+            first_index = first;
+            written = index - first;
+        }
+    }
+
+    for (; i < count; ++i) {
         if (!uniform_queue.Push(values[i], is_float32)) {
             continue;
         }
@@ -110,6 +209,7 @@ std::optional<ShaderSetup::UniformWriteRange> ShaderSetup::WriteUniformFloatRegR
         const u32 index = uniform_setup.index.Value();
         const auto prev = std::exchange(uniforms.f[index], uniform);
         uniforms_dirty |= prev != uniform;
+        uniform_raw_mode[index] = 0;
         uniform_setup.index.Assign(index + 1);
 
         if (!first_index) {

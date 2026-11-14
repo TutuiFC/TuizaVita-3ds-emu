@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cstring>
 #include <vector>
 #include "common/arch.h"
 #include "common/archives.h"
@@ -162,6 +163,7 @@ PicaCore::PicaCore(Memory::MemorySystem& memory_, std::shared_ptr<DebugContext> 
       shader_engine{CreateEngine(Settings::values.use_shader_jit.GetValue())} {
     InitializeRegs();
     dirty_regs.SetAllDirty();
+    vs_setup.raw_uniforms = true;
 
     const auto submit_vertex = [this](const AttributeBuffer& buffer) {
         const auto add_triangle = [this](const OutputVertex& v0, const OutputVertex& v1,
@@ -296,6 +298,20 @@ static consteval std::array<RegImplInfo, RegsInternal::NUM_REGS> BuildRegImplFla
 static constexpr std::array<RegImplInfo, RegsInternal::NUM_REGS> reg_impl_flags_lut =
     BuildRegImplFlagsLUT();
 
+/**
+ * Para el camino rapido de ProcessCmdList (0.4.6.2): 1 si el registro no se puede escribir
+ * sin mas, y a 0x400 entradas para que los fuera de rango (0x300..0x3FF) salgan de aqui y
+ * una sola mascara sobre la cabecera descarte el resto y las ordenes con datos de mas.
+ */
+static constexpr std::array<u8, 0x400> BuildFastRegLUT() {
+    std::array<u8, 0x400> table{};
+    for (u32 i = 0; i < table.size(); i++) {
+        table[i] = i >= RegsInternal::NUM_REGS || reg_impl_flags_lut[i].NeedsSpecialHandling();
+    }
+    return table;
+}
+alignas(32) static constexpr std::array<u8, 0x400> fast_reg_lut = BuildFastRegLUT();
+
 // Expand a 4-bit mask to 4-byte mask, e.g. 0b0101 -> 0x00FF00FF
 static constexpr std::array<u32, 16> ExpandBitsToBytes = {
     0x00000000, 0x000000ff, 0x0000ff00, 0x0000ffff, 0x00ff0000, 0x00ff00ff, 0x00ffff00, 0x00ffffff,
@@ -351,6 +367,9 @@ void PicaCore::ProcessCmdList(PAddr list, u32 size, bool ignore_list) [[hot]] {
 
     const u8* head = memory.GetPhysicalPointer(list);
     cmd_list.Reset(list, head, size);
+#ifdef __PSVITA__
+    Common::vita_gpu_tag = Common::kGpuTagDecode;
+#endif
 
     bool stop_requested = false;
     bool skip_fast_path = false;
@@ -372,50 +391,60 @@ void PicaCore::ProcessCmdList(PAddr list, u32 size, bool ignore_list) [[hot]] {
         // that's why it was decided to keep the structure like this.
         if (!debug_context) [[likely]] {
             if (!skip_fast_path) {
-                constexpr u32 batch_size = 4;
-                u32 index = cmd_list.current_index;
-                u32 ids[batch_size], values[batch_size], masks[batch_size];
-                u32 run = 0;
-
-                while (run < batch_size && index + 1 < cmd_list.length) {
-                    const u32 value = cmd_list.head[index];
-                    const CommandHeader header{cmd_list.head[index + 1]};
+                /**
+                 * UNA SOLA VUELTA (0.4.5.4). Esto iba de cuatro en cuatro, copiando las
+                 * ordenes a tres arrays para luego recorrerlos, porque en un x86 asi se
+                 * vectoriza. El Cortex-A9 no lo vectoriza, y el muestreo decia que en
+                 * Kirby este bucle era el 11 % de todo el tiempo, mas que dibujar.
+                 */
+                const u32* __restrict head_words = cmd_list.head;
+                const u32 length = cmd_list.length;
+                const u32 first = cmd_list.current_index;
+                u32 index = first;
+                while (index + 1 < length) {
+                    /**
+                     * LO QUE VIENE, ANTES DE LLEGAR (0.4.6.2). La lista la acaba de escribir
+                     * el juego desde otro nucleo: cada linea de cache hay que traerla de alli.
+                     * 16 ordenes por delante dan tiempo a que llegue sin parar el bucle, y
+                     * pasarse del final no falla: un prefetch no da fallos.
+                     */
+                    __builtin_prefetch(head_words + index + 32);
+                    const u32 raw_header = head_words[index + 1];
+                    const u32 id = raw_header & 0x3FF;
 
                     // If extra handling is needed stop and fallback to slower path.
-                    if (header.extra_data_length != 0 || header.cmd_id >= RegsInternal::NUM_REGS ||
-                        reg_impl_flags_lut[header.cmd_id].NeedsSpecialHandling()) {
+                    if ((raw_header & 0x0FF0FC00u) != 0 || fast_reg_lut[id] != 0) {
                         skip_fast_path = true;
                         break;
                     }
 
-                    ids[run] = header.cmd_id;
-                    values[run] = value;
-                    masks[run] = header.parameter_mask;
-                    ++run;
+                    /**
+                     * SUCIO SOLO SI CAMBIA (0.4.0.8). Aqui solo llegan registros
+                     * normales (los puertos y disparos van por WriteInternalReg),
+                     * y el unico que mira dirty_regs es el memo del rasterizador
+                     * GXM, que ya compara por valor: un juego que reescribe ~40
+                     * registros iguales antes de cada lote (Super Mario 3D Land)
+                     * le hacia revisarlos uno a uno.
+                     */
+                    const u32 old_value = regs.internal.reg_array[id];
+                    u32 new_value = head_words[index];
+                    // Casi todas escriben el registro entero: sin pasar por la tabla.
+                    if ((raw_header & 0x000F0000u) != 0x000F0000u) [[unlikely]] {
+                        const u32 write_mask = ExpandBitsToBytes[(raw_header >> 16) & 0xF];
+                        new_value = (old_value & ~write_mask) | (new_value & write_mask);
+                    }
+                    if (new_value != old_value) {
+                        regs.internal.reg_array[id] = new_value;
+                        dirty_regs.Set(id);
+                    }
                     index += 2;
                 }
 
-                // Process the commands that we have read so far (up to 4).
-                if (run > 0) {
-                    delay_generator.AddCommands(run);
-                    for (u32 i = 0; i < run; ++i) {
-                        const u32 id = ids[i];
-                        const u32 write_mask = ExpandBitsToBytes[masks[i]];
-                        /**
-                         * SUCIO SOLO SI CAMBIA (0.4.0.8). Aqui solo llegan registros
-                         * normales (los puertos y disparos van por WriteInternalReg),
-                         * y el unico que mira dirty_regs es el memo del rasterizador
-                         * GXM, que ya compara por valor: un juego que reescribe ~40
-                         * registros iguales antes de cada lote (Super Mario 3D Land)
-                         * le hacia revisarlos uno a uno.
-                         */
-                        const u32 old_value = regs.internal.reg_array[id];
-                        const u32 new_value = (old_value & ~write_mask) | (values[i] & write_mask);
-                        if (new_value != old_value) {
-                            regs.internal.reg_array[id] = new_value;
-                            dirty_regs.Set(id);
-                        }
-                    }
+                if (index != first) {
+                    delay_generator.AddCommands((index - first) / 2);
+#ifdef __PSVITA__
+                    Common::vita_gpu_cmds = Common::vita_gpu_cmds + (index - first) / 2;
+#endif
                     cmd_list.current_index = index;
 
                     // Continue from the while loop in case we reached the end of the list.
@@ -537,13 +566,16 @@ void PicaCore::HandleSpecialRegBatch(u32 id, const u32* values, u32 count) {
     case PICA_REG_INDEX(vs.uniform_setup.set_value[5]):
     case PICA_REG_INDEX(vs.uniform_setup.set_value[6]):
     case PICA_REG_INDEX(vs.uniform_setup.set_value[7]): {
+#ifdef __PSVITA__
+        Common::vita_gpu_tag = Common::kGpuTagSpecialUniform;
+#endif
         const auto range = vs_setup.WriteUniformFloatRegRange(regs.internal.vs, values, count);
         if (range && !regs.internal.pipeline.gs_unit_exclusive_configuration &&
             regs.internal.pipeline.use_gs == PipelineRegs::UseGS::No) {
-            for (u32 i = 0; i < range->count; ++i) {
-                const u32 idx = range->first_index + i;
-                gs_setup.uniforms.f[idx] = vs_setup.uniforms.f[idx];
-            }
+            // De una vez: elemento a elemento son cuatro cargas y cuatro escrituras de VFP.
+            std::memcpy(&gs_setup.uniforms.f[range->first_index],
+                        &vs_setup.uniforms.f[range->first_index],
+                        range->count * sizeof(gs_setup.uniforms.f[0]));
         }
         break;
     }
@@ -555,6 +587,9 @@ void PicaCore::HandleSpecialRegBatch(u32 id, const u32* values, u32 count) {
     case PICA_REG_INDEX(vs.program.set_word[5]):
     case PICA_REG_INDEX(vs.program.set_word[6]):
     case PICA_REG_INDEX(vs.program.set_word[7]): {
+#ifdef __PSVITA__
+        Common::vita_gpu_tag = Common::kGpuTagSpecialProgram;
+#endif
         u32& offset = regs.internal.vs.program.offset;
         if (offset + count > 512) {
             LOG_ERROR(HW_GPU, "Invalid VS program offset {} count {}", offset, count);
@@ -576,6 +611,9 @@ void PicaCore::HandleSpecialRegBatch(u32 id, const u32* values, u32 count) {
     case PICA_REG_INDEX(vs.swizzle_patterns.set_word[5]):
     case PICA_REG_INDEX(vs.swizzle_patterns.set_word[6]):
     case PICA_REG_INDEX(vs.swizzle_patterns.set_word[7]): {
+#ifdef __PSVITA__
+        Common::vita_gpu_tag = Common::kGpuTagSpecialProgram;
+#endif
         u32& offset = regs.internal.vs.swizzle_patterns.offset;
         if (offset + count > vs_setup.GetSwizzleData().size()) {
             LOG_ERROR(HW_GPU, "Invalid VS swizzle pattern offset {} count {}", offset, count);
@@ -598,15 +636,26 @@ void PicaCore::HandleSpecialRegBatch(u32 id, const u32* values, u32 count) {
     case PICA_REG_INDEX(lighting.lut_data[6]):
     case PICA_REG_INDEX(lighting.lut_data[7]): {
         auto& lut_config = regs.internal.lighting.lut_config;
-
-        for (u32 i = 0; i < count; i++) {
-            const u32 prev =
-                std::exchange(lighting
-                                  .luts[lut_config.type][(lut_config.index + i) %
-                                                         lighting.luts[lut_config.type].size()]
-                                  .raw,
-                              values[i]);
-            lighting.lut_dirty |= (prev != values[i]) << lut_config.type;
+        auto& lut = lighting.luts[lut_config.type];
+        const u32 lut_start = lut_config.index;
+        /**
+         * DE UNA VEZ (0.4.6.2). Mario 3D Land sube tablas de 256 entradas casi en cada
+         * lote, casi siempre iguales: era el 6 % del hilo de la GPU, con un modulo y un
+         * campo de bits leidos en cada palabra de una lista que aun no esta en cache.
+         */
+        if (lut_start + count <= lut.size()) {
+            u32 difference = 0;
+            for (u32 i = 0; i < count; i++) {
+                __builtin_prefetch(values + i + 16);
+                difference |= lut[lut_start + i].raw ^ values[i];
+                lut[lut_start + i].raw = values[i];
+            }
+            lighting.lut_dirty |= (difference != 0 ? 1U : 0U) << lut_config.type;
+        } else {
+            for (u32 i = 0; i < count; i++) {
+                const u32 prev = std::exchange(lut[(lut_start + i) % lut.size()].raw, values[i]);
+                lighting.lut_dirty |= (prev != values[i]) << lut_config.type;
+            }
         }
         lut_config.index.Assign(lut_config.index + count);
         break;
@@ -681,6 +730,7 @@ void PicaCore::HandleSpecialReg(u32 id, u32 value, bool& stop_requested) {
         // TODO(PabloMK7): This logic is not fully accurate, but close enough:
         // https://problemkaputt.de/gbatek-3ds-gpu-internal-registers-finalize-interrupt-registers.htm
         if (any_byte_match(regs.internal.reg_array[id], regs.internal.irq_compare)) [[likely]] {
+            rasterizer->BeforeP3dInterrupt();
             signal_interrupt(Service::GSP::InterruptId::P3D,
                              delay_generator.CalculateAndResetDelay());
             if (regs.internal.irq_autostop) [[likely]] {
@@ -717,7 +767,21 @@ void PicaCore::HandleSpecialReg(u32 id, u32 value, bool& stop_requested) {
         const u32 index = static_cast<u32>(id - PICA_REG_INDEX(pipeline.command_buffer.trigger[0]));
         const PAddr addr = regs.internal.pipeline.command_buffer.GetPhysicalAddress(index);
         const u32 size = regs.internal.pipeline.command_buffer.GetSize(index);
-        const u8* head = memory.GetPhysicalPointer(addr);
+        /**
+         * LOS SALTOS DE LISTA (0.4.6.2). Kirby hace ~10.000 por segundo, el 2,5 % del hilo:
+         * casi siempre a la FCRAM, que no necesita recorrer las regiones. Y lo primero de la
+         * lista, ya pedido: el bucle de ProcessCmdList solo pide lo que esta mas adelante.
+         */
+        if (fcram_base == nullptr) [[unlikely]] {
+            fcram_base = memory.GetFCRAMPointer(0);
+        }
+        const u8* head = addr >= Memory::FCRAM_PADDR &&
+                                 addr < Memory::FCRAM_PADDR + Memory::FCRAM_N3DS_SIZE
+                             ? fcram_base + (addr - Memory::FCRAM_PADDR)
+                             : memory.GetPhysicalPointer(addr);
+        __builtin_prefetch(head);
+        __builtin_prefetch(head + 32);
+        __builtin_prefetch(head + 64);
         cmd_list.Reset(addr, head, size);
         break;
     }
@@ -973,7 +1037,14 @@ void PicaCore::WriteInternalRegBatch(u32 id, const u32* values, u32 count, u32 m
 
     if (reg_impl_flags_lut[id].SupportsBatch()) {
         // If the register supports batch then call the handler.
+#ifdef __PSVITA__
+        Common::vita_gpu_reg = static_cast<unsigned short>(id);
+        Common::vita_gpu_tag = Common::kGpuTagSpecial;
+#endif
         HandleSpecialRegBatch(id, values, count);
+#ifdef __PSVITA__
+        Common::vita_gpu_tag = Common::kGpuTagDecode;
+#endif
     } else if (reg_impl_flags_lut[id].NeedsSpecialHandling()) [[unlikely]] {
         // Unlikely as all special regs that make sense to use batch mode already
         // support batch handling.
@@ -1035,8 +1106,36 @@ void PicaCore::WriteInternalRegSequential(u32 id, const u32* __restrict values, 
         // Whatever register stopped the batch (if we didn't reach the end)
         // needs individual handling, then resume batching after it.
         if (offset < count) {
-            WriteInternalReg(id + offset, values[offset], mask, stop_requested);
-            ++offset;
+            /**
+             * LOS PUERTOS, TAMBIEN DE UNA VEZ (0.4.6.2). Los uniformes y las tablas son
+             * ocho registros seguidos que hacen lo mismo, y muchos juegos los escriben con
+             * una orden agrupada: palabra a palabra, cada una con su tabla y su switch, y
+             * sin el atajo de los uniformes que no cambian. Zafiro y Kirby: 5 % del hilo.
+             */
+            const u32 port = id + offset;
+            if (reg_impl_flags_lut[port].SupportsBatch()) {
+                u32 run = 1;
+                while (offset + run < count && reg_impl_flags_lut[port + run].SupportsBatch()) {
+                    run++;
+                }
+                for (u32 i = 0; i < run; i++) {
+                    dst[offset + i] = (dst[offset + i] & ~write_mask) | (values[offset + i] & write_mask);
+                    dirty_regs.Set(port + i);
+                }
+                delay_generator.AddCommands(run);
+#ifdef __PSVITA__
+                Common::vita_gpu_reg = static_cast<unsigned short>(port);
+                Common::vita_gpu_tag = Common::kGpuTagSpecial;
+#endif
+                HandleSpecialRegBatch(port, values + offset, run);
+#ifdef __PSVITA__
+                Common::vita_gpu_tag = Common::kGpuTagDecode;
+#endif
+                offset += run;
+            } else {
+                WriteInternalReg(port, values[offset], mask, stop_requested);
+                ++offset;
+            }
         }
     }
 }
@@ -1067,7 +1166,14 @@ void PicaCore::WriteInternalReg(u32 id, u32 value, u32 mask, bool& stop_requeste
     }
 
     if (reg_impl_flags_lut[id].NeedsSpecialHandling()) {
+#ifdef __PSVITA__
+        Common::vita_gpu_reg = static_cast<unsigned short>(id);
+        Common::vita_gpu_tag = Common::kGpuTagSpecial;
+#endif
         HandleSpecialReg(id, value, stop_requested);
+#ifdef __PSVITA__
+        Common::vita_gpu_tag = Common::kGpuTagDecode;
+#endif
     }
 
     dirty_regs.Set(id);
@@ -1195,6 +1301,9 @@ void PicaCore::DrawArrays(bool is_indexed) {
         return;
     }
 
+#ifdef __PSVITA__
+    Common::vita_gpu_tag = Common::kGpuTagCpuVertices;
+#endif
     // We cannot accelerate the draw, so load and execute the vertex shader for each vertex.
     LoadVertices(is_indexed);
 

@@ -380,6 +380,8 @@ public:
     RegsLcd regs_lcd{};
     Regs regs{};
     DirtyRegs dirty_regs{};
+    /// Ver LOS SALTOS DE LISTA en pica_core.cpp.
+    const u8* fcram_base = nullptr;
     GeometryShaderUnit gs_unit;
     ShaderSetup vs_setup;
     ShaderSetup gs_setup;

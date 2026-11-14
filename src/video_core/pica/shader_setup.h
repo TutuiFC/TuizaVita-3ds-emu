@@ -160,11 +160,18 @@ public:
     u32 entry_point{};
     const void* cached_shader{};
     bool uniforms_dirty = true;
+    /// Ver WriteUniformFloatRegRange. Solo en el de vertices: a los uniformes del de geometria
+    /// tambien se escribe desde fuera (el espejo de PicaCore y GeometryPipeline).
+    bool raw_uniforms = false;
 
     // bool requires_fixup = false;
     // bool has_fixup = false;
 
 private:
+    /// Lo ultimo que se escribio en cada uniforme, tal cual llego, y en que formato: 0, nada
+    /// valido; 1, f24 empaquetado (3 palabras); 2, f32 (4 palabras).
+    std::array<std::array<u32, 4>, 96> uniform_raw{};
+    std::array<u8, 96> uniform_raw_mode{};
     ProgramCode program_code{};
     SwizzleData swizzle_data{};
     bool program_code_hash_dirty{true};
@@ -197,6 +204,7 @@ private:
         // ar & has_fixup;
         if (Archive::is_loading::value) {
             uniforms_dirty = true;
+            uniform_raw_mode.fill(0);
         }
     }
 };

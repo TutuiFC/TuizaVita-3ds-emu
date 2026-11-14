@@ -4,12 +4,32 @@
 
 #pragma once
 
+#include <atomic>
 #include <string>
 #include <vector>
 #include <vita2d.h>
 #include "common/common_types.h"
 
 namespace VitaFrontend {
+
+/**
+ * EL CUELGUE DEL MENU, ATACADO EN SU CAUSA (0.4.5.0).
+ *
+ * 0.4.4.6 lo tapo esperando a la GPU en CADA fotograma durante 120 fotogramas
+ * tras mover la seleccion. 0.4.4.8 quito el tapon creyendo que el origen era el
+ * atlas de iconos, y el cuelgue volvio al desplazarse la cuadricula: el origen es
+ * el pool de vita2d, ver StartMenuDrawing en vita_home_menu.cpp. La espera antes
+ * de escribir una textura se queda porque hace falta (el atlas lo puede estar
+ * leyendo el fotograma anterior), y fuera de la escena: HomeMenu::PrepareFrame.
+ *
+ * Ajustes (solo ajustes.txt):
+ *   menu_espera_atlas=0  vuelve a escribir el atlas sin esperar (0.4.4.7).
+ *   menu_tapon=1         vuelve al tapon de 120 fotogramas de 0.4.4.6.
+ *   menu_notas=1         vuelve a anotar cada carga del menu en crash.txt.
+ */
+extern std::atomic<bool> g_menu_wait_atlas;
+extern std::atomic<bool> g_menu_hold_frames;
+extern std::atomic<bool> g_menu_notes;
 
 /// Un fichero de juego encontrado en la carpeta de ROMs.
 struct HomeGame {
@@ -49,6 +69,9 @@ public:
     }
     const std::string& SelectedPath() const;
 
+    /// El piloto (0.4.4.6): deja seleccionado ese juego. False si no esta.
+    bool SelectPath(const std::string& path);
+
     /// Cruceta, gatillos y tactil. True = arrancar el juego seleccionado.
     bool Update(unsigned int buttons, unsigned int pressed);
 
@@ -57,6 +80,10 @@ public:
 
     /// Los titulos se eligen segun el idioma del menu: hay que releerlos al cambiarlo.
     void RefreshTitles();
+
+    /// Lee y sube lo que haga falta para este fotograma. Espera a la GPU y escribe
+    /// texturas: siempre antes de vita2d_start_drawing, nunca con la escena abierta.
+    void PrepareFrame();
 
     /// El menu entero, sin vita2d_start_drawing ni swap (el selector de idioma
     /// lo usa de fondo). Las 'hold' van de 0 a 1 mientras se mantiene START/SELECT.
@@ -131,6 +158,8 @@ private:
     /// Mientras se arrastra con el dedo, la camara no sigue a la seleccion.
     bool free_camera = false;
     u32 frame = 0;
+    /// Fotogramas que aun se anotan en crash.txt tras mover la seleccion (0.4.4.6).
+    int diag_frames = 0;
 
     /// Repeticion de la cruceta mantenida.
     unsigned int repeat_buttons = 0;

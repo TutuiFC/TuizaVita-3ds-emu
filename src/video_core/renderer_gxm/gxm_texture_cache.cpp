@@ -186,12 +186,35 @@ bool DecodeTileFast(const u8* tile, TexturingRegs::TextureFormat format, u32 wid
         }
         return true;
     }
-    case Format::RGB8:
-        DecodeTileTexels<3>(tile, width, tile_out, [](const u8* p) {
-            return static_cast<u32>(p[2]) | (static_cast<u32>(p[1]) << 8) |
-                   (static_cast<u32>(p[0]) << 16) | 0xFF000000u;
-        });
+    case Format::RGB8: {
+        /**
+         * RGB8 CON NEON (0.4.6.4). El video de Yo-kai Watch 3 es una textura de 512x512 en
+         * RGB8 que cambia entera cada fotograma, y texel a texel (tres cargas de un byte y la
+         * posicion Morton de cada uno) eran ~14 ms. Ahora el mosaico entero se convierte en
+         * orden Morton de ocho en ocho (vld3 separa los canales) y luego cada fila son
+         * cuatro parejas de texeles seguidos, como en RGBA8. Mismos bytes: R = p[2],
+         * G = p[1], B = p[0], A = 255.
+         */
+        alignas(16) u32 linear[64];
+        const uint8x8_t opaque = vdup_n_u8(0xFF);
+        for (u32 i = 0; i < 8; i++) {
+            const uint8x8x3_t in = vld3_u8(tile + i * 24);
+            uint8x8x4_t texels;
+            texels.val[0] = in.val[2];
+            texels.val[1] = in.val[1];
+            texels.val[2] = in.val[0];
+            texels.val[3] = opaque;
+            vst4_u8(reinterpret_cast<u8*>(linear + i * 8), texels);
+        }
+        const u32* morton = VideoCore::kMortonValues.data();
+        for (u32 y = 0; y < 8; y++, morton += 8) {
+            u32* out = tile_out + y * width;
+            vst1q_u32(out, vcombine_u32(vld1_u32(linear + morton[0]), vld1_u32(linear + morton[2])));
+            vst1q_u32(out + 4,
+                      vcombine_u32(vld1_u32(linear + morton[4]), vld1_u32(linear + morton[6])));
+        }
         return true;
+    }
     case Format::RGB5A1:
         DecodeTile16Neon(tile, width, tile_out, [](uint16x8_t v) {
             const uint16x8_t mask5 = vdupq_n_u16(0x1F);
@@ -295,6 +318,36 @@ void WriteSwizzled(u32* dst, const u32* src, u32 width, u32 height) {
     const u32 square_mask = side * side - 1;
     const u32 total = width * height;
     const bool wide = width >= height;
+#if defined(__ARM_NEON)
+    /**
+     * DE 16 EN 16 (0.4.6.2). Las cuentas de la posicion en cada texel eran lo que mas
+     * costaba de las texturas: un cuadrado de 4x4 es consecutivo en Z y tiene siempre la
+     * misma forma, asi que basta con calcular su esquina. Y salen 64 bytes seguidos hacia
+     * la memoria de la GPU, que es lo que su combinacion de escrituras hace bien.
+     */
+    if (side >= 4) {
+        for (u32 i = 0; i < total; i += 16) {
+            const u32 low = i & square_mask;
+            u32 x = CompactEvenBits(low >> 1);
+            u32 y = CompactEvenBits(low);
+            const u32 upper = (i >> (2 * k)) << k;
+            if (wide) {
+                x += upper;
+            } else {
+                y += upper;
+            }
+            const u32* row = src + static_cast<std::size_t>(y) * width + x;
+            const uint32x4x2_t top = vzipq_u32(vld1q_u32(row), vld1q_u32(row + width));
+            const uint32x4x2_t bottom =
+                vzipq_u32(vld1q_u32(row + 2 * width), vld1q_u32(row + 3 * width));
+            vst1q_u32(dst + i, top.val[0]);
+            vst1q_u32(dst + i + 4, bottom.val[0]);
+            vst1q_u32(dst + i + 8, top.val[1]);
+            vst1q_u32(dst + i + 12, bottom.val[1]);
+        }
+        return;
+    }
+#endif
     for (u32 i = 0; i < total; i++) {
         const u32 low = i & square_mask;
         u32 x = CompactEvenBits(low >> 1);
@@ -313,8 +366,21 @@ void DecodeTileRow(const u8* row_source, const Pica::Texture::TextureInfo& info,
                    u32* band) {
     const bool etc1 = info.format == TexturingRegs::TextureFormat::ETC1;
     const bool etc1a4 = info.format == TexturingRegs::TextureFormat::ETC1A4;
+    /**
+     * LO QUE VIENE, PEDIDO ANTES (0.4.6.4). Lo que se decodifica casi nunca esta en la
+     * cache: acaba de escribirlo el juego, una copia o un DMA, y leer asi va a ~130 MB/s
+     * (banco de memoria de 0.4.0.9) frente a ~480 pidiendolo 128 bytes antes. El video de
+     * Yo-kai Watch 3 (512x512 RGB8, 768 KB en cada fotograma) se iba en eso.
+     */
+    const u32 tile_size = static_cast<u32>(info.tile_size);
+    for (u32 offset = 0; offset < 128 && offset < tile_size * (width / 8); offset += 32) {
+        __builtin_prefetch(row_source + offset);
+    }
     for (u32 tile_x = 0; tile_x < width / 8; tile_x++) {
         const u8* tile = row_source + tile_x * info.tile_size;
+        for (u32 offset = 0; offset < tile_size; offset += 32) {
+            __builtin_prefetch(tile + 128 + offset);
+        }
         u32* tile_out = band + tile_x * 8;
         if (etc1 || etc1a4) {
             const std::size_t subtile_size = etc1a4 ? 16 : 8;
@@ -380,6 +446,8 @@ void TextureCache::Retire(Entry& entry) {
     entry.dirty_end = 0;
     entry.fill_tag = 0;
     entry.pending_fill_tag = 0;
+    entry.changed_streak = 0;
+    entry.changed_skips = 0;
     entry.band_hashes.clear();
     shadow_bytes -= static_cast<u32>(entry.shadow.size() * sizeof(u32));
     std::vector<u32>().swap(entry.shadow);
@@ -654,10 +722,12 @@ bool TextureCache::ApplyUnitSampler(u32 unit, const Pica::RegsInternal& regs,
     if (!MapWrap(config->wrap_s.Value(), &wrap_s) || !MapWrap(config->wrap_t.Value(), &wrap_t)) {
         return false;
     }
-    const bool min_linear =
-        config->min_filter == TexturingRegs::TextureConfig::TextureFilter::Linear;
-    const bool mag_linear =
-        config->mag_filter == TexturingRegs::TextureConfig::TextureFilter::Linear;
+    const bool shadow_texture =
+        unit == 0 && config->type == TexturingRegs::TextureConfig::Shadow2D;
+    const bool min_linear = !shadow_texture && config->min_filter ==
+                                                   TexturingRegs::TextureConfig::TextureFilter::Linear;
+    const bool mag_linear = !shadow_texture && config->mag_filter ==
+                                                   TexturingRegs::TextureConfig::TextureFilter::Linear;
     sceGxmTextureSetMinFilter(&texture, min_linear ? SCE_GXM_TEXTURE_FILTER_LINEAR
                                                    : SCE_GXM_TEXTURE_FILTER_POINT);
     sceGxmTextureSetMagFilter(&texture, mag_linear ? SCE_GXM_TEXTURE_FILTER_LINEAR
@@ -717,8 +787,11 @@ const SceGxmTexture* TextureCache::Get(u32 unit, const Pica::RegsInternal& regs,
     // La unidad 0 tiene tipo (2D, proyeccion, cubo, sombra). El resto no.
     // Proyectada es una textura 2D normal: lo que cambia es la coordenada
     // (dividida por w en el shader), no la imagen. Cubo y sombra no.
+    // La de sombra tambien (0.4.6.4): es una imagen 2D, la comparacion va en el shader.
+    const bool shadow_texture =
+        unit == 0 && config->type == TexturingRegs::TextureConfig::Shadow2D;
     if (unit == 0 && config->type != TexturingRegs::TextureConfig::Texture2D &&
-        config->type != TexturingRegs::TextureConfig::Projection2D) {
+        config->type != TexturingRegs::TextureConfig::Projection2D && !shadow_texture) {
         rejects[kRejectType].fetch_add(1, std::memory_order_relaxed);
         return nullptr;
     }
@@ -784,10 +857,11 @@ const SceGxmTexture* TextureCache::Get(u32 unit, const Pica::RegsInternal& regs,
         return nullptr;
     }
 
-    const bool min_linear =
-        config->min_filter == TexturingRegs::TextureConfig::TextureFilter::Linear;
-    const bool mag_linear =
-        config->mag_filter == TexturingRegs::TextureConfig::TextureFilter::Linear;
+    // Sin filtro la de sombra: se filtra el resultado de comparar, no la profundidad.
+    const bool min_linear = !shadow_texture && config->min_filter ==
+                                                   TexturingRegs::TextureConfig::TextureFilter::Linear;
+    const bool mag_linear = !shadow_texture && config->mag_filter ==
+                                                   TexturingRegs::TextureConfig::TextureFilter::Linear;
 
     /**
      * La clave, en campos de bits que NO se pisan.
@@ -845,15 +919,36 @@ const SceGxmTexture* TextureCache::Get(u32 unit, const Pica::RegsInternal& regs,
                     const u32 first = std::min(entry.dirty_begin / entry.stride, bands);
                     const u32 end_band =
                         std::min((entry.dirty_end + entry.stride - 1) / entry.stride, bands);
-                    for (u32 b = first; b < end_band; b++) {
-                        const u64 hash = Common::ComputeHash64(
-                            bytes + static_cast<std::size_t>(b) * entry.stride, entry.stride);
-                        if (hash != entry.band_hashes[b]) {
+                    /**
+                     * LAS QUE SIEMPRE CAMBIAN (0.4.6.2). Un video es una textura distinta
+                     * en cada fotograma, y a Yo-kai Watch 3 le costaba 1,5 ms por fotograma
+                     * comprobarlo, y otros tantos volver a calcular esos hashes al decodificar.
+                     * Tras varias seguidas distintas se da por cambiada sin mirar, salvo
+                     * una de cada ocho: si deja de cambiar, ahi se ve.
+                     */
+                    const bool assume_changed = !entry.shadow.empty() &&
+                                                entry.changed_streak >= kChangedStreak &&
+                                                (++entry.changed_skips & 7u) != 0;
+                    if (assume_changed) {
+                        for (u32 b = first; b < end_band; b++) {
                             changed_bands.push_back(b);
                         }
+                    } else {
+                        for (u32 b = first; b < end_band; b++) {
+                            const u64 hash = Common::ComputeHash64(
+                                bytes + static_cast<std::size_t>(b) * entry.stride, entry.stride);
+                            if (hash != entry.band_hashes[b]) {
+                                changed_bands.push_back(b);
+                                entry.band_hashes[b] = hash;
+                            }
+                        }
+                        Common::FrameStats::texture_rehash_bytes.fetch_add(
+                            (end_band - first) * entry.stride, std::memory_order_relaxed);
+                        entry.changed_streak = changed_bands.empty()
+                                                   ? u8{0}
+                                                   : static_cast<u8>(std::min<u32>(
+                                                         entry.changed_streak + 1u, kChangedStreak));
                     }
-                    Common::FrameStats::texture_rehash_bytes.fetch_add(
-                        (end_band - first) * entry.stride, std::memory_order_relaxed);
                     same = changed_bands.empty();
                     partial = !same && !entry.shadow.empty();
                 } else {
@@ -1210,7 +1305,6 @@ bool TextureCache::RedecodeBands(Entry& entry, const u8* source,
     band.resize(static_cast<std::size_t>(width) * 8);
     for (const u32 tile_y : changed) {
         const u8* row_source = source + static_cast<std::size_t>(tile_y) * info.stride;
-        entry.band_hashes[tile_y] = Common::ComputeHash64(row_source, info.stride);
         DecodeTileRow(row_source, info, width, band.data());
         for (u32 line = 0; line < 8; line++) {
             const u32 dest_y = height - 1 - (tile_y * 8 + line);

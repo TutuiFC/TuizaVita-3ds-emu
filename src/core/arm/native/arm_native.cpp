@@ -428,6 +428,8 @@ void CtxToState(const AzGuestCtx& ctx, ARMul_State& state) {
 
 bool enabled = false;
 bool both_cores = false;
+u32 min_slice_us = 2;
+s64 min_sleep_ns = 0;
 
 /// El resumen, sin reiniciar los contadores (lo llama tambien TryRun).
 /**
@@ -550,13 +552,21 @@ bool TryRun(ARMul_State& state, u64 max_instructions, u32& ticks, bool& then_int
      * interprete entera: por debajo de eso el peaje del cambio de mundo seria
      * la mitad del tiempo.
      */
+    /**
+     * Y DE 2 A LO QUE DIGA EL AJUSTE (0.4.4.7). En Kirby Triple Deluxe (8.247
+     * despertares de hilo por segundo) el 44 % de las rodajas caia por debajo
+     * de 2 us y se iba al JIT: hasta ~1.766 instrucciones a ~25 MIPS, unos 70
+     * us, frente a ~2 us + 5 de peaje en nativo. Con 0, toda rodaja va al
+     * motor nativo; la mas corta se le pide de 1 us.
+     */
     const u64 budget = max_instructions / kInstrPerUs;
-    if (budget < kMinSliceUs) {
+    if (budget < min_slice_us) {
         g_last_bail = "rodaja corta";
         g_native_bails++;
         return false;
     }
-    const u32 budget_us = budget > kSliceUs ? kSliceUs : static_cast<u32>(budget);
+    const u32 budget_us =
+        budget > kSliceUs ? kSliceUs : std::max<u32>(1, static_cast<u32>(budget));
 
     StateToCtx(state, ctx);
 
@@ -859,6 +869,8 @@ bool DecodeSvc(Memory::MemorySystem&, u32, bool, u32&) {
 }
 bool enabled = false;
 bool both_cores = false;
+u32 min_slice_us = 2;
+s64 min_sleep_ns = 0;
 bool TryRun(ARMul_State&, u64, u32& ticks, bool& then_interpreter) {
     then_interpreter = false;
     ticks = 0;

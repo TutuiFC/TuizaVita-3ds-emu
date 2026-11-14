@@ -167,14 +167,21 @@ void DrainRing() {
     g_report_max_us = 0;
 }
 
+void SyncOpenLogs(); // mas abajo, junto a los ficheros abiertos
+
 void* NoteWriterMain(void*) {
     // Por encima del compilador de shaders, que comparte nucleo y pasa
     // minutos sin soltarlo, y por debajo de todo lo demas.
     sceKernelChangeThreadPriority(sceKernelGetThreadId(), kVitaPriorityBackground - 1);
+    unsigned int rounds = 0;
     while (true) {
         sceKernelDelayThread(kNoteFlushUs);
         const std::lock_guard lock{g_write_mutex};
         DrainRing();
+        // Cada ~3 s, a la tarjeta de verdad (ver SyncOpenLogs).
+        if (++rounds % 6 == 0) {
+            SyncOpenLogs();
+        }
     }
     return nullptr;
 }
@@ -272,6 +279,30 @@ void WriteTo(std::atomic<int>& cached, const char* path, const char* line, std::
         }
     }
     sceIoWrite(fd, line, n);
+}
+
+/**
+ * LOS REGISTROS A LA TARJETA DE VERDAD (0.4.4.5). Un GPUCRASH reinicia la
+ * consola de golpe, y lo escrito en ficheros abiertos que aun no habia bajado a
+ * la tarjeta se perdia: de los cuelgues de Yo-kai Watch 3 del 03-11 no quedo ni
+ * el crash.txt ni el del juego. Cada ~3 s se vuelcan; asi queda hasta unos
+ * segundos antes del cuelgue.
+ *
+ * sceIoSyncByFd no bastaba: tras otro GPUCRASH crash.txt seguia con el tamano
+ * de antes de abrirlo (lo del menu, 1688 bytes) y el del juego ni se habia
+ * renombrado. Lo que de verdad lo deja en la tarjeta es cerrarlo; la siguiente
+ * linea lo vuelve a abrir (WriteTo, en modo anadir).
+ */
+void SyncOpenLogs() {
+    for (std::atomic<int>* cached : {&g_crash_fd, &g_game_fd}) {
+        const int fd = cached->exchange(-1, std::memory_order_acq_rel);
+        if (fd >= 0) {
+            sceIoSyncByFd(fd, 0);
+            sceIoClose(fd);
+        }
+    }
+    // Y la carpeta: el renombrado del registro del juego tampoco quedaba.
+    sceIoSync("ux0:", 0);
 }
 
 void WriteLogLine(const char* line, std::size_t n) {
@@ -588,6 +619,95 @@ inline void WriteFpscr(unsigned int value) {
 #endif
 }
 } // Anonymous namespace
+
+namespace {
+std::atomic<unsigned int> g_gpu_samples[kGpuTagCount]{};
+constexpr unsigned int kGpuRegs = 0x300;
+std::atomic<unsigned int> g_gpu_reg_samples[kGpuRegs]{};
+
+int GpuSamplerMain(SceSize, void*) {
+    VitaPinThreadToUserCore(2, "muestreo gpu");
+    VitaSetThreadPriority(kVitaPriorityHelper - 2, "muestreo gpu");
+    while (true) {
+        const unsigned char tag = vita_gpu_tag;
+        if (tag < kGpuTagCount) {
+            g_gpu_samples[tag].fetch_add(1, std::memory_order_relaxed);
+        }
+        if (tag == kGpuTagSpecial) {
+            const unsigned short reg = vita_gpu_reg;
+            if (reg < kGpuRegs) {
+                g_gpu_reg_samples[reg].fetch_add(1, std::memory_order_relaxed);
+            }
+        }
+        sceKernelDelayThread(1000);
+    }
+    return 0;
+}
+} // Anonymous namespace
+
+void VitaStartGpuSampler() {
+    static bool started = false;
+    if (started || !vita_gpu_sampler_on) {
+        return;
+    }
+    started = true;
+    const SceUID thread = sceKernelCreateThread("muestreo gpu", &GpuSamplerMain, 64, 16 * 1024, 0,
+                                                0, nullptr);
+    if (thread >= 0) {
+        sceKernelStartThread(thread, 0, nullptr);
+    }
+}
+
+std::string VitaTakeGpuSamples() {
+    static constexpr const char* kNames[kGpuTagCount] = {
+        "sin trabajo", "orden", "decodificar", "registros", "preguntas", "vs",     "enlazar",
+        "datos",       "estado", "uniforms",   "fin lote",  "texturas",  "dibujo", "presentar",
+        "puerto uniformes", "puerto programa", "vertices cpu", "relleno", "transferencia", "dma",
+        "espera chip", "barrido"};
+    unsigned int counts[kGpuTagCount];
+    unsigned int total = 0;
+    for (unsigned int i = 0; i < kGpuTagCount; i++) {
+        counts[i] = g_gpu_samples[i].exchange(0, std::memory_order_relaxed);
+        total += counts[i];
+    }
+    if (total == 0) {
+        return {};
+    }
+    const unsigned int busy = total - counts[kGpuTagIdle];
+    std::string text = fmt::format("{} muestras, ocupado {:.1f} %:", total,
+                                   100.0 * static_cast<double>(busy) / static_cast<double>(total));
+    for (unsigned int i = 1; i < kGpuTagCount; i++) {
+        text += fmt::format(" {} {:.1f}", kNames[i],
+                            100.0 * static_cast<double>(counts[i]) / static_cast<double>(total));
+    }
+    // Los registros que mas tiempo se llevan dentro de "registros".
+    unsigned int reg_counts[kGpuRegs];
+    for (unsigned int i = 0; i < kGpuRegs; i++) {
+        reg_counts[i] = g_gpu_reg_samples[i].exchange(0, std::memory_order_relaxed);
+    }
+    {
+        const unsigned int commands = vita_gpu_cmds;
+        vita_gpu_cmds = 0;
+        text += fmt::format(" | ordenes rapidas {}", commands);
+    }
+    text += " | registros:";
+    for (int shown = 0; shown < 8; shown++) {
+        unsigned int best = 0;
+        for (unsigned int i = 1; i < kGpuRegs; i++) {
+            if (reg_counts[i] > reg_counts[best]) {
+                best = i;
+            }
+        }
+        if (reg_counts[best] == 0) {
+            break;
+        }
+        text += fmt::format(" {:#x} {:.1f}", best,
+                            100.0 * static_cast<double>(reg_counts[best]) /
+                                static_cast<double>(total));
+        reg_counts[best] = 0;
+    }
+    return text;
+}
 
 void VitaEnableFastFloatMode() {
     // Bit 24 = FZ (flush-to-zero), bit 25 = DN (default NaN).

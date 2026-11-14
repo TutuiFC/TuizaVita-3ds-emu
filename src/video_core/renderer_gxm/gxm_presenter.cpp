@@ -386,7 +386,7 @@ ScreenPresenter::Source ScreenPresenter::PrepareScreen(Screen& screen,
                 } else {
                     // Escalada (resolucion x2): lineal, o al reducirla al
                     // tamano de la pantalla se perderian filas enteras.
-                    const SceGxmTextureFilter filter = direct.scale != 2
+                    const SceGxmTextureFilter filter = direct.scale != 4
                                                            ? SCE_GXM_TEXTURE_FILTER_LINEAR
                                                            : SCE_GXM_TEXTURE_FILTER_POINT;
                     sceGxmTextureSetMinFilter(&screen.texture, filter);
@@ -416,7 +416,7 @@ ScreenPresenter::Source ScreenPresenter::PrepareScreen(Screen& screen,
                     static_cast<SceGxmTextureFormat>(direct.gxm_texture_format), direct.width,
                     direct.height, direct.stride_bytes);
                 if (rc >= 0) {
-                    const SceGxmTextureFilter filter = direct.scale != 2
+                    const SceGxmTextureFilter filter = direct.scale != 4
                                                            ? SCE_GXM_TEXTURE_FILTER_LINEAR
                                                            : SCE_GXM_TEXTURE_FILTER_POINT;
                     sceGxmTextureSetMinFilter(&screen.texture, filter);

@@ -4,9 +4,12 @@
 
 #include "video_core/shader/generator/cg_fs_shader_gen.h"
 
+#include <algorithm>
 #include <array>
 #include <cctype>
+#include <optional>
 #include <string_view>
+#include <vector>
 #include <fmt/format.h>
 #include "common/logging/log.h"
 #include "video_core/pica/regs_framebuffer.h"
@@ -130,8 +133,11 @@ bool IsSupported(const FSConfig& config, const char** out_reason) {
      * textura de sombra (que ya esta fuera por texture0_type) y mezcla su
      * resultado en la difusa y la especular. Queda para cuando haya sombras.
      */
-    if (config.lighting.enable_shadow) {
-        return reject("luz con sombra");
+    // La sombra de la iluminacion, desde 0.4.6.4 (ver WriteLighting), solo de las tres
+    // unidades de textura: la cuarta es la procedural, que sigue en software.
+    if (config.lighting.enable && config.lighting.enable_shadow &&
+        config.lighting.shadow_selector.Value() > 2) {
+        return reject("luz con sombra procedural");
     }
     // Texturas procedurales: necesitan noise y LUTs de la PICA.
     if (config.proctex.enable) {
@@ -168,7 +174,8 @@ bool IsSupported(const FSConfig& config, const char** out_reason) {
     case TexturingRegs::TextureConfig::ShadowCube:
         return reject("textura 0 sombra de cubo");
     case TexturingRegs::TextureConfig::Shadow2D:
-        return reject("textura 0 sombra 2D");
+        // Desde 0.4.6.4: ver LA TEXTURA DE SOMBRA en WriteTextureSamples.
+        break;
     default:
         return reject("tipo de textura 0 desconocido");
     }
@@ -220,7 +227,7 @@ public:
                 out += "float4 normquat : TEXCOORD3, float3 view : TEXCOORD4, ";
                 touch += " + normquat + float4(view, 0.0)";
             }
-            if (IsProjected()) {
+            if (NeedsW()) {
                 out += "float tc0_w : TEXCOORD5, ";
                 touch += " + float4(tc0_w, 0.0, 0.0, 0.0)";
             }
@@ -242,9 +249,10 @@ public:
             // interpolarlos en cada pixel para nada, asi que van aqui dentro.
             out += "float4 normquat : TEXCOORD3, float3 view : TEXCOORD4, ";
         }
-        if (IsProjected()) {
+        if (NeedsW()) {
             // La W de la coordenada 0: solo la escriben las variantes _proj
             // del shader de vertices (kVertexSourceProj en rasterizer_gxm.cpp).
+            // La textura de sombra tambien la lee: es su profundidad.
             out += "float tc0_w : TEXCOORD5, ";
         }
         out += "float4 gl_FragCoord : WPOS, "
@@ -261,7 +269,14 @@ public:
         // depender de eso.
         WriteTextureSamples();
 
-        out += "    float4 rounded_primary_color = byteround(primary_color);\n";
+        /**
+         * Con el color y el alfa sueltos (0.4.4.7) el color del vertice no se
+         * redondea: 3-5 instrucciones en casi cada shader para una diferencia de
+         * medio escalon de 8 bits como mucho, la misma que ya se acepta entre
+         * etapas. El vertice lo deja ya en [0, 1] (min(abs(...), 1) en su shader).
+         */
+        out += loose_alpha ? "    float4 rounded_primary_color = primary_color;\n"
+                           : "    float4 rounded_primary_color = byteround(primary_color);\n";
         /**
          * Los dos colores de la ILUMINACION arrancan en NEGRO, no en el color
          * del vertice.
@@ -336,7 +351,8 @@ public:
          * sobre k/255 da 2k/255 o 4k/255 exactos), asi que sin la mezcla de la
          * niebla redondear otra vez da el mismo valor y es trabajo por pixel.
          */
-        if (config.texture.fog_mode == TexturingRegs::FogMode::Fog) {
+        // Con el alfa suelto (loose_alpha) no se redondea: el framebuffer ya lo hace.
+        if (config.texture.fog_mode == TexturingRegs::FogMode::Fog && !loose_alpha) {
             out += "    combiner_output = byteround(combiner_output);\n";
         }
         out += "    gl_FragColor = combiner_output;\n";
@@ -468,6 +484,9 @@ private:
             config.lighting.bump_mode != LightingRegs::LightingBumpMode::None) {
             MarkTextureUnit(config.lighting.bump_selector.Value());
         }
+        if (config.lighting.enable && config.lighting.enable_shadow) {
+            MarkTextureUnit(config.lighting.shadow_selector.Value());
+        }
         for (const auto& stage : config.texture.tev_stages) {
             const TexturingRegs::TevStageConfig tev = stage;
             const std::array<Source, 3> color_sources = {tev.color_source1.Value(),
@@ -562,6 +581,15 @@ private:
          * que el rasterizador ya sabe saltarse.
          */
         out += "uniform float4 tev_combiner_buffer_color;\n";
+        if (uses_tex0 && IsShadow2D()) {
+            // Ancho y alto de la textura de sombra y el sesgo (ya por dos, en unidades de
+            // la profundidad de 24 bits). Ver LA TEXTURA DE SOMBRA.
+            out += "uniform float3 shadow_params;\n"
+                   "float ShadowTest(float4 texel, float z)\n{\n"
+                   "    float stored = floor(texel.a * 255.0 + 0.5) * 65536.0 + "
+                   "floor(texel.b * 255.0 + 0.5) * 256.0 + floor(texel.g * 255.0 + 0.5);\n"
+                   "    return stored >= z ? texel.r : 0.0;\n}\n";
+        }
         if (alpha_from_blend_const) {
             out += "uniform float blend_const_alpha;\n";
         }
@@ -679,7 +707,41 @@ private:
                 "    float4 texcolor{0} = ({1}) ? tex_border_color[{0}] : raw_tex{0};\n", unit,
                 condition);
         };
-        if (uses_tex0 && IsProjected()) {
+        if (uses_tex0 && IsShadow2D()) {
+            /**
+             * LA TEXTURA DE SOMBRA (0.4.6.4). Luigi's Mansion 2 la usa en cada lote de su
+             * casa, y en software caia a 0,7 FPS. Sus texeles no son color: tres bytes de
+             * profundidad y la densidad de la sombra (ver DecodeD24S8Shadow). Como
+             * TextureColor del rasterizador de software: la profundidad del fragmento sale
+             * de la W de la coordenada 0, se le resta el sesgo, y donde la guardada es
+             * mayor o igual, la densidad; si no, 0. La textura se lee sin filtro y aqui se
+             * comparan los cuatro texeles vecinos y se interpolan, como el hardware y el
+             * backend de OpenGL. La decodificacion deja R = byte 3 (densidad) y G, B, A =
+             * bytes 2, 1, 0 (la profundidad, de menor a mayor).
+             */
+            if (config.texture.shadow_texture_orthographic != 0) {
+                out += "    float2 tc0_shadow = tc0;\n";
+            } else {
+                out += "    float2 tc0_shadow = tc0 / tc0_w;\n";
+            }
+            out += "    float shadow_z = floor(min(abs(tc0_w), 1.0) * 16777215.0) - "
+                   "shadow_params.z;\n"
+                   "    float2 shadow_coord = tc0_shadow * shadow_params.xy - float2(0.5, 0.5);\n"
+                   "    float2 shadow_base = floor(shadow_coord);\n"
+                   "    float2 shadow_f = shadow_coord - shadow_base;\n"
+                   "    float2 shadow_texel = float2(1.0, 1.0) / shadow_params.xy;\n"
+                   "    float2 shadow_uv = (shadow_base + float2(0.5, 0.5)) * shadow_texel;\n"
+                   "    float shadow_s0 = ShadowTest(tex2D(tex0, shadow_uv), shadow_z);\n"
+                   "    float shadow_s1 = ShadowTest(tex2D(tex0, shadow_uv + "
+                   "float2(shadow_texel.x, 0.0)), shadow_z);\n"
+                   "    float shadow_s2 = ShadowTest(tex2D(tex0, shadow_uv + "
+                   "float2(0.0, shadow_texel.y)), shadow_z);\n"
+                   "    float shadow_s3 = ShadowTest(tex2D(tex0, shadow_uv + shadow_texel), "
+                   "shadow_z);\n"
+                   "    float shadow_v = lerp(lerp(shadow_s0, shadow_s1, shadow_f.x), "
+                   "lerp(shadow_s2, shadow_s3, shadow_f.x), shadow_f.y);\n"
+                   "    float4 texcolor0 = float4(shadow_v, shadow_v, shadow_v, shadow_v);\n";
+        } else if (uses_tex0 && IsProjected()) {
             // Proyeccion: u/w y v/w, como TextureColor del rasterizador de
             // software, y DESPUES todo lo demas (borde incluido) con la
             // coordenada ya dividida. Las tres interpoladas con correccion de
@@ -700,6 +762,15 @@ private:
     bool IsProjected() const {
         return config.texture.texture0_type.Value() ==
                TexturingRegs::TextureConfig::Projection2D;
+    }
+
+    bool IsShadow2D() const {
+        return config.texture.texture0_type.Value() == TexturingRegs::TextureConfig::Shadow2D;
+    }
+
+    /// La W de la coordenada 0: la proyectada divide por ella y la de sombra es su z.
+    bool NeedsW() const {
+        return IsProjected() || IsShadow2D();
     }
 
     std::string GetSource(Source source, u32 tev_index) {
@@ -962,7 +1033,7 @@ private:
     }
 
     void WriteAlphaTestCondition(FramebufferRegs::CompareFunc func) {
-        const auto get_cond = [func]() -> std::string {
+        const auto get_cond = [this, func]() -> std::string {
             switch (func) {
             case FramebufferRegs::CompareFunc::Never:
                 return "true";
@@ -1003,6 +1074,36 @@ private:
                  * int son carisimas en la USSE: un shader con prueba de alfa
                  * paso de 77 a 61 instrucciones solo con esto.
                  */
+                /**
+                 * Y SIN floor (0.4.4.7). Con u = alfa * 255 y la referencia
+                 * entera R, floor(u + 0.5) comparado con R es lo mismo que u
+                 * comparado con R - 0.5 o R + 0.5 (u + 0.5 y R +- 0.5 son
+                 * exactos en float): mismo resultado en cada pixel, y la
+                 * referencia +- 0.5 la calcula Cg una vez por lote en el
+                 * programa secundario. Dos instrucciones menos (vfrc y resta).
+                 * Con fs_alfa_exacto=1, la forma de siempre.
+                 */
+                if (loose_alpha) {
+                    static constexpr std::array<const char*, 6> conds = {
+                        "u < alphatest_ref - 0.5 || u >= alphatest_ref + 0.5", // Equal
+                        "u >= alphatest_ref - 0.5 && u < alphatest_ref + 0.5", // NotEqual
+                        "u >= alphatest_ref - 0.5",                            // LessThan
+                        "u >= alphatest_ref + 0.5",                            // LessThanOrEqual
+                        "u < alphatest_ref + 0.5",                             // GreaterThan
+                        "u < alphatest_ref - 0.5",                             // GreaterThanOrEqual
+                    };
+                    std::string cond = conds[index];
+                    std::string expanded;
+                    for (std::size_t i = 0; i < cond.size(); i++) {
+                        if (cond[i] == 'u' && (i == 0 || cond[i - 1] == ' ') &&
+                            (i + 1 == cond.size() || cond[i + 1] == ' ')) {
+                            expanded += "(combiner_output.a * 255.0)";
+                        } else {
+                            expanded += cond[i];
+                        }
+                    }
+                    return expanded;
+                }
                 return fmt::format("floor(combiner_output.a * 255.0 + 0.5) {} alphatest_ref",
                                    ops[index]);
             }
@@ -1062,8 +1163,37 @@ private:
         out += "    float3 normal = quaternion_rotate(normalized_normquat, surface_normal);\n";
         out += "    float3 tangent = quaternion_rotate(normalized_normquat, surface_tangent);\n";
 
+        /**
+         * LA SOMBRA DE LA ILUMINACION (0.4.6.4), como el generador de GLSL: el color de
+         * la unidad elegida (con una textura de sombra en la 0, lo que sale de comparar),
+         * invertido si se pide, multiplica la difusa y/o la especular de las luces que
+         * la tienen encendida, y el alfa de las sumas si se pide.
+         */
+        if (lighting.enable_shadow) {
+            const std::string unit = fmt::format("texcolor{}", lighting.shadow_selector.Value());
+            out += lighting.shadow_invert
+                       ? fmt::format("    float4 shadow = float4(1.0, 1.0, 1.0, 1.0) - {};\n", unit)
+                       : fmt::format("    float4 shadow = {};\n", unit);
+            out += "    float4 shadow_rgb = float4(shadow.rgb, 1.0);\n";
+        }
+
         for (u32 slot = 0; slot < lighting.src_num; slot++) {
             WriteLight(slot);
+        }
+        if (lighting.enable_shadow && lighting.shadow_alpha) {
+            if (lighting.enable_primary_alpha) {
+                out += "    diffuse_sum.a *= shadow.a;\n";
+            }
+            if (lighting.enable_secondary_alpha) {
+                out += "    specular_sum.a *= shadow.a;\n";
+            }
+        }
+        if (lut_batch) {
+            out += light_prefixes;
+            out += EmitLutBatch();
+            out += light_bodies;
+            light_prefixes.clear();
+            light_bodies.clear();
         }
 
         out += "    diffuse_sum.rgb += lighting_global_ambient.rgb;\n";
@@ -1164,9 +1294,89 @@ private:
             index = lighting.lights[slot].two_sided_diffuse != 0
                         ? fmt::format("abs({})", index)
                         : fmt::format("max({}, 0.0)", index);
-            return fmt::format("LookupLightingLUTUnsigned({}.0, {})", row, index);
+            return LutValue(row, index, false);
         }
-        return fmt::format("LookupLightingLUTSigned({}.0, {})", row, index);
+        return LutValue(row, index, true);
+    }
+
+    /**
+     * LAS TABLAS DE LUZ EN LOTE (0.4.4.6, ajuste fs_lut_vector). Cada lectura de
+     * tabla iba suelta: indice, recorte, fraccion, envoltura de los negativos y
+     * coordenada para UN valor, unas 10-15 instrucciones de un solo componente
+     * cada una. Medido en la consola (03-11): en el USSE una instruccion cuesta
+     * lo mismo con un componente que con cuatro, y los shaders con luz y niebla
+     * de Mario 3D Land se llevaban la mitad del tiempo de pixeles. Ahora las
+     * lecturas de cada luz se apuntan aqui y EmitLutBatch las hace de cuatro en
+     * cuatro con las mismas cuentas: la envoltura "indice < 0 ? indice + 256"
+     * sale de indice - 256 * floor(indice / 256), que con el indice entre -128
+     * y 255 da exactamente lo mismo.
+     */
+    struct LutLookup {
+        std::string index;
+        u32 row;
+        bool is_signed;
+    };
+
+    std::string LutValue(u32 row, const std::string& index, bool is_signed) {
+        if (!lut_batch) {
+            return fmt::format("LookupLightingLUT{}({}.0, {})", is_signed ? "Signed" : "Unsigned",
+                               row, index);
+        }
+        const std::size_t k = luts.size();
+        luts.push_back({RenameLightVars(index, lut_light_slot), row, is_signed});
+        return fmt::format("lut_v{}_{}.{}", lut_batch_id, k / 4, "xyzw"[k % 4]);
+    }
+
+    std::string EmitLutBatch() {
+        std::string code;
+        for (std::size_t g = 0; g * 4 < luts.size(); g++) {
+            const std::size_t n = std::min<std::size_t>(4, luts.size() - g * 4);
+            const auto lanes = [&](const auto& per_lane) {
+                std::string s = "float4(";
+                for (std::size_t k = 0; k < 4; k++) {
+                    s += k < n ? per_lane(luts[g * 4 + k]) : std::string("0.0");
+                    s += k < 3 ? ", " : ")";
+                }
+                return s;
+            };
+            const std::string id = fmt::format("{}_{}", lut_batch_id, g);
+            code += fmt::format("    float4 lut_x{} = {} * {};\n", id,
+                                lanes([](const LutLookup& l) { return l.index; }),
+                                lanes([](const LutLookup& l) {
+                                    return std::string(l.is_signed ? "128.0" : "256.0");
+                                }));
+            code += fmt::format("    float4 lut_i{0} = clamp(floor(lut_x{0}), {1}, {2});\n", id,
+                                lanes([](const LutLookup& l) {
+                                    return std::string(l.is_signed ? "-128.0" : "0.0");
+                                }),
+                                lanes([](const LutLookup& l) {
+                                    return std::string(l.is_signed ? "127.0" : "255.0");
+                                }));
+            code += fmt::format("    float4 lut_d{0} = lut_x{0} - lut_i{0};\n", id);
+            code += fmt::format("    float4 lut_u{0} = (lut_i{0} - 256.0 * floor(lut_i{0} / 256.0) "
+                                "+ 0.5) / 256.0;\n",
+                                id);
+            std::string xs = "float4(";
+            std::string ys = "float4(";
+            for (std::size_t k = 0; k < 4; k++) {
+                if (k < n) {
+                    code += fmt::format("    float2 lut_e{0}_{1} = tex2D(lighting_lut, "
+                                        "float2(lut_u{0}.{2}, ({3}.0 + 0.5) / 25.0)).rg;\n",
+                                        id, k, "xyzw"[k], luts[g * 4 + k].row);
+                    xs += fmt::format("lut_e{}_{}.x", id, k);
+                    ys += fmt::format("lut_e{}_{}.y", id, k);
+                } else {
+                    xs += "0.0";
+                    ys += "0.0";
+                }
+                xs += k < 3 ? ", " : ")";
+                ys += k < 3 ? ", " : ")";
+            }
+            code += fmt::format("    float4 lut_v{0} = {1} + {2} * lut_d{0};\n", id, xs, ys);
+        }
+        luts.clear();
+        lut_batch_id++;
+        return code;
     }
 
     /// Una luz del hueco 'slot'. Acumula en diffuse_sum y specular_sum.
@@ -1175,6 +1385,10 @@ private:
         const auto& light = lighting.lights[slot];
         // El hueco dice QUE luz es; el numero dice DONDE estan sus registros.
         const u32 num = light.num.Value();
+        // Ver LIGHT_VARS: el prefijo de esta luz, aparte (lo de antes queda en saved).
+        std::string saved = std::move(out);
+        out.clear();
+        lut_light_slot = slot;
 
         // Direccional: la posicion ES la direccion, ya en espacio del ojo.
         // Posicional: hay que restarle la posicion del fragmento, y 'view' es
@@ -1206,6 +1420,11 @@ private:
             out += "    clamp_highlights = sign(dot_product);\n";
         }
 
+        // Lo que sigue lee las tablas: se escribe aparte y va DESPUES del lote
+        // (EmitLutBatch), que necesita los vectores de arriba y nada de abajo.
+        std::string before_luts = std::move(out);
+        out.clear();
+
         std::string spot_atten = "1.0";
         if (light.spot_atten_enable &&
             LightingRegs::IsLightingSamplerSupported(
@@ -1223,9 +1442,8 @@ private:
                 fmt::format("clamp(light_dist_atten[{0}].y * light_distance + "
                             "light_dist_atten[{0}].x, 0.0, 1.0)",
                             num);
-            dist_atten = fmt::format(
-                "LookupLightingLUTUnsigned({}.0, {})",
-                static_cast<u32>(LightingRegs::DistanceAttenuationSampler(num)), index);
+            dist_atten = LutValue(
+                static_cast<u32>(LightingRegs::DistanceAttenuationSampler(num)), index, false);
         }
 
         if (light.geometric_factor_0 || light.geometric_factor_1) {
@@ -1244,7 +1462,7 @@ private:
             d0_lut_value = fmt::format("({:#} * {})", lighting.lut_d0.GetScale(), value);
         }
         std::string specular_0 =
-            fmt::format("({} * light_specular_0[{}].rgb)", d0_lut_value, num);
+            fmt::format("({} * light_specular_0[{}])", d0_lut_value, num);
         if (light.geometric_factor_0) {
             specular_0 = fmt::format("({} * geo_factor)", specular_0);
         }
@@ -1260,7 +1478,8 @@ private:
                             lighting.lut_d1.type, lighting.lut_d1.abs_input != 0);
             d1_lut_value = fmt::format("({:#} * {})", lighting.lut_d1.GetScale(), value);
         }
-        std::string specular_1 = fmt::format("({} * refl_value * light_specular_1[{}].rgb)",
+        std::string specular_1 =
+            fmt::format("({} * float4(refl_value, 0.0) * light_specular_1[{}])",
                                              d1_lut_value, num);
         if (light.geometric_factor_1) {
             specular_1 = fmt::format("({} * geo_factor)", specular_1);
@@ -1283,11 +1502,95 @@ private:
             }
         }
 
-        out += fmt::format("    diffuse_sum.rgb += ((light_diffuse[{0}].rgb * dot_product) + "
-                           "light_ambient[{0}].rgb) * {1} * {2};\n",
-                           num, dist_atten, spot_atten);
-        out += fmt::format("    specular_sum.rgb += ({} + {}) * clamp_highlights * {} * {};\n",
-                           specular_0, specular_1, dist_atten, spot_atten);
+        /**
+         * EN float4 (0.4.4.7). Las sumas eran .rgb: en el USSE, tres componentes
+         * hacia un registro temporal son dos instrucciones (.xy y .z). Los
+         * colores de las luces llegan con w = 0 (put_color en el rasterizador),
+         * asi que sumando los cuatro el alfa de los acumuladores no cambia.
+         */
+        const bool shadow_on = lighting.enable_shadow && light.shadow_enable;
+        const char* shadow_primary = shadow_on && lighting.shadow_primary ? " * shadow_rgb" : "";
+        const char* shadow_secondary =
+            shadow_on && lighting.shadow_secondary ? " * shadow_rgb" : "";
+        out += fmt::format("    diffuse_sum += ((light_diffuse[{0}] * dot_product{3}) + "
+                           "light_ambient[{0}]) * {1} * {2};\n",
+                           num, dist_atten, spot_atten, shadow_primary);
+        out += fmt::format("    specular_sum += ({} + {}) * clamp_highlights * {} * {}{};\n",
+                           specular_0, specular_1, dist_atten, spot_atten, shadow_secondary);
+
+        std::string after_luts = std::move(out);
+        out = std::move(saved);
+        if (!lut_batch) {
+            out += before_luts;
+            out += after_luts;
+            return;
+        }
+        light_prefixes += LightVarDeclarations(slot);
+        light_prefixes += RenameLightVars(before_luts, slot);
+        light_bodies += RenameLightVars(after_luts, slot);
+    }
+
+    /**
+     * LIGHT_VARS (0.4.4.6): EL LOTE DE TABLAS DE TODAS LAS LUCES. En el escenario
+     * de Pokemon X (4 luces, dos con atenuacion por distancia) cada luz leia su
+     * tabla sola y el lote de una luz era de un valor: 11 instrucciones de un
+     * componente por luz. Ahora cada luz calcula sus vectores en variables
+     * suyas (light_vector_N...), luego va UN lote con las tablas de todas, y
+     * luego lo que suma cada una. Mismas cuentas, en otro orden.
+     */
+    static constexpr std::array<std::pair<const char*, const char*>, 8> kLightVars{{
+        {"light_vector", "float3"},
+        {"light_distance", "float"},
+        {"refl_value", "float3"},
+        {"spot_dir", "float3"},
+        {"half_vector", "float3"},
+        {"dot_product", "float"},
+        {"clamp_highlights", "float"},
+        {"geo_factor", "float"},
+    }};
+
+    static std::string LightVarDeclarations(u32 slot) {
+        std::string code;
+        for (const auto& [name, type] : kLightVars) {
+            const std::string_view t{type};
+            const char* init = t == "float3" ? "float3(0.0, 0.0, 0.0)"
+                               : (std::string_view{name} == "clamp_highlights" ||
+                                  std::string_view{name} == "geo_factor")
+                                   ? "1.0"
+                                   : "0.0";
+            code += fmt::format("    {} {}_{} = {};\n", type, name, slot, init);
+        }
+        return code;
+    }
+
+    /// Cambia cada nombre de kLightVars (palabra entera) por el de la luz 'slot'.
+    static std::string RenameLightVars(const std::string& code, u32 slot) {
+        const auto is_ident = [](char c) {
+            return std::isalnum(static_cast<unsigned char>(c)) != 0 || c == '_';
+        };
+        std::string result;
+        result.reserve(code.size() + 64);
+        std::size_t i = 0;
+        while (i < code.size()) {
+            if (is_ident(code[i]) && (i == 0 || !is_ident(code[i - 1]))) {
+                std::size_t j = i;
+                while (j < code.size() && is_ident(code[j])) {
+                    j++;
+                }
+                const std::string_view word{code.data() + i, j - i};
+                result.append(word);
+                for (const auto& [name, type] : kLightVars) {
+                    if (word == name) {
+                        result += fmt::format("_{}", slot);
+                        break;
+                    }
+                }
+                i = j;
+                continue;
+            }
+            result += code[i++];
+        }
+        return result;
     }
 
     /**
@@ -1337,6 +1640,141 @@ private:
                stage.GetColorMultiplier() == 1 && stage.GetAlphaMultiplier() == 1;
     }
 
+    /**
+     * COLOR Y ALFA EN UNA SOLA CUENTA (0.4.4.7, ajuste fs_tev_junto). Cada
+     * etapa calculaba el color (vec3) y el alfa (escalar) por separado: dos o
+     * tres instrucciones del USSE donde cabe una, y en esta GPU una instruccion
+     * cuesta lo mismo con uno que con cuatro componentes (medido el 03-11).
+     * Cuando la operacion del color y la del alfa son la misma y cada operando
+     * sale de la misma fuente en los dos (con o sin "1 -" a la vez), los
+     * operandos son esa fuente con un swizzle (fuente, fuente.aaaa,
+     * fuente.rgbr...) y la cuenta va en un float4. Las mismas cuentas por
+     * canal; el clamp, si hace falta en uno, se hace en los cuatro (al canal que
+     * no lo necesitaba no le cambia nada). Solo con el color suelto: con el
+     * color exacto cada etapa redondea el color aparte.
+     */
+    std::optional<std::string> FusedOperand(ColorModifier color_mod, Source color_source,
+                                            AlphaModifier alpha_mod, Source alpha_source,
+                                            u32 index) {
+        const TexturingRegs::TevStageConfig stage = config.texture.tev_stages[index];
+        const Source c = index == 0 && color_source == Source::Previous
+                             ? stage.color_source3.Value()
+                             : color_source;
+        const Source a = index == 0 && alpha_source == Source::Previous
+                             ? stage.alpha_source3.Value()
+                             : alpha_source;
+        if (c != a) {
+            return std::nullopt;
+        }
+        const char* color_swizzle = nullptr;
+        bool color_inverted = false;
+        switch (color_mod) {
+        case ColorModifier::SourceColor: color_swizzle = "rgb"; break;
+        case ColorModifier::OneMinusSourceColor: color_swizzle = "rgb"; color_inverted = true; break;
+        case ColorModifier::SourceAlpha: color_swizzle = "aaa"; break;
+        case ColorModifier::OneMinusSourceAlpha: color_swizzle = "aaa"; color_inverted = true; break;
+        case ColorModifier::SourceRed: color_swizzle = "rrr"; break;
+        case ColorModifier::OneMinusSourceRed: color_swizzle = "rrr"; color_inverted = true; break;
+        case ColorModifier::SourceGreen: color_swizzle = "ggg"; break;
+        case ColorModifier::OneMinusSourceGreen: color_swizzle = "ggg"; color_inverted = true; break;
+        case ColorModifier::SourceBlue: color_swizzle = "bbb"; break;
+        case ColorModifier::OneMinusSourceBlue: color_swizzle = "bbb"; color_inverted = true; break;
+        default: return std::nullopt;
+        }
+        const char* alpha_swizzle = nullptr;
+        bool alpha_inverted = false;
+        switch (alpha_mod) {
+        case AlphaModifier::SourceAlpha: alpha_swizzle = "a"; break;
+        case AlphaModifier::OneMinusSourceAlpha: alpha_swizzle = "a"; alpha_inverted = true; break;
+        case AlphaModifier::SourceRed: alpha_swizzle = "r"; break;
+        case AlphaModifier::OneMinusSourceRed: alpha_swizzle = "r"; alpha_inverted = true; break;
+        case AlphaModifier::SourceGreen: alpha_swizzle = "g"; break;
+        case AlphaModifier::OneMinusSourceGreen: alpha_swizzle = "g"; alpha_inverted = true; break;
+        case AlphaModifier::SourceBlue: alpha_swizzle = "b"; break;
+        case AlphaModifier::OneMinusSourceBlue: alpha_swizzle = "b"; alpha_inverted = true; break;
+        default: return std::nullopt;
+        }
+        if (color_inverted != alpha_inverted) {
+            return std::nullopt;
+        }
+        const std::string swizzle = std::string(color_swizzle) + alpha_swizzle;
+        const std::string source = GetSource(c, index);
+        const std::string value = swizzle == "rgba" ? source : source + "." + swizzle;
+        return color_inverted ? "(float4(1.0, 1.0, 1.0, 1.0) - " + value + ")" : value;
+    }
+
+    bool TryWriteFusedStage(const TexturingRegs::TevStageConfig& stage, u32 index) {
+        if (!tev_fuse || !loose_color || stage.color_op != stage.alpha_op) {
+            return false;
+        }
+        u32 operands = 0;
+        switch (stage.color_op) {
+        case Operation::Replace: operands = 1; break;
+        case Operation::Modulate:
+        case Operation::Add:
+        case Operation::AddSigned:
+        case Operation::Subtract: operands = 2; break;
+        case Operation::Lerp:
+        case Operation::MultiplyThenAdd:
+        case Operation::AddThenMultiply: operands = 3; break;
+        default: return false;
+        }
+        std::array<std::string, 3> r;
+        const ColorModifier color_mods[3] = {stage.color_modifier1, stage.color_modifier2,
+                                             stage.color_modifier3};
+        const AlphaModifier alpha_mods[3] = {stage.alpha_modifier1, stage.alpha_modifier2,
+                                             stage.alpha_modifier3};
+        const Source color_sources[3] = {stage.color_source1, stage.color_source2,
+                                         stage.color_source3};
+        const Source alpha_sources[3] = {stage.alpha_source1, stage.alpha_source2,
+                                         stage.alpha_source3};
+        for (u32 i = 0; i < operands; i++) {
+            auto operand = FusedOperand(color_mods[i], color_sources[i], alpha_mods[i],
+                                        alpha_sources[i], index);
+            if (!operand.has_value()) {
+                return false;
+            }
+            r[i] = std::move(*operand);
+        }
+        std::string value;
+        switch (stage.color_op) {
+        case Operation::Replace: value = r[0]; break;
+        case Operation::Modulate: value = fmt::format("({} * {})", r[0], r[1]); break;
+        case Operation::Add: value = fmt::format("({} + {})", r[0], r[1]); break;
+        case Operation::AddSigned:
+            value = fmt::format("({} + {} - float4(0.5, 0.5, 0.5, 0.5))", r[0], r[1]);
+            break;
+        case Operation::Lerp: value = fmt::format("lerp({}, {}, {})", r[1], r[0], r[2]); break;
+        case Operation::Subtract: value = fmt::format("({} - {})", r[0], r[1]); break;
+        case Operation::MultiplyThenAdd:
+            value = fmt::format("({} * {} + {})", r[0], r[1], r[2]);
+            break;
+        case Operation::AddThenMultiply:
+            value = fmt::format("(min({} + {}, float4(1.0, 1.0, 1.0, 1.0)) * {})", r[0], r[1],
+                                r[2]);
+            break;
+        default: return false;
+        }
+        const bool color_bounded = SourcesBounded(stage.color_op, stage.color_source1,
+                                                  stage.color_source2, stage.color_source3, index);
+        const bool alpha_bounded = SourcesBounded(stage.alpha_op, stage.alpha_source1,
+                                                  stage.alpha_source2, stage.alpha_source3, index);
+        const bool clamp_free =
+            ClampFree(stage.color_op) && color_bounded && alpha_bounded;
+        if (!clamp_free) {
+            value = fmt::format("clamp({}, float4(0.0, 0.0, 0.0, 0.0), float4(1.0, 1.0, 1.0, 1.0))",
+                                value);
+        }
+        out += fmt::format("    float4 tev_fused_{} = {};\n", index, value);
+        out += fmt::format("    float3 color_output_{0} = tev_fused_{0}.rgb;\n", index);
+        if (loose_alpha) {
+            out += fmt::format("    float alpha_output_{0} = tev_fused_{0}.a;\n", index);
+        } else {
+            out += fmt::format("    float alpha_output_{0} = byteround1(tev_fused_{0}.a);\n", index);
+        }
+        return true;
+    }
+
     void WriteTevStage(u32 index) {
         const TexturingRegs::TevStageConfig stage = config.texture.tev_stages[index];
 
@@ -1351,67 +1789,71 @@ private:
             return;
         }
 
-        out += "    color_results_1 = ";
-        AppendColorModifier(stage.color_modifier1, stage.color_source1, index);
-        out += ";\n    color_results_2 = ";
-        AppendColorModifier(stage.color_modifier2, stage.color_source2, index);
-        out += ";\n    color_results_3 = ";
-        AppendColorModifier(stage.color_modifier3, stage.color_source3, index);
+        // Ver TryWriteFusedStage (0.4.4.7): color y alfa en una sola cuenta vec4.
+        if (!TryWriteFusedStage(stage, index)) {
+            out += "    color_results_1 = ";
+            AppendColorModifier(stage.color_modifier1, stage.color_source1, index);
+            out += ";\n    color_results_2 = ";
+            AppendColorModifier(stage.color_modifier2, stage.color_source2, index);
+            out += ";\n    color_results_3 = ";
+            AppendColorModifier(stage.color_modifier3, stage.color_source3, index);
 
-        const bool color_bounded = SourcesBounded(stage.color_op, stage.color_source1,
-                                                  stage.color_source2, stage.color_source3, index);
-        if (loose_color || (OnGridReplace(stage.color_op, EffectiveSource(stage.color_source1,
-                                                                          stage.color_source3,
-                                                                          index)) &&
-                            ColorModifierKeepsGrid(stage.color_modifier1))) {
-            // Sin redondeo: ya en la rejilla de 8 bits, o color suelto (g_fs_tev_exact).
-            out += fmt::format(";\n    float3 color_output_{} = ", index);
-            AppendColorCombiner(stage.color_op, color_bounded);
-            out += ";\n";
-        } else {
-            out += fmt::format(";\n    float3 color_output_{} = byteround(float4(", index);
-            AppendColorCombiner(stage.color_op, color_bounded);
-            out += ", 1.0)).rgb;\n";
-        }
-
-        if (stage.color_op == Operation::Dot3_RGBA) {
-            // Con el color suelto, el alfa que sale del color se redondea aqui: el
-            // alfa siempre exacto (ver g_fs_tev_exact).
-            if (loose_color) {
-                out += fmt::format("    float alpha_output_{0} = byteround1(color_output_{0}.r);\n",
-                                   index);
-            } else {
-                out += fmt::format("    float alpha_output_{0} = color_output_{0}.r;\n", index);
-            }
-        } else {
-            out += "    alpha_results_1 = ";
-            AppendAlphaModifier(stage.alpha_modifier1, stage.alpha_source1, index);
-            out += ";\n    alpha_results_2 = ";
-            AppendAlphaModifier(stage.alpha_modifier2, stage.alpha_source2, index);
-            out += ";\n    alpha_results_3 = ";
-            AppendAlphaModifier(stage.alpha_modifier3, stage.alpha_source3, index);
-            const bool alpha_bounded = SourcesBounded(stage.alpha_op, stage.alpha_source1,
-                                                      stage.alpha_source2, stage.alpha_source3,
-                                                      index);
-            /**
-             * Con el color suelto (g_fs_tev_exact), "sustituir por la salida anterior"
-             * solo esta en la rejilla si toma su ALFA: un canal de color de la etapa
-             * anterior ya no salio de byteround. El color primario si (rounded_).
-             */
-            const Source alpha_source1 =
-                EffectiveSource(stage.alpha_source1, stage.alpha_source3, index);
-            const bool alpha_reads_loose_color =
-                loose_color && alpha_source1 == Source::Previous &&
-                stage.alpha_modifier1 != AlphaModifier::SourceAlpha;
-            if (OnGridReplace(stage.alpha_op, alpha_source1) &&
-                AlphaModifierKeepsGrid(stage.alpha_modifier1) && !alpha_reads_loose_color) {
-                out += fmt::format(";\n    float alpha_output_{} = ", index);
-                AppendAlphaCombiner(stage.alpha_op, alpha_bounded);
+            const bool color_bounded = SourcesBounded(stage.color_op, stage.color_source1,
+                                                      stage.color_source2, stage.color_source3, index);
+            if (loose_color || (OnGridReplace(stage.color_op, EffectiveSource(stage.color_source1,
+                                                                              stage.color_source3,
+                                                                              index)) &&
+                                ColorModifierKeepsGrid(stage.color_modifier1))) {
+                // Sin redondeo: ya en la rejilla de 8 bits, o color suelto (g_fs_tev_exact).
+                out += fmt::format(";\n    float3 color_output_{} = ", index);
+                AppendColorCombiner(stage.color_op, color_bounded);
                 out += ";\n";
             } else {
-                out += fmt::format(";\n    float alpha_output_{} = byteround1(", index);
-                AppendAlphaCombiner(stage.alpha_op, alpha_bounded);
-                out += ");\n";
+                out += fmt::format(";\n    float3 color_output_{} = byteround(float4(", index);
+                AppendColorCombiner(stage.color_op, color_bounded);
+                out += ", 1.0)).rgb;\n";
+            }
+
+            if (stage.color_op == Operation::Dot3_RGBA) {
+                // Con el color suelto, el alfa que sale del color se redondea aqui: el
+                // alfa siempre exacto (ver g_fs_tev_exact).
+                if (loose_color && !loose_alpha) {
+                    out += fmt::format("    float alpha_output_{0} = byteround1(color_output_{0}.r);\n",
+                                       index);
+                } else {
+                    out += fmt::format("    float alpha_output_{0} = color_output_{0}.r;\n", index);
+                }
+            } else {
+                out += "    alpha_results_1 = ";
+                AppendAlphaModifier(stage.alpha_modifier1, stage.alpha_source1, index);
+                out += ";\n    alpha_results_2 = ";
+                AppendAlphaModifier(stage.alpha_modifier2, stage.alpha_source2, index);
+                out += ";\n    alpha_results_3 = ";
+                AppendAlphaModifier(stage.alpha_modifier3, stage.alpha_source3, index);
+                const bool alpha_bounded = SourcesBounded(stage.alpha_op, stage.alpha_source1,
+                                                          stage.alpha_source2, stage.alpha_source3,
+                                                          index);
+                /**
+                 * Con el color suelto (g_fs_tev_exact), "sustituir por la salida anterior"
+                 * solo esta en la rejilla si toma su ALFA: un canal de color de la etapa
+                 * anterior ya no salio de byteround. El color primario si (rounded_).
+                 */
+                const Source alpha_source1 =
+                    EffectiveSource(stage.alpha_source1, stage.alpha_source3, index);
+                const bool alpha_reads_loose_color =
+                    loose_color && alpha_source1 == Source::Previous &&
+                    stage.alpha_modifier1 != AlphaModifier::SourceAlpha;
+                if (loose_alpha || (OnGridReplace(stage.alpha_op, alpha_source1) &&
+                                    AlphaModifierKeepsGrid(stage.alpha_modifier1) &&
+                                    !alpha_reads_loose_color)) {
+                    out += fmt::format(";\n    float alpha_output_{} = ", index);
+                    AppendAlphaCombiner(stage.alpha_op, alpha_bounded);
+                    out += ";\n";
+                } else {
+                    out += fmt::format(";\n    float alpha_output_{} = byteround1(", index);
+                    AppendAlphaCombiner(stage.alpha_op, alpha_bounded);
+                    out += ");\n";
+                }
             }
         }
 
@@ -1455,6 +1897,26 @@ private:
     const bool half_tev = g_fs_half_tev.load(std::memory_order_relaxed);
     /// Ver g_fs_tev_exact (0.4.4.1): el color de las etapas sin redondear.
     const bool loose_color = !g_fs_tev_exact.load(std::memory_order_relaxed);
+    /**
+     * EL ALFA SUELTO (0.4.4.6). El alfa seguia redondeado a 8 bits en cada etapa
+     * (3 instrucciones por etapa) porque la prueba de alfa compara con un umbral
+     * entero. Sin prueba de alfa solo sirve para mezclar, y ahi 1/255 no se ve:
+     * mismo trato que el color suelto. Con fs_tev_exacto=1, todo exacto.
+     */
+    /// Ver TryWriteFusedStage (0.4.4.7).
+    const bool tev_fuse = g_fs_tev_fuse.load(std::memory_order_relaxed);
+    const bool loose_alpha =
+        loose_color &&
+        (config.framebuffer.alpha_test_func == FramebufferRegs::CompareFunc::Always ||
+         !g_fs_alpha_exact.load(std::memory_order_relaxed));
+    /// Ver LutValue (0.4.4.6): las tablas de luz de cada luz, de cuatro en cuatro.
+    const bool lut_batch = g_fs_lut_vector.load(std::memory_order_relaxed);
+    std::vector<LutLookup> luts;
+    u32 lut_batch_id = 0;
+    /// Ver LIGHT_VARS: la luz que se esta escribiendo y lo acumulado de todas.
+    u32 lut_light_slot = 0;
+    std::string light_prefixes;
+    std::string light_bodies;
     std::string out;
     bool uses_tex0 = false;
     bool uses_tex1 = false;
@@ -1468,6 +1930,9 @@ private:
 std::atomic<bool> g_fs_flat_test{false};
 std::atomic<bool> g_fs_half_tev{false};
 std::atomic<bool> g_fs_tev_exact{false};
+std::atomic<bool> g_fs_lut_vector{true};
+std::atomic<bool> g_fs_alpha_exact{false};
+std::atomic<bool> g_fs_tev_fuse{true};
 
 std::optional<std::string> GenerateFragmentShader(const FSConfig& config,
                                                   const char** out_reason,

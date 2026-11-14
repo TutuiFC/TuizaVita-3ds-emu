@@ -1,0 +1,228 @@
+// Interprete de shaders de vertices de la PICA (prueba de compilacion).
+uniform float4 vs_f[96];
+uniform float4 vs_i[4];
+uniform float vs_b[16];
+uniform float4 vs_outmap[6];
+uniform float4 vs_entry;
+uniform float4 vs_in_keep0; uniform float4 vs_in_fill0;
+uniform float4 vs_in_keep1; uniform float4 vs_in_fill1;
+uniform float4 vs_in_keep2; uniform float4 vs_in_fill2;
+uniform float4 vs_in_keep3; uniform float4 vs_in_fill3;
+uniform float4 vs_in_keep4; uniform float4 vs_in_fill4;
+uniform float4 vs_in_keep5; uniform float4 vs_in_fill5;
+uniform float4 vs_in_keep6; uniform float4 vs_in_fill6;
+uniform float4 vs_in_keep7; uniform float4 vs_in_fill7;
+uniform float4 vs_prog[2688] : BUFFER[1];
+
+static float4 r[16];
+static float4 inr[16];
+static float4 o[16];
+static float3 areg;
+static float2 cc;
+
+float4 Fetch(float code, float off) {
+    if (code < 16.0) { return inr[(int)code]; }
+    if (code < 32.0) { return r[(int)(code - 16.0)]; }
+    if (code < 128.0) {
+        float idx = code - 32.0 + off;
+        idx = idx - floor(idx / 128.0) * 128.0;
+        if (idx >= 96.0) { return float4(1.0, 1.0, 1.0, 1.0); }
+        return vs_f[(int)idx];
+    }
+    return float4(0.0, 0.0, 0.0, 0.0);
+}
+float4 Swz(float4 v, float base) {
+    return float4(dot(v, vs_prog[(int)base]), dot(v, vs_prog[(int)base + 1]),
+                  dot(v, vs_prog[(int)base + 2]), dot(v, vs_prog[(int)base + 3]));
+}
+float AddrOff(float which) {
+    if (which < 0.5) { return 0.0; }
+    if (which < 1.5) { return areg.x; }
+    if (which < 2.5) { return areg.y; }
+    return areg.z;
+}
+bool Cond(float code) {
+    float op = floor(code / 4.0);
+    float refx = fmod(floor(code / 2.0), 2.0);
+    float refy = fmod(code, 2.0);
+    bool rx = (refx == cc.x);
+    bool ry = (refy == cc.y);
+    if (op < 0.5) { return rx || ry; }
+    if (op < 1.5) { return rx && ry; }
+    if (op < 2.5) { return rx; }
+    return ry;
+}
+bool CmpOp(float op, float a, float b) {
+    if (op < 0.5) { return a == b; }
+    if (op < 1.5) { return a != b; }
+    if (op < 2.5) { return a < b; }
+    if (op < 3.5) { return a <= b; }
+    if (op < 4.5) { return a > b; }
+    if (op < 5.5) { return a >= b; }
+    return false;
+}
+float OutSem(float idx) {
+    if (idx < 0.0) { return 1.0; }
+    float a = floor(idx / 4.0);
+    float c = idx - a * 4.0;
+    float4 v = o[(int)a];
+    return dot(v, float4(c == 0.0, c == 1.0, c == 2.0, c == 3.0));
+}
+
+void main(float4 vs_in0, float4 vs_in1, float4 vs_in2, float4 vs_in3,
+          float4 vs_in4, float4 vs_in5, float4 vs_in6, float4 vs_in7,
+          out float4 gl_Position : POSITION, out float4 out_color : COLOR0,
+          out float2 out_tc0 : TEXCOORD0, out float2 out_tc1 : TEXCOORD1,
+          out float2 out_tc2 : TEXCOORD2,
+          out float4 out_normquat : TEXCOORD3, out float3 out_view : TEXCOORD4)
+{
+    for (int k = 0; k < 16; k++) {
+        r[k] = float4(0.0, 0.0, 0.0, 1.0);
+        o[k] = float4(0.0, 0.0, 0.0, 1.0);
+        inr[k] = float4(0.0, 0.0, 0.0, 1.0);
+    }
+    inr[0] = vs_in0 * vs_in_keep0 + vs_in_fill0;
+    inr[1] = vs_in1 * vs_in_keep1 + vs_in_fill1;
+    inr[2] = vs_in2 * vs_in_keep2 + vs_in_fill2;
+    inr[3] = vs_in3 * vs_in_keep3 + vs_in_fill3;
+    inr[4] = vs_in4 * vs_in_keep4 + vs_in_fill4;
+    inr[5] = vs_in5 * vs_in_keep5 + vs_in_fill5;
+    inr[6] = vs_in6 * vs_in_keep6 + vs_in_fill6;
+    inr[7] = vs_in7 * vs_in_keep7 + vs_in_fill7;
+    areg = float3(0.0, 0.0, 0.0);
+    cc = float2(0.0, 0.0);
+    float4 call_s[4];
+    float2 if_s[8];
+    float4 loop_s[4];
+    float loop_prev[4];
+    float ncall = 0.0;
+    float nif = 0.0;
+    float nloop = 0.0;
+    float pc = vs_entry.x;
+    for (int step = 0; step < 1024; step++) {
+        float4 a = vs_prog[(int)(pc * 2.0)];
+        float4 b = vs_prog[(int)(pc * 2.0 + 1.0)];
+        float kind = a.x;
+        float oldpc = pc;
+        bool brk = false;
+        bool stop = false;
+        if (kind < 29.5) {
+            float4 s1 = Swz(Fetch(a.z, b.z < 0.5 ? AddrOff(b.w) : 0.0), b.y);
+            float4 s2 = Swz(Fetch(a.w, (b.z > 0.5 && b.z < 1.5) ? AddrOff(b.w) : 0.0), b.y + 4.0);
+            float4 res = float4(0.0, 0.0, 0.0, 0.0);
+            if (kind < 1.5) { res = s1 + s2; }
+            else if (kind < 2.5) { res = dot(s1.xyz, s2.xyz).xxxx; }
+            else if (kind < 3.5) { res = dot(s1, s2).xxxx; }
+            else if (kind < 4.5) { res = dot(float4(s1.xyz, 1.0), s2).xxxx; }
+            else if (kind < 6.5) { res = exp2(s1.x).xxxx; }
+            else if (kind < 7.5) { res = log2(s1.x).xxxx; }
+            else if (kind < 9.5) { res = s1 * s2; }
+            else if (kind < 10.5) { res = s1 >= s2 ? 1.0 : 0.0; }
+            else if (kind < 11.5) { res = s1 < s2 ? 1.0 : 0.0; }
+            else if (kind < 12.5) { res = floor(s1); }
+            else if (kind < 13.5) { res = s1 > s2 ? s1 : s2; }
+            else if (kind < 14.5) { res = s1 < s2 ? s1 : s2; }
+            else if (kind < 15.5) { res = (1.0 / s1.x).xxxx; }
+            else if (kind < 16.5) { res = rsqrt(s1.x).xxxx; }
+            else if (kind < 17.5) {
+                float4 m = vs_prog[(int)(b.y + 12.0)];
+                if (m.x > 0.5) { areg.x = s1.x < 0.0 ? ceil(s1.x) : floor(s1.x); }
+                if (m.y > 0.5) { areg.y = s1.y < 0.0 ? ceil(s1.y) : floor(s1.y); }
+            }
+            else if (kind < 18.5) { res = s1; }
+            else if (kind < 19.5) {
+                float cx = floor(b.x / 8.0);
+                float cy = b.x - cx * 8.0;
+                cc = float2(CmpOp(cx, s1.x, s2.x) ? 1.0 : 0.0, CmpOp(cy, s1.y, s2.y) ? 1.0 : 0.0);
+            }
+            else {
+                float4 s3 = Swz(Fetch(b.x, b.z > 1.5 ? AddrOff(b.w) : 0.0), b.y + 8.0);
+                res = s1 * s2 + s3;
+            }
+            if (kind != 17.0 && kind != 19.0 && a.y >= 0.0) {
+                float4 m = vs_prog[(int)(b.y + 12.0)];
+                if (a.y < 16.0) {
+                    int d = (int)a.y;
+                    o[d] = m > 0.5 ? res : o[d];
+                } else {
+                    int d = (int)(a.y - 16.0);
+                    r[d] = m > 0.5 ? res : r[d];
+                }
+            }
+        } else {
+            if (kind < 30.5) { stop = true; }
+            else if (kind < 31.5) { }
+            else if (kind < 32.5) { if (Cond(a.w)) { pc = a.y - 1.0; } }
+            else if (kind < 33.5) {
+                if ((vs_b[(int)b.x] > 0.5) == (fmod(a.z, 2.0) < 0.5)) { pc = a.y - 1.0; }
+            }
+            else if (kind < 36.5) {
+                bool go = kind < 34.5 || (kind < 35.5 ? Cond(a.w) : vs_b[(int)b.x] > 0.5);
+                if (go && ncall < 4.0) {
+                    call_s[(int)ncall] = float4(a.y + a.z, pc + 1.0, 0.0, 0.0);
+                    ncall += 1.0;
+                    pc = a.y - 1.0;
+                }
+            }
+            else if (kind < 38.5) {
+                bool c = kind < 37.5 ? vs_b[(int)b.x] > 0.5 : Cond(a.w);
+                if (c) {
+                    if (nif < 8.0) { if_s[(int)nif] = float2(a.y, a.y + a.z); nif += 1.0; }
+                } else {
+                    pc = a.y - 1.0;
+                }
+            }
+            else if (kind < 39.5) {
+                float4 lp = vs_i[(int)b.y];
+                if (nloop < 4.0) {
+                    loop_prev[(int)nloop] = areg.z;
+                    loop_s[(int)nloop] = float4(pc + 1.0, a.y + 1.0, lp.x, lp.z);
+                    nloop += 1.0;
+                }
+                areg.z = lp.y;
+            }
+            else if (kind < 40.5) { brk = true; }
+            else { if (Cond(a.w)) { brk = true; } }
+        }
+        if (stop) { break; }
+        pc = pc + 1.0;
+        float next = oldpc + 1.0;
+        for (int c = 0; c < 4; c++) {
+            if (ncall < 0.5) { break; }
+            float4 top = call_s[(int)(ncall - 1.0)];
+            if (top.x != next) { break; }
+            if (c < 3) { pc = top.y; next = pc; }
+            ncall -= 1.0;
+        }
+        if (nif > 0.5 && if_s[(int)(nif - 1.0)].x == oldpc + 1.0) {
+            pc = if_s[(int)(nif - 1.0)].y;
+            nif -= 1.0;
+        }
+        if (nloop > 0.5) {
+            float4 l = loop_s[(int)(nloop - 1.0)];
+            if (l.y == oldpc + 1.0 || brk) {
+                areg.z += l.w;
+                if (!brk && l.z > 0.5) {
+                    l.z -= 1.0;
+                    loop_s[(int)(nloop - 1.0)] = l;
+                    pc = l.x;
+                } else {
+                    pc = l.y;
+                    if (nloop > 1.5) { areg.z = loop_prev[(int)(nloop - 1.0)]; }
+                    nloop -= 1.0;
+                }
+            }
+        }
+    }
+    gl_Position = float4(OutSem(vs_outmap[0].x), OutSem(vs_outmap[0].y),
+                         OutSem(vs_outmap[0].z), OutSem(vs_outmap[0].w));
+    float4 col = float4(OutSem(vs_outmap[1].x), OutSem(vs_outmap[1].y),
+                        OutSem(vs_outmap[1].z), OutSem(vs_outmap[1].w));
+    out_color = min(abs(col), float4(1.0, 1.0, 1.0, 1.0));
+    out_tc0 = float2(OutSem(vs_outmap[2].x), OutSem(vs_outmap[2].y));
+    out_tc1 = float2(OutSem(vs_outmap[2].z), OutSem(vs_outmap[2].w));
+    out_tc2 = float2(OutSem(vs_outmap[3].x), OutSem(vs_outmap[3].y));
+    out_normquat = float4(OutSem(vs_outmap[4].x), OutSem(vs_outmap[4].y),
+                          OutSem(vs_outmap[4].z), OutSem(vs_outmap[4].w));
+    out_view = float3(OutSem(vs_outmap[5].x), OutSem(vs_outmap[5].y), OutSem(vs_outmap[5].z));
+}

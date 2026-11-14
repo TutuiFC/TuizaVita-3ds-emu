@@ -196,6 +196,28 @@ public:
     static std::atomic<u32> reserve_batches;
     /// De los saltados, los que esperaban a su shader de VERTICES (0.4.2.3).
     static std::atomic<u32> skipped_vs_batches;
+    /// Lotes dibujados con el shader de vertices generico mientras compila el
+    /// suyo (0.4.7.0, ver EncodeGenericVs).
+    static std::atomic<u32> generic_vs_batches;
+    /// El generico encendido (con ux0:/data/azahar/vs_generico.txt) o apagado (0).
+    static std::atomic<u32> generic_vs;
+    /**
+     * SHADERS DE VERTICES PROPIOS (0.4.7.1, ver usse_vs_gen.h): 0 apagado; 1 el
+     * programa propio dibuja mientras el de Cg compila, y tambien cuando Cg no
+     * puede con el (demasiado grande, error del compilador): ya no se salta el
+     * lote ni va por la CPU; 2 (pruebas) el propio SIEMPRE, aunque el de Cg este
+     * en la cache. Con ux0:/data/azahar/usse_vs.txt (su primer caracter).
+     */
+    static std::atomic<u32> usse_vs;
+    /// Lotes dibujados con un programa propio, programas hechos y los que no se
+    /// pudieron hacer (el generador lo rechaza o GXM no lo registra).
+    static std::atomic<u32> usse_vs_batches;
+    static std::atomic<u32> usse_vs_built;
+    static std::atomic<u32> usse_vs_failed;
+    /// Coste de lo dibujado con el generico (vertices x instrucciones) y lotes
+    /// que no cupieron en su presupuesto.
+    static std::atomic<u64> generic_vs_cost;
+    static std::atomic<u32> generic_vs_over;
 
     /// Interruptor del menu ("Copia de pantalla en GPU"). Encendido.
     static std::atomic<u32> transfer_on_gpu;
@@ -278,9 +300,9 @@ public:
     /// DrawStateShadow). Clave "estado_sombra=" de ajustes.txt.
     static std::atomic<u32> state_shadow_enabled;
     /**
-     * Resolucion de dibujado en la GPU EN MITADES (ajuste "Resolucion GPU"):
-     * 1 = 0.5x (0.2.0.4), 2 = 1x, 4 = 2x (0.2.0.3). Las superficies tienen
-     * width * escala / 2 pixeles por eje; la memoria del invitado sigue a 1x
+     * Resolucion de dibujado en la GPU EN CUARTOS (ajuste "Resolucion GPU"):
+     * de 2 = 0.5x a 10 = 2.5x, 4 = 1x (0.4.6.6; antes en mitades). Las superficies
+     * tienen width * escala / 4 pixeles por eje; la memoria del invitado sigue a 1x
      * (se remuestrea al volcar y al recargar), asi que el juego no nota nada.
      * Se lee al crear cada superficie.
      */
@@ -300,6 +322,7 @@ public:
      */
     void FlushForPresent();
 
+    void BeforeP3dInterrupt() override;
     void FlushAll() override;
     void FlushRegion(PAddr addr, u32 size) override;
     void InvalidateRegion(PAddr addr, u32 size) override;
@@ -433,6 +456,7 @@ public:
         kWritebackSoftwareBatch,
         kWritebackFlush,
         kWritebackFlushInvalidate,
+        kWritebackP3d,
         kWritebackSites,
     };
     static std::array<std::atomic<u32>, kWritebackSites> writeback_sites;
@@ -526,7 +550,7 @@ public:
         u32 stride_bytes = 0;
         /// Formato GXM de la superficie de color (no el del invitado).
         u32 gxm_texture_format = 0;
-        /// La de la superficie, en mitades (resolution_scale).
+        /// La de la superficie, en cuartos (resolution_scale).
         u32 scale = 2;
     };
 
@@ -683,6 +707,8 @@ private:
     /// La superficie de dibujado que pide el estado actual, creada si hace
     /// falta. nullptr si no se puede (formato no soportado, sin memoria).
     Surface* CurrentSurface();
+    /// Vuelca lo sucio y suelta todas las superficies (el tope, o cambiar de resolucion).
+    void DropSurfaces();
 
     /// Cierra la escena GXM si hay una abierta. Con no_finish_wait=0 ademas
     /// espera a que el chip termine (camino de 0.1.5.1); con =1 solo cierra
@@ -796,6 +822,8 @@ private:
     }
     std::unique_ptr<TextureCache> textures;
     std::vector<std::unique_ptr<Surface>> surfaces;
+    /// La resolution_scale que tienen las superficies. Ver CurrentSurface.
+    u32 surfaces_scale = 0;
     Surface* open_surface = nullptr;
     /// Hay un sceGxmEndScene sin su sceGxmFinish (4.5). Ver WaitGpu.
     bool gpu_pending = false;

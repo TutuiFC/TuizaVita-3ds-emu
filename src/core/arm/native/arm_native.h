@@ -169,6 +169,16 @@ extern bool enabled;
  * probarlo sabiendo eso.
  */
 extern bool both_cores;
+/**
+ * Rodaja nativa minima en us (0.4.4.7, ajuste nativo_rodaja_min=). Por debajo,
+ * la rodaja va al JIT. Ver kMinSliceUs en arm_native.cpp.
+ */
+extern u32 min_slice_us;
+/**
+ * Sueno minimo de SleepThread en ns (0.4.5.2, ajuste svc_sueno_min= en us; 0, sin
+ * tocar). Ver SVC::SleepThread.
+ */
+extern s64 min_sleep_ns;
 
 /// Deja en crash.txt lo que ha hecho el motor desde la ultima vez. Sin esto no
 /// hay forma de saber si esta ejecutando algo o abandonando siempre, que es

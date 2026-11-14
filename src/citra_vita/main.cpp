@@ -401,9 +401,14 @@ struct UserSettings {
     bool gpu_thread = false;
     /// 0.2.0.3: sin esperar al refresco al presentar (VitaFrontend::g_unlimited_speed).
     bool unlimited_speed = false;
-    /// Resolucion de la GPU en mitades: 1 = 0.5x, 2 = 1x, 4 = 2x
+    /// Resolucion de la GPU en CUARTOS (0.4.6.6): de 2 = 0.5x a 10 = 2.5x, 4 = 1x
     /// (RasterizerGXM::resolution_scale).
-    int gpu_scale = 2;
+    int gpu_scale = 4;
+    /// El estirado de audio (0.4.6.6, VitaFrontend::g_audio_stretch). Es otra cosa que
+    /// "sound", que es la salida nula.
+    bool audio_stretch = true;
+    /// 0.4.6.1: sin el sonido del juego (menu de la partida, Settings::values.audio_muted).
+    bool muted = false;
     /// 0.2.1.1: saltar el lote mientras compila su shader de vertices
     /// (RasterizerGXM::async_vs). ON.
     bool async_shaders = true;
@@ -497,10 +502,22 @@ struct UserSettings {
     /// 0.4.4.1: el color de las etapas TEV redondeado a 8 bits en cada etapa, como
     /// la 3DS (GXM::g_fs_tev_exact). Apagado: -9,7 % de instrucciones. Solo ajustes.txt.
     bool fs_tev_exact = false;
+    /// 0.4.4.6: tablas de luz de cuatro en cuatro (GXM::g_fs_lut_vector). Solo ajustes.txt.
+    bool fs_lut_vector = true;
+    /// 0.4.4.6: el alfa redondeado en cada etapa con prueba de alfa (GXM::g_fs_alpha_exact).
+    bool fs_alpha_exact = false;
+    /// 0.4.4.7: el AAC del DSP en otro hilo (AudioCore::DspHle::async_aac). Solo ajustes.txt.
+    bool aac_thread = true;
+    /// 0.4.4.7: color y alfa del TEV en una cuenta (GXM::g_fs_tev_fuse). Solo ajustes.txt.
+    bool fs_tev_fuse = true;
     bool jit_nativo = false;
     /// 0.3.9.8: el motor nativo tambien en el nucleo 1 (ver
     /// Core::Native::both_cores). Experimental, solo ajustes.txt.
     bool native_both_cores = false;
+    /// 0.4.4.7: rodaja nativa minima en us (Core::Native::min_slice_us). Solo ajustes.txt.
+    int native_min_slice_us = 2;
+    /// 0.4.5.2: sueno minimo de SleepThread en us (Core::Native::min_sleep_ns). Solo ajustes.txt.
+    int sleep_min_us = 1000;
     /// 0.3.4.9: tamano maximo de un shader de vertices que se compila en partida,
     /// en KB (Gxm::RasterizerGXM::vs_compile_limit_kb). Solo ajustes.txt.
     int vs_limit_kb = 23;
@@ -510,6 +527,13 @@ struct UserSettings {
     /// 0.3.3.9: idioma de los menus (VitaFrontend::I18n::Language). Ingles por
     /// defecto; se elige manteniendo SELECT en el menu de inicio.
     int menu_language = I18n::kEnglish;
+    /// 0.4.4.8: espera a la GPU antes de escribir el atlas de iconos del menu
+    /// (el cuelgue de la lista de juegos). Apagarlo vuelve a 0.4.4.7.
+    bool menu_wait_atlas = true;
+    /// 0.4.4.8: el tapon de 120 fotogramas de 0.4.4.6, solo para volver atras.
+    bool menu_hold_frames = false;
+    /// 0.4.4.8: notas de diagnostico del menu en crash.txt (apagadas al publicar).
+    bool menu_notes = false;
 };
 UserSettings g_user;
 
@@ -527,6 +551,7 @@ int LanguageIndex(int value) {
 
 void ApplyUserSettings() {
     Settings::values.volume = static_cast<float>(g_user.volume_percent) / 100.0f;
+    Settings::values.audio_muted = g_user.muted;
     I18n::SetLanguage(g_user.menu_language);
     Service::CFG::g_vita_system_language = g_user.language;
     SwRenderer::FrameSkip::half_resolution.store(g_user.half_resolution,
@@ -603,7 +628,8 @@ void ApplyUserSettings() {
      */
     Settings::values.output_type =
         g_user.sound ? AudioCore::SinkType::Vita : AudioCore::SinkType::Null;
-    Settings::values.enable_audio_stretching = g_user.sound;
+    Settings::values.enable_audio_stretching = g_user.audio_stretch;
+    VitaFrontend::g_audio_stretch.store(g_user.audio_stretch, std::memory_order_relaxed);
     VitaFrontend::g_screen_layout.store(
         std::clamp(g_user.screen_layout, 0, VitaFrontend::kScreenLayoutCount - 1),
         std::memory_order_relaxed);
@@ -631,6 +657,9 @@ void ApplyUserSettings() {
     Gxm::RasterizerGXM::vertex_ring_host.store(g_user.vertex_ring_host ? 1u : 0u,
                                                std::memory_order_relaxed);
     AudioCore::DspHle::async_mix.store(g_user.dsp_thread, std::memory_order_relaxed);
+    AudioCore::DspHle::async_aac.store(g_user.aac_thread, std::memory_order_relaxed);
+    Pica::Shader::Generator::GXM::g_fs_tev_fuse.store(g_user.fs_tev_fuse,
+                                                      std::memory_order_relaxed);
     Core::ArmJit::profile.store(g_user.jit_profile ? 1u : 0u, std::memory_order_relaxed);
     Gxm::RasterizerGXM::present_writeback_every.store(
         static_cast<u32>(g_user.present_writeback_every), std::memory_order_relaxed);
@@ -661,8 +690,14 @@ void ApplyUserSettings() {
                                                       std::memory_order_relaxed);
     Pica::Shader::Generator::GXM::g_fs_tev_exact.store(g_user.fs_tev_exact,
                                                        std::memory_order_relaxed);
+    Pica::Shader::Generator::GXM::g_fs_lut_vector.store(g_user.fs_lut_vector,
+                                                        std::memory_order_relaxed);
+    Pica::Shader::Generator::GXM::g_fs_alpha_exact.store(g_user.fs_alpha_exact,
+                                                         std::memory_order_relaxed);
     Core::Native::enabled = g_user.jit_nativo;
     Core::Native::both_cores = g_user.native_both_cores;
+    Core::Native::min_slice_us = static_cast<u32>(std::max(0, g_user.native_min_slice_us));
+    Core::Native::min_sleep_ns = static_cast<s64>(std::max(0, g_user.sleep_min_us)) * 1000;
     if (g_user.jit_nativo) {
         Common::VitaNote("nativo", "jit_nativo=1: se intentara ejecutar codigo del "
                                    "juego en la CPU de la consola");
@@ -671,6 +706,9 @@ void ApplyUserSettings() {
                                                   std::memory_order_relaxed);
     Gxm::RasterizerGXM::state_shadow_enabled.store(g_user.state_shadow ? 1u : 0u,
                                                    std::memory_order_relaxed);
+    VitaFrontend::g_menu_wait_atlas.store(g_user.menu_wait_atlas, std::memory_order_relaxed);
+    VitaFrontend::g_menu_hold_frames.store(g_user.menu_hold_frames, std::memory_order_relaxed);
+    VitaFrontend::g_menu_notes.store(g_user.menu_notes, std::memory_order_relaxed);
 }
 
 /// Lee ajustes.txt. Si no existe o una linea no se entiende, se queda el valor
@@ -728,10 +766,14 @@ void LoadUserSettings() {
     read_bool("copia_gpu=", g_user.gpu_screen_copy);
     read_bool("gpu_hilo=", g_user.gpu_thread);
     read_bool("sin_limite=", g_user.unlimited_speed);
-    // Clave nueva en 0.2.0.4, en mitades (la de 0.2.0.3 iba en enteros).
-    if (read_int("resolucion_gpu2=", value)) {
-        g_user.gpu_scale = value == 1 || value == 4 ? value : 2;
+    read_bool("silencio=", g_user.muted);
+    // En cuartos desde 0.4.6.6. La de antes (0.2.0.4) iba en mitades: 1, 2 o 4.
+    if (read_int("resolucion_gpu3=", value)) {
+        g_user.gpu_scale = std::clamp(value, 2, 10);
+    } else if (read_int("resolucion_gpu2=", value)) {
+        g_user.gpu_scale = value == 1 ? 2 : value == 4 ? 8 : 4;
     }
+    read_bool("audio_estirado=", g_user.audio_stretch);
     read_bool("shaders_asinc=", g_user.async_shaders);
     read_bool("jit_thumb=", g_user.jit_thumb);
     read_bool("jit_parche=", g_user.jit_link_patch);
@@ -763,12 +805,26 @@ void LoadUserSettings() {
     read_bool("fs_rapidos=", g_user.fs_fast);
     read_bool("fs_media=", g_user.fs_half);
     read_bool("fs_tev_exacto=", g_user.fs_tev_exact);
+    read_bool("fs_lut_vector=", g_user.fs_lut_vector);
+    read_bool("fs_alfa_exacto=", g_user.fs_alpha_exact);
+    read_bool("aac_hilo=", g_user.aac_thread);
+    read_bool("fs_tev_junto=", g_user.fs_tev_fuse);
     read_bool("jit_nativo=", g_user.jit_nativo);
     read_bool("nativo_dos_nucleos=", g_user.native_both_cores);
+    if (read_int("nativo_rodaja_min=", value)) {
+        g_user.native_min_slice_us = value;
+    }
+    read_bool("gpu_muestreo=", Common::vita_gpu_sampler_on);
+    if (read_int("svc_sueno_min=", value)) {
+        g_user.sleep_min_us = value;
+    }
     if (read_int("vs_tope_kb=", value)) {
         g_user.vs_limit_kb = std::clamp(value, 16, 40);
     }
     read_bool("estado_sombra=", g_user.state_shadow);
+    read_bool("menu_espera_atlas=", g_user.menu_wait_atlas);
+    read_bool("menu_tapon=", g_user.menu_hold_frames);
+    read_bool("menu_notas=", g_user.menu_notes);
     if (read_int("idioma_menu=", value)) {
         g_user.menu_language = std::clamp(value, 0, I18n::kLanguageCount - 1);
     }
@@ -782,12 +838,13 @@ int FormatUserSettings(char* buffer, std::size_t size) {
         "jit_vfp_datos=%d\ngxm_sin_espera=%d\ngxm_present_dir=%d\n"
         "jit_enlace_dir=%d\nvs_saltos2=%d\ncache_vertices=%d\nsonido=%d\npantallas=%d\n"
         "omitir_repetidas=%d\nvs_especializar2=%d\ncopia_gpu=%d\ngpu_hilo=%d\nsin_limite=%d\n"
-        "resolucion_gpu2=%d\nshaders_asinc=%d\njit_thumb=%d\njit_parche=%d\n"
+        "resolucion_gpu3=%d\nshaders_asinc=%d\njit_thumb=%d\njit_parche=%d\n"
         "jit_superbloques=%d\njit_regs_fijos=%d\njit_vfp_fijos=%d\nvertices_ram=%d\n"
         "dsp_hilo=%d\njit_perfil=%d\nvolcado_cada2=%d\ncopia_textura_gpu=%d\n"
         "jit_tabla_enlaces=%d\njit_saltos_cro=%d\njit_reusar_base=%d\nidioma_menu=%d\n"
         "wbuffer_gpu=%d\nmemo_valor=%d\nestado_sombra=%d\nvs_tope_kb=%d\nvs_cache_disp=%d\ncache_pipeline=%d\njit_nativo=%d\n"
-        "nativo_dos_nucleos=%d\nuniformes_directos=%d\ncache_subidas=%d\ny2r_hilo=%d\nvalla_exacta=%d\nuniformes_justos=%d\nvertices_por_vaciados=%d\nvs_o2=%d\nvs_o3=%d\n",
+        "nativo_dos_nucleos=%d\nuniformes_directos=%d\ncache_subidas=%d\ny2r_hilo=%d\nvalla_exacta=%d\nuniformes_justos=%d\nvertices_por_vaciados=%d\nvs_o2=%d\nvs_o3=%d\n"
+        "menu_espera_atlas=%d\nmenu_tapon=%d\nmenu_notas=%d\nsilencio=%d\naudio_estirado=%d\n",
         g_user.volume_percent, g_user.language, g_user.half_resolution ? 1 : 0,
         g_user.jit_reg_cache ? 1 : 0, g_user.jit_vfp_data ? 1 : 0, g_user.gxm_no_finish ? 1 : 0,
         g_user.gxm_present_direct ? 1 : 0, g_user.jit_direct_link ? 1 : 0,
@@ -806,7 +863,9 @@ int FormatUserSettings(char* buffer, std::size_t size) {
         g_user.native_both_cores ? 1 : 0, g_user.direct_uniforms ? 1 : 0,
         g_user.vertex_upload_cache ? 1 : 0, g_user.y2r_async ? 1 : 0,
         g_user.present_marks ? 1 : 0, g_user.exact_vs_uniforms ? 1 : 0,
-        g_user.vertex_epochs ? 1 : 0, g_user.vs_o2 ? 1 : 0, g_user.vs_o3 ? 1 : 0);
+        g_user.vertex_epochs ? 1 : 0, g_user.vs_o2 ? 1 : 0, g_user.vs_o3 ? 1 : 0,
+        g_user.menu_wait_atlas ? 1 : 0, g_user.menu_hold_frames ? 1 : 0,
+        g_user.menu_notes ? 1 : 0, g_user.muted ? 1 : 0, g_user.audio_stretch ? 1 : 0);
 }
 
 /// Los ajustes con los que se juega, a crash.txt en una linea (0.1.8.7): sin
@@ -832,6 +891,17 @@ void SaveUserSettings() {
     }
     sceIoWrite(fd, buffer, static_cast<SceSize>(length));
     sceIoClose(fd);
+}
+
+/// La escala en cuartos como texto: 4 -> "1x", 6 -> "1.5x", 9 -> "2.25x" (0.4.6.6).
+const char* ScaleText(int quarters) {
+    static char buffers[2][12];
+    static int next = 0;
+    char* out = buffers[next];
+    next = (next + 1) % 2;
+    static const char* const kFractions[4] = {"", ".25", ".5", ".75"};
+    std::snprintf(out, 12, "%d%sx", quarters / 4, kFractions[quarters & 3]);
+    return out;
 }
 
 // 21 desde 0.4.2.1: el motor nativo (experimental) tiene su fila.
@@ -870,7 +940,7 @@ void DrawSettings(vita2d_pgf* font, int row) {
         g_user.gpu_screen_copy ? "ON" : "OFF",
         g_user.gpu_thread ? "ON" : "OFF",
         g_user.unlimited_speed ? T(I18n::kValUnlimited) : T(I18n::kValRefresh),
-        g_user.gpu_scale == 4 ? T(I18n::kVal2x) : g_user.gpu_scale == 1 ? "0.5x" : "1x",
+        ScaleText(g_user.gpu_scale),
         g_user.async_shaders ? "ON" : "OFF",
         gxm ? "GXM" : T(I18n::kValSoftware),
         g_user.jit_nativo ? "ON" : "OFF"};
@@ -1038,9 +1108,8 @@ void RunSettingsMenu(vita2d_pgf* font) {
                 break;
             }
             default:
-                // 0.5x -> 1x -> 2x con DERECHA, al reves con IZQUIERDA.
-                g_user.gpu_scale = step > 0 ? (g_user.gpu_scale == 1 ? 2 : g_user.gpu_scale == 2 ? 4 : 1)
-                                            : (g_user.gpu_scale == 4 ? 2 : g_user.gpu_scale == 2 ? 1 : 4);
+                // De 0.5x a 2.5x de 0.25 en 0.25: DERECHA sube, IZQUIERDA baja.
+                g_user.gpu_scale = std::clamp(g_user.gpu_scale + step, 2, 10);
                 break;
             }
             ApplyUserSettings();
@@ -1055,6 +1124,275 @@ void RunSettingsMenu(vita2d_pgf* font) {
         // falta, con los ajustes ya guardados), no al proximo arranque.
         Core::Native::LoadModuleIfMissing(g_argc, g_argv);
     }
+}
+
+/**
+ * EL MENU DE LA PARTIDA (0.4.6.1). START y SELECT seguidos, en plena partida: lo
+ * que se quiere tocar sin salir del juego y las dos salidas. Hasta ahora esa
+ * combinacion cerraba el juego sin preguntar.
+ *
+ * Corre dentro de EmuWindow_Vita::PollEvents, justo despues de presentar: en el
+ * hilo que tiene el contexto de GXM (el de la GPU, o el de emulacion sin el) y con
+ * la escena del rasterizador cerrada. El juego se queda parado hasta que se cierre:
+ * ese hilo no sigue, y el de emulacion espera en RunGame. Espera a la GPU en cada
+ * fotograma, como el menu de inicio: vita2d_start_drawing vacia su pool.
+ */
+/// "Salir del emulador": cuando RunGame termina de cerrar el juego, se acaba todo.
+std::atomic<bool> g_exit_emulator{false};
+
+enum GameMenuRow : int {
+    kRowResume,
+    kRowResolution,
+    kRowLayout,
+    kRowFps,
+    kRowMute,
+    kRowAudio,
+    kRowMainMenu,
+    kRowExit,
+    kGameMenuRows,
+};
+
+/// Lo que hay en pantalla, para pintar el menu encima y dejarlo otra vez al cerrar.
+/// Opaco, porque vita2d mezcla con el alfa. Sin memoria, nullptr y fondo liso.
+vita2d_texture* CopyScreenToTexture() {
+    constexpr unsigned int kWidth = 960;
+    constexpr unsigned int kHeight = 544;
+    SceDisplayFrameBuf frame{};
+    frame.size = sizeof(frame);
+    if (sceDisplayGetFrameBuf(&frame, SCE_DISPLAY_SETBUF_NEXTFRAME) < 0 || frame.base == nullptr ||
+        frame.pixelformat != SCE_DISPLAY_PIXELFORMAT_A8B8G8R8 || frame.width != kWidth ||
+        frame.height != kHeight) {
+        return nullptr;
+    }
+    vita2d_texture* texture =
+        vita2d_create_empty_texture_format(kWidth, kHeight, SCE_GXM_TEXTURE_FORMAT_A8B8G8R8);
+    if (texture == nullptr) {
+        return nullptr;
+    }
+    const auto* pixels = static_cast<const u32*>(frame.base);
+    auto* out = static_cast<u32*>(vita2d_texture_get_datap(texture));
+    const unsigned int stride = vita2d_texture_get_stride(texture) / 4;
+    // La pantalla se lee sin cache: la fila de una vez y despues de memoria normal.
+    std::vector<u32> line(kWidth);
+    for (unsigned int y = 0; y < kHeight; y++) {
+        std::memcpy(line.data(), pixels + y * frame.pitch, kWidth * 4);
+        u32* row = out + y * stride;
+        for (unsigned int x = 0; x < kWidth; x++) {
+            row[x] = line[x] | 0xFF000000u;
+        }
+    }
+    return texture;
+}
+
+void DrawGameMenu(vita2d_pgf* font, vita2d_texture* background, int row) {
+    constexpr float kPanelX = 130.0f;
+    constexpr float kPanelY = 52.0f;
+    constexpr float kPanelW = 700.0f;
+    constexpr float kPanelH = 450.0f;
+    constexpr int kTextX = 154;
+    constexpr int kValueX = 470;
+    constexpr int kTextW = 652;
+
+    vita2d_wait_rendering_done();
+    vita2d_start_drawing();
+    vita2d_clear_screen();
+    if (background != nullptr) {
+        vita2d_draw_texture(background, 0.0f, 0.0f);
+    }
+    vita2d_draw_rectangle(0.0f, 0.0f, 960.0f, 544.0f, 0x90000000u);
+    vita2d_draw_rectangle(kPanelX, kPanelY, kPanelW, kPanelH, 0xF8201810u);
+    vita2d_draw_rectangle(kPanelX, kPanelY, kPanelW, 3.0f, kColorAccent);
+    vita2d_pgf_draw_text(font, kTextX, 98, kColorAccent, 1.3f, T(I18n::kGameMenuTitle));
+
+    const bool gxm = Settings::GetWorkingGraphicsAPI() == Settings::GraphicsAPI::GXM;
+    const char* resolution =
+        gxm ? ScaleText(g_user.gpu_scale) : (g_user.half_resolution ? "0.5x" : "1x");
+    const I18n::Str labels[kGameMenuRows] = {
+        I18n::kGameMenuResume, I18n::kGameMenuResolution, I18n::kGameMenuLayout,
+        I18n::kGameMenuFps,    I18n::kGameMenuMute,       I18n::kGameMenuAudio,
+        I18n::kGameMenuMainMenu, I18n::kGameMenuExit};
+    const char* values[kGameMenuRows] = {
+        nullptr,
+        resolution,
+        T(kLayoutNames[std::clamp(g_user.screen_layout, 0, VitaFrontend::kScreenLayoutCount - 1)]),
+        g_user.unlimited_speed ? T(I18n::kValUnlimited) : T(I18n::kGameMenuFpsLimited),
+        g_user.muted ? T(I18n::kYes) : T(I18n::kNo),
+        g_user.audio_stretch ? T(I18n::kGameMenuAudioStretched) : T(I18n::kGameMenuAudioDirect),
+        nullptr,
+        nullptr};
+    for (int i = 0; i < kGameMenuRows; i++) {
+        const int y = 144 + i * 36 + (i >= kRowMainMenu ? 12 : 0);
+        const bool selected = i == row;
+        if (selected) {
+            vita2d_draw_rectangle(kPanelX + 12.0f, static_cast<float>(y - 25), kPanelW - 24.0f,
+                                  34.0f, 0xFF402810u);
+        }
+        const unsigned int color = selected ? kColorAccent : kColorText;
+        I18n::DrawTextFit(font, kTextX, y, color, 1.0f, T(labels[i]),
+                          values[i] != nullptr ? kValueX - kTextX - 12 : kTextW);
+        if (values[i] != nullptr) {
+            vita2d_pgf_draw_textf(font, kValueX, y, color, 1.0f, selected ? "<  %s  >" : "   %s",
+                                  values[i]);
+        }
+    }
+
+    const char* hint = row == kRowResolution ? T(I18n::kGameMenuHintResolution)
+                       : row == kRowLayout   ? T(I18n::kGameMenuHintLayout)
+                       : row == kRowFps      ? T(I18n::kGameMenuHintFps)
+                       : row == kRowMute     ? T(I18n::kGameMenuHintMute)
+                       : row == kRowAudio    ? T(I18n::kGameMenuHintAudio)
+                       : row >= kRowMainMenu ? T(I18n::kGameMenuHintExit)
+                                             : nullptr;
+    if (hint != nullptr) {
+        I18n::DrawTextFit(font, kTextX, 448, kColorText, 0.82f, hint, kTextW);
+    }
+    I18n::DrawTextFit(font, kTextX, 476, kColorDim, 0.76f, T(I18n::kGameMenuFooter), kTextW);
+    vita2d_end_drawing();
+    vita2d_swap_buffers();
+}
+
+void RunGameMenu(vita2d_pgf* font, VitaFrontend::EmuWindow_Vita& window) {
+    // L+R cambia la resolucion sin pasar por aqui: partir del valor real.
+    g_user.half_resolution =
+        SwRenderer::FrameSkip::half_resolution.load(std::memory_order_relaxed);
+    g_user.gpu_scale =
+        static_cast<int>(Gxm::RasterizerGXM::resolution_scale.load(std::memory_order_relaxed));
+    g_user.unlimited_speed = VitaFrontend::g_unlimited_speed.load(std::memory_order_relaxed);
+    const bool half_before = g_user.half_resolution;
+    const int scale_before = g_user.gpu_scale;
+    const bool unlimited_before = g_user.unlimited_speed;
+    const bool muted_before = g_user.muted;
+    g_user.audio_stretch = VitaFrontend::g_audio_stretch.load(std::memory_order_relaxed);
+    g_user.screen_layout = VitaFrontend::g_screen_layout.load(std::memory_order_relaxed);
+    const bool stretch_before = g_user.audio_stretch;
+    const int layout_before = g_user.screen_layout;
+    const bool gxm = Settings::GetWorkingGraphicsAPI() == Settings::GraphicsAPI::GXM;
+    Common::VitaNote("menu partida", "abierto");
+
+    vita2d_wait_rendering_done();
+    vita2d_texture* background = CopyScreenToTexture();
+    if (background == nullptr) {
+        Common::VitaNote("menu partida", "sin copia de la pantalla: fondo liso");
+    }
+    // Con "sin limite" el juego no espera al refresco; el menu, si. PollEvents lo
+    // deja como estaba al cerrar.
+    vita2d_set_vblank_wait(1);
+
+    int row = kRowResume;
+    // Lo ya pulsado al entrar cuenta como mantenido: ver RunSettingsMenu.
+    unsigned int previous_buttons = ~0u;
+    bool open = true;
+    while (open) {
+        SceCtrlData pad{};
+        sceCtrlPeekBufferPositive(0, &pad, 1);
+        const unsigned int pilot = VitaFrontend::Input::PilotButtons();
+        if ((pilot & SCE_CTRL_START) && (pilot & SCE_CTRL_SELECT)) {
+            window.RequestExit();
+            break;
+        }
+        pad.buttons |= pilot & ~VitaFrontend::Input::kPilotStickMask;
+        const unsigned int pressed = pad.buttons & ~previous_buttons;
+        previous_buttons = pad.buttons;
+
+        if (pressed & (SCE_CTRL_CIRCLE | SCE_CTRL_START)) {
+            break;
+        }
+        if (pressed & SCE_CTRL_DOWN) {
+            row = (row + 1) % kGameMenuRows;
+        }
+        if (pressed & SCE_CTRL_UP) {
+            row = (row + kGameMenuRows - 1) % kGameMenuRows;
+        }
+        int step = (pressed & SCE_CTRL_RIGHT) ? 1 : (pressed & SCE_CTRL_LEFT) ? -1 : 0;
+        if (pressed & SCE_CTRL_CROSS) {
+            if (row == kRowResume) {
+                open = false;
+            } else if (row == kRowMainMenu) {
+                window.RequestExit();
+                open = false;
+            } else if (row == kRowExit) {
+                g_exit_emulator.store(true, std::memory_order_relaxed);
+                window.RequestExit();
+                open = false;
+            } else {
+                step = 1;
+            }
+        }
+        if (step != 0 && row == kRowResolution) {
+            if (gxm) {
+                // De 0.5x a 2.5x de 0.25 en 0.25 (con X, sube y da la vuelta). Las
+                // superficies se rehacen en cuanto el juego siga: CurrentSurface.
+                const bool wrap = (pressed & SCE_CTRL_CROSS) != 0;
+                g_user.gpu_scale = g_user.gpu_scale + step;
+                g_user.gpu_scale = g_user.gpu_scale > 10 ? (wrap ? 2 : 10)
+                                   : g_user.gpu_scale < 2 ? 2
+                                                          : g_user.gpu_scale;
+                Gxm::RasterizerGXM::resolution_scale.store(static_cast<u32>(g_user.gpu_scale),
+                                                           std::memory_order_relaxed);
+            } else {
+                g_user.half_resolution = !g_user.half_resolution;
+                SwRenderer::FrameSkip::half_resolution.store(g_user.half_resolution,
+                                                             std::memory_order_relaxed);
+            }
+        } else if (step != 0 && row == kRowFps) {
+            g_user.unlimited_speed = !g_user.unlimited_speed;
+            VitaFrontend::g_unlimited_speed.store(g_user.unlimited_speed,
+                                                  std::memory_order_relaxed);
+            Settings::values.frame_limit = g_user.unlimited_speed ? 0.0 : 100.0;
+        } else if (step != 0 && row == kRowLayout) {
+            // Se aplica en el siguiente fotograma: PresentScreens mira g_screen_layout.
+            g_user.screen_layout = (g_user.screen_layout + (step > 0 ? 1 : -1) +
+                                    VitaFrontend::kScreenLayoutCount) %
+                                   VitaFrontend::kScreenLayoutCount;
+            VitaFrontend::g_screen_layout.store(g_user.screen_layout, std::memory_order_relaxed);
+        } else if (step != 0 && row == kRowMute) {
+            g_user.muted = !g_user.muted;
+            Settings::values.audio_muted = g_user.muted;
+        } else if (step != 0 && row == kRowAudio) {
+            g_user.audio_stretch = !g_user.audio_stretch;
+            VitaFrontend::g_audio_stretch.store(g_user.audio_stretch, std::memory_order_relaxed);
+            Settings::values.enable_audio_stretching = g_user.audio_stretch;
+            auto& system = Core::System::GetInstance();
+            if (system.IsPoweredOn()) {
+                system.DSP().EnableStretching(g_user.audio_stretch);
+            }
+        }
+        if (open) {
+            DrawGameMenu(font, background, row);
+        }
+    }
+
+    // El fotograma del juego otra vez, sin el menu: un juego parado no presenta
+    // ninguno nuevo, y la caratula de la ficha se saca de la pantalla al salir.
+    vita2d_wait_rendering_done();
+    vita2d_start_drawing();
+    vita2d_clear_screen();
+    if (background != nullptr) {
+        vita2d_draw_texture(background, 0.0f, 0.0f);
+    }
+    vita2d_end_drawing();
+    vita2d_swap_buffers();
+    vita2d_wait_rendering_done();
+    if (background != nullptr) {
+        vita2d_free_texture(background);
+    }
+    // Lo pulsado para cerrar no le tiene que llegar al juego.
+    VitaFrontend::Input::SwallowButtons(previous_buttons);
+
+    if (g_user.half_resolution != half_before || g_user.gpu_scale != scale_before ||
+        g_user.unlimited_speed != unlimited_before || g_user.muted != muted_before ||
+        g_user.audio_stretch != stretch_before || g_user.screen_layout != layout_before) {
+        SaveUserSettings();
+    }
+    Common::VitaNote("menu partida",
+                     fmt::format("cerrado: resolucion {} (media {}), sin limite {}, silencio {}{}{}",
+                                 g_user.gpu_scale, g_user.half_resolution ? 1 : 0,
+                                 g_user.unlimited_speed ? 1 : 0, g_user.muted ? 1 : 0,
+                                 window.ShouldExit() ? ", sale de la partida" : "",
+                                 g_exit_emulator.load(std::memory_order_relaxed)
+                                     ? " y del emulador"
+                                     : "")
+                         .c_str());
 }
 
 /// "Cargando shaders" con barra de progreso, antes de empezar el juego (0.2.0.4).
@@ -1662,6 +2000,13 @@ void RunGame(vita2d_pgf* font, const std::string& path) {
 
     WriteCrashLog("carga", "creando ventana de emulacion");
     auto window = std::make_unique<VitaFrontend::EmuWindow_Vita>();
+    // Desde cuando estan START y SELECT a la vez sin que se abra el menu: ver el
+    // bucle de abajo. El menu lo pone a cero al cerrar, desde el hilo donde corre.
+    std::atomic<SceUInt64> exit_held_since{0};
+    window->SetGameMenu([font, &window, &exit_held_since] {
+        RunGameMenu(font, *window);
+        exit_held_since.store(0, std::memory_order_relaxed);
+    });
     window->SetStatsFont(font);
 
     WriteCrashLog("carga", "llamando a System::Load");
@@ -1774,6 +2119,12 @@ void RunGame(vita2d_pgf* font, const std::string& path) {
         while (!watchdog_stop.load(std::memory_order_relaxed)) {
             sceKernelDelayThread(1000 * 1000);
             const unsigned int now = heartbeat.load(std::memory_order_relaxed);
+            // Con el menu de la partida abierto no avanzar es lo correcto.
+            if (window->GameMenuOpen()) {
+                last = now;
+                still = 0;
+                continue;
+            }
             if (++tick % 10 == 0) {
                 const u64 frames = window->FramesPresented();
                 if (frames == beat_frames && now != beat_loops && beats < 40) {
@@ -1836,15 +2187,36 @@ void RunGame(vita2d_pgf* font, const std::string& path) {
 
     try {
         while (!window->ShouldExit() && !user_quit) {
+            // El menu de la partida corre en el hilo que presenta (ver RunGameMenu):
+            // el juego se queda aqui hasta que se cierre.
+            if (window->GameMenuOpen()) {
+                exit_held_since.store(0, std::memory_order_relaxed);
+                sceKernelDelayThread(10 * 1000);
+                continue;
+            }
             // La ventana solo mira los botones cuando el juego termina un
             // fotograma. Si no llega ninguno, no habria forma de salir, asi que
-            // la combinacion se comprueba tambien aqui.
+            // la combinacion se comprueba tambien aqui: antes del primer fotograma
+            // sale sin mas, y despues si el menu no se abre en kExitHeldUs (el
+            // juego colgado sin presentar nada). El piloto sale siempre a la vez.
             if ((loops % 16) == 0) {
+                constexpr SceUInt64 kExitHeldUs = 3 * 1000 * 1000;
+                const unsigned int pilot = VitaFrontend::Input::PilotButtons();
                 SceCtrlData pad{};
                 sceCtrlPeekBufferPositive(0, &pad, 1);
-                pad.buttons |= VitaFrontend::Input::PilotButtons();
-                if ((pad.buttons & SCE_CTRL_START) && (pad.buttons & SCE_CTRL_SELECT)) {
+                pad.buttons |= pilot;
+                const bool held = (pad.buttons & SCE_CTRL_START) && (pad.buttons & SCE_CTRL_SELECT);
+                const SceUInt64 now = sceKernelGetProcessTimeWide();
+                const SceUInt64 since = exit_held_since.load(std::memory_order_relaxed);
+                if (((pilot & SCE_CTRL_START) && (pilot & SCE_CTRL_SELECT)) ||
+                    (held && window->FramesPresented() == 0) ||
+                    (held && since != 0 && now - since >= kExitHeldUs)) {
                     user_quit = true;
+                }
+                if (!held) {
+                    exit_held_since.store(0, std::memory_order_relaxed);
+                } else if (since == 0) {
+                    exit_held_since.store(now, std::memory_order_relaxed);
                 }
             }
 
@@ -2103,6 +2475,13 @@ struct PilotStep {
 struct Pilot {
     std::string rom;
     double exit_s = 0;
+    /// menu=N (0.4.4.6): N s en el menu antes de arrancar, como a mano.
+    double menu_s = 0;
+    /// menu_derecha=T: a los T s de verse el menu, la cruceta a la derecha.
+    double menu_right_s = 1.0;
+    /// menu_repite=T (0.4.4.9): una pulsacion cada T s, 20 a cada lado, sin que la
+    /// consola se suspenda: el cuelgue de la cruceta sale pocas veces.
+    double menu_every_s = 0;
     std::vector<PilotStep> steps;
     std::atomic<bool> stop{false};
 };
@@ -2228,6 +2607,12 @@ bool LoadPilot(Pilot& pilot) {
             pilot.rom = line.substr(6);
         } else if (line.rfind("salir=", 0) == 0) {
             pilot.exit_s = std::atof(line.c_str() + 6);
+        } else if (line.rfind("menu=", 0) == 0) {
+            pilot.menu_s = std::atof(line.c_str() + 5);
+        } else if (line.rfind("menu_derecha=", 0) == 0) {
+            pilot.menu_right_s = std::atof(line.c_str() + 13);
+        } else if (line.rfind("menu_repite=", 0) == 0) {
+            pilot.menu_every_s = std::atof(line.c_str() + 12);
         } else {
             char names[128] = {};
             double at = 0;
@@ -2289,8 +2674,90 @@ void* PilotMain(void* arg) {
     return nullptr;
 }
 
+/**
+ * UN MII SI NO HAY NINGUNO (0.4.6.2). Una consola de verdad siempre tiene al menos el del
+ * usuario, y los juegos lo dan por hecho: Mario Kart 7 avisa de que no hay ninguno y no deja
+ * correr hasta que no se crea uno, cosa que aqui no se puede porque el editor de Mii es un
+ * applet que no se emula. Solo si el fichero existe, es el que se espera y sus 100 huecos
+ * estan vacios: los Mii que ya hubiera no se tocan nunca. Sin el fichero no se hace nada:
+ * lo crea el sistema emulado, y solo este formato esta comprobado contra uno real.
+ *
+ * Formato (comprobado contra el fichero de la consola): "CFOG", version, 100 Mii de 0x5C
+ * desde 0x8; CRC-16 0x1021, inicial 0, de los bytes 0..0xC81E, big endian en 0xC81E. Los
+ * campos son los de MiiSelector::GetStandardMiiResult.
+ */
+void EnsureOneMii() {
+    constexpr char kPath[] = "ux0:/data/azahar/nand/data/00000000000000000000000000000000/extdata/"
+                             "00048000/F000000B/user/CFL_DB.dat";
+    constexpr SceSize kFileSize = 0x4BD20;
+    constexpr std::size_t kCrcAt = 0xC81E;
+    constexpr std::size_t kFirst = 8;
+    constexpr std::size_t kSlot = 0x5C;
+    static constexpr u8 kMii[kSlot] = {
+        0x03, 0x00, 0x10, 0x30, 0xD2, 0x85, 0xB6, 0xB3, 0x00, 0xC8, 0x85, 0x0A, 0x98, 0x39, 0x1E,
+        0xE4, 0x40, 0xF4, 0x07, 0xB7, 0x37, 0x10, 0x00, 0x00, 0x00, 0xA6, 'T',  0,    'u',  0,
+        'i',  0,    'z',  0,    'a',  0,    0,    0,    0,    0,    0,    0,    0,    0,    0,
+        0,    0x40, 0x40, 0x00, 0x00, 0x21, 0x01, 0x18, 0x44, 0x68, 0x02, 0x14, 0x46, 0x34, 0x26,
+        0x12, 0x81, 0x68, 0x17, 0x00, 0x0D, 0x29, 0x00, 0x52, 0x00, 0x50, 0x48, 'T',  0,    'u',
+        0,    'i',  0,    'z',  0,    'a',  0,    0,    0,    0,    0,    0,    0,    0,    0,
+        0,    0};
+    const auto crc16 = [](const u8* data, std::size_t size) {
+        u32 crc = 0;
+        for (std::size_t i = 0; i < size; i++) {
+            crc ^= static_cast<u32>(data[i]) << 8;
+            for (int bit = 0; bit < 8; bit++) {
+                crc = (crc & 0x8000) != 0 ? ((crc << 1) ^ 0x1021) & 0xFFFF : (crc << 1) & 0xFFFF;
+            }
+        }
+        return crc;
+    };
+
+    SceIoStat stat{};
+    if (sceIoGetstat(kPath, &stat) < 0 || stat.st_size != kFileSize) {
+        return;
+    }
+    const SceUID in = sceIoOpen(kPath, SCE_O_RDONLY, 0);
+    if (in < 0) {
+        return;
+    }
+    std::vector<u8> data(kFileSize);
+    const int got = sceIoRead(in, data.data(), kFileSize);
+    sceIoClose(in);
+    if (got != static_cast<int>(kFileSize) || std::memcmp(data.data(), "CFOG", 4) != 0) {
+        return;
+    }
+    for (std::size_t i = kFirst; i < kFirst + 100 * kSlot; i++) {
+        if (data[i] != 0) {
+            return;
+        }
+    }
+    if (crc16(data.data(), kCrcAt + 2) != 0) {
+        Common::VitaNote("mii", "CFL_DB.dat vacio pero su suma no cuadra: no se toca");
+        return;
+    }
+    std::memcpy(data.data() + kFirst, kMii, kSlot);
+    const u32 crc = crc16(data.data(), kCrcAt);
+    data[kCrcAt] = static_cast<u8>(crc >> 8);
+    data[kCrcAt + 1] = static_cast<u8>(crc);
+
+    const std::string temporary = std::string(kPath) + ".nuevo";
+    const SceUID out = sceIoOpen(temporary.c_str(), SCE_O_WRONLY | SCE_O_CREAT | SCE_O_TRUNC, 0777);
+    if (out < 0) {
+        return;
+    }
+    const int written = sceIoWrite(out, data.data(), kFileSize);
+    sceIoClose(out);
+    if (written != static_cast<int>(kFileSize) || sceIoRemove(kPath) < 0 ||
+        sceIoRename(temporary.c_str(), kPath) < 0) {
+        Common::VitaNote("mii", "no se pudo escribir CFL_DB.dat");
+        return;
+    }
+    Common::VitaNote("mii", "base de datos vacia: creado un Mii");
+}
+
 /// Si hay piloto.txt, juega su partida antes de enseñar el menu.
-void RunPilotIfAny(vita2d_pgf* font, const std::vector<RomEntry>& roms) {
+void RunPilotIfAny(vita2d_pgf* font, const std::vector<RomEntry>& roms,
+                   VitaFrontend::HomeMenu& menu) {
     Pilot pilot;
     if (!LoadPilot(pilot)) {
         return;
@@ -2304,6 +2771,54 @@ void RunPilotIfAny(vita2d_pgf* font, const std::vector<RomEntry>& roms) {
     Common::VitaNote("piloto", fmt::format("{}: {} pasos, salir a los {:.0f} s", pilot.rom,
                                            pilot.steps.size(), pilot.exit_s)
                                    .c_str());
+    /**
+     * POR EL MENU, COMO A MANO (0.4.4.6). Sin esto el piloto arrancaba el juego
+     * sin haber dibujado nunca el menu, y el cuelgue de la GPU del 03-11 solo le
+     * pasaba al usuario: en la lista de juegos, nada mas abrir Azahar, una vez la
+     * cruceta a la derecha. El mismo bucle que Run: Update y Draw en cada
+     * fotograma, desde el primer juego, y la derecha a los menu_derecha s.
+     */
+    if (pilot.menu_s > 0) {
+        std::vector<std::string> paths;
+        for (const RomEntry& entry : roms) {
+            paths.push_back(entry.path);
+        }
+        VitaFrontend::Covers::Start(paths);
+        const SceUInt64 begin = sceKernelGetProcessTimeWide();
+        const SceUInt64 total = static_cast<SceUInt64>(pilot.menu_s * 1e6);
+        const SceUInt64 right_at = static_cast<SceUInt64>(pilot.menu_right_s * 1e6);
+        const SceUInt64 every = static_cast<SceUInt64>(pilot.menu_every_s * 1e6);
+        unsigned int previous = 0;
+        bool noted = false;
+        double menu_frames = 0;
+        while (sceKernelGetProcessTimeWide() - begin < total) {
+            const SceUInt64 t = sceKernelGetProcessTimeWide() - begin;
+            unsigned int buttons =
+                (t >= right_at && t < right_at + 100000) ? SCE_CTRL_RIGHT : 0;
+            if (every != 0) {
+                sceKernelPowerTick(SCE_KERNEL_POWER_TICK_DISABLE_AUTO_SUSPEND);
+                if (t >= right_at && (t - right_at) % every < 100000) {
+                    const bool left = (((t - right_at) / every) / 20) % 2 != 0;
+                    buttons = left ? SCE_CTRL_LEFT : SCE_CTRL_RIGHT;
+                }
+            }
+            if (buttons != 0 && !noted) {
+                Common::VitaNote("piloto", "menu: cruceta a la derecha");
+                noted = true;
+            }
+            menu.Update(buttons, buttons & ~previous);
+            previous = buttons;
+            menu.Draw(0.0f, 0.0f);
+            menu_frames++;
+        }
+        Common::VitaNote("piloto", fmt::format("menu: {:.1f} fotogramas/s", menu_frames / pilot.menu_s)
+                                       .c_str());
+        Common::VitaNote("piloto", fmt::format("menu: seleccionado '{}', arranca '{}'",
+                                               menu.SelectedPath(), rom->path)
+                                       .c_str());
+        VitaFrontend::Covers::Stop();
+        menu.ReleaseTextures();
+    }
     pthread_t thread{};
     const bool started = pthread_create(&thread, nullptr, &PilotMain, &pilot) == 0;
     g_pilot_running.store(true, std::memory_order_relaxed);
@@ -2316,7 +2831,7 @@ void RunPilotIfAny(vita2d_pgf* font, const std::vector<RomEntry>& roms) {
         pthread_join(thread, nullptr);
     }
     VitaFrontend::Input::SetPilotButtons(0);
-    if (pilot.exit_s > 0) {
+    if (pilot.exit_s > 0 || g_exit_emulator.load(std::memory_order_relaxed)) {
         /**
          * Y AZAHAR SE CIERRA SOLO (0.3.8.3). Matarlo desde fuera (quit all de
          * vitacompanion) en plena compilacion de un shader dejaba la marca de
@@ -2455,7 +2970,8 @@ void Run(vita2d_pgf* font) {
     // Ver HW::Y2R::RunBenchIfAny (0.4.1.4): solo con banco_mem/y2r.txt.
     HW::Y2R::RunBenchIfAny();
     Gxm::RunMemBenchIfAny();
-    RunPilotIfAny(font, roms);
+    EnsureOneMii();
+    RunPilotIfAny(font, roms, menu);
     // Las caratulas que falten, en otro hilo (0.3.4.1). Ver vita_covers.h.
     std::vector<std::string> rom_paths;
     for (const RomEntry& rom : roms) {
@@ -2535,6 +3051,10 @@ void Run(vita2d_pgf* font) {
             VitaFrontend::Covers::Stop();
             menu.ReleaseTextures();
             RunGame(font, menu.SelectedPath());
+            if (g_exit_emulator.load(std::memory_order_relaxed)) {
+                // "Salir del emulador" en el menu de la partida.
+                sceKernelExitProcess(0);
+            }
             menu.ForgetScreenshot(menu.SelectedPath());
             VitaFrontend::Covers::Start(rom_paths);
             // Al volver del juego hay que reiniciar el estado de botones para
@@ -2587,11 +3107,28 @@ int main(int argc, char** argv) {
     sceIoMkdir("ux0:/data", 0777);
     sceIoMkdir("ux0:/data/azahar", 0777);
     StartKeepAwake();
-    sceIoRemove("ux0:/data/azahar/crash_anterior.txt");
-    sceIoRename(kCrashLog, "ux0:/data/azahar/crash_anterior.txt");
-    // Lo mismo con los shaders que no compilan: solo los de esta sesion.
-    sceIoRemove("ux0:/data/azahar/cg_error_anterior.txt");
-    sceIoRename("ux0:/data/azahar/cg_error.txt", "ux0:/data/azahar/cg_error_anterior.txt");
+    /**
+     * EL RELANZAMIENTO DEL MODULO NO ES OTRA SESION (0.4.4.5). Tras un GPUCRASH
+     * la consola se reinicia, el modulo nativo ya no esta cargado y Azahar se
+     * relanza a si mismo para cargarlo (--aznative-relanzada, arm_native.cpp).
+     * Ese relanzamiento rotaba OTRA vez: el crash.txt de la partida que colgo
+     * la GPU pasaba a crash_anterior.txt y enseguida lo pisaba el de unas lineas
+     * del arranque. Asi se perdieron los de Yo-kai Watch 3 del 03-11. Ahora el
+     * relanzado sigue escribiendo en el crash.txt del arranque de verdad.
+     */
+    bool relaunched = false;
+    for (int i = 1; i < argc; i++) {
+        if (argv[i] != nullptr && std::strcmp(argv[i], "--aznative-relanzada") == 0) {
+            relaunched = true;
+        }
+    }
+    if (!relaunched) {
+        sceIoRemove("ux0:/data/azahar/crash_anterior.txt");
+        sceIoRename(kCrashLog, "ux0:/data/azahar/crash_anterior.txt");
+        // Lo mismo con los shaders que no compilan: solo los de esta sesion.
+        sceIoRemove("ux0:/data/azahar/cg_error_anterior.txt");
+        sceIoRename("ux0:/data/azahar/cg_error.txt", "ux0:/data/azahar/cg_error_anterior.txt");
+    }
     WriteCrashLog("version", kVersion);
     WriteCrashLog("main", "entrando (inicializadores estaticos superados)");
 

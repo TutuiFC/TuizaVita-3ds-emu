@@ -47,6 +47,66 @@ constexpr float kDeadzone = 0.15f;
 /// Ver SetPilotButtons.
 std::atomic<unsigned int> g_pilot_buttons{0};
 
+/**
+ * START Y SELECT SEGUIDOS ABREN EL MENU DE LA PARTIDA (0.4.6.1). Cada uno por
+ * separado es un boton del 3DS, asi que hay que saber si viene el otro antes de
+ * darselo al juego: la primera espera kComboHoldUs, y si llega la segunda en ese
+ * tiempo el juego no ve ninguna. Pasado ese tiempo el juego recibe la primera
+ * (estirada kComboTapUs si ya se habia soltado, para no perder un toque corto),
+ * y la segunda aun abre el menu hasta kComboWindowUs: mejor un START de mas para
+ * el juego que no abrir el menu a quien pulsa con calma.
+ */
+constexpr unsigned int kComboButtons = SCE_CTRL_START | SCE_CTRL_SELECT;
+constexpr SceUInt64 kComboHoldUs = 350 * 1000;
+constexpr SceUInt64 kComboTapUs = 100 * 1000;
+constexpr SceUInt64 kComboWindowUs = 600 * 1000;
+
+std::atomic<bool> g_game_menu_request{false};
+/// Botones que el juego no ve hasta que se suelten. Ver SwallowButtons.
+std::atomic<unsigned int> g_swallowed{0};
+
+unsigned int FilterGameMenuCombo(unsigned int buttons, SceUInt64 now) {
+    static unsigned int previous = 0;
+    static unsigned int first = 0;
+    static SceUInt64 first_at = 0;
+
+    unsigned int swallowed = g_swallowed.load(std::memory_order_relaxed);
+    if (swallowed != 0) {
+        const unsigned int still = swallowed & buttons;
+        if (still != swallowed) {
+            g_swallowed.store(still, std::memory_order_relaxed);
+        }
+        swallowed = still;
+        buttons &= ~still;
+    }
+
+    const unsigned int combo = buttons & kComboButtons;
+    const unsigned int fresh = combo & ~previous;
+    previous = combo;
+    if (first != 0 && now - first_at > kComboWindowUs) {
+        first = 0;
+    }
+    if (fresh != 0) {
+        if (fresh == kComboButtons || (first != 0 && (fresh & ~first) != 0)) {
+            first = 0;
+            previous = 0;
+            g_swallowed.store(swallowed | kComboButtons, std::memory_order_relaxed);
+            g_game_menu_request.store(true, std::memory_order_relaxed);
+            return buttons & ~kComboButtons;
+        }
+        first = fresh;
+        first_at = now;
+    }
+    if (first == 0) {
+        return buttons;
+    }
+    const SceUInt64 age = now - first_at;
+    if (age < kComboHoldUs) {
+        return buttons & ~first;
+    }
+    return age < kComboHoldUs + kComboTapUs ? buttons | first : buttons;
+}
+
 SceCtrlData ReadPad() {
     constexpr SceUInt64 kPadFreshUs = 2000;
     static SceCtrlData cached{};
@@ -55,16 +115,15 @@ SceCtrlData ReadPad() {
     if (cached_at == 0 || now - cached_at >= kPadFreshUs) {
         sceCtrlPeekBufferPositive(0, &cached, 1);
         cached_at = now;
+        const unsigned int pilot = g_pilot_buttons.load(std::memory_order_relaxed);
+        cached.buttons = FilterGameMenuCombo(cached.buttons | (pilot & ~kPilotStickMask), now);
+        // El stick del piloto (0.3.9.3): al tope en la direccion pedida.
+        if ((pilot & kPilotStickMask) != 0) {
+            cached.lx = (pilot & kPilotStickRight) ? 255 : (pilot & kPilotStickLeft) ? 0 : 128;
+            cached.ly = (pilot & kPilotStickDown) ? 255 : (pilot & kPilotStickUp) ? 0 : 128;
+        }
     }
-    SceCtrlData pad = cached;
-    const unsigned int pilot = g_pilot_buttons.load(std::memory_order_relaxed);
-    pad.buttons |= pilot & ~kPilotStickMask;
-    // El stick del piloto (0.3.9.3): al tope en la direccion pedida.
-    if ((pilot & kPilotStickMask) != 0) {
-        pad.lx = (pilot & kPilotStickRight) ? 255 : (pilot & kPilotStickLeft) ? 0 : 128;
-        pad.ly = (pilot & kPilotStickDown) ? 255 : (pilot & kPilotStickUp) ? 0 : 128;
-    }
-    return pad;
+    return cached;
 }
 
 class VitaButton final : public ::Input::ButtonDevice {
@@ -177,6 +236,14 @@ void Shutdown() {
 
 void SetPilotButtons(unsigned int buttons) {
     g_pilot_buttons.store(buttons, std::memory_order_relaxed);
+}
+
+bool TakeGameMenuRequest() {
+    return g_game_menu_request.exchange(false, std::memory_order_relaxed);
+}
+
+void SwallowButtons(unsigned int buttons) {
+    g_swallowed.store(buttons, std::memory_order_relaxed);
 }
 
 /// Ver SetPilotTouch: x en los 16 bits altos, y en los bajos; -1 = sin toque.

@@ -290,6 +290,9 @@ void GPU::ExecuteCommand(const Service::GSP::Command& command,
     switch (command.id) {
     case CommandId::RequestDma: {
         const GxScopeTimer timer{GxStats::dma_ns};
+#ifdef __PSVITA__
+        Common::vita_gpu_tag = Common::kGpuTagDma;
+#endif
         GxStats::frame_work.fetch_add(1, std::memory_order_relaxed);
         impl->system.Memory().RasterizerFlushVirtualRegion(
             command.dma_request.source_address, command.dma_request.size, Memory::FlushMode::Flush);
@@ -334,6 +337,9 @@ void GPU::ExecuteCommand(const Service::GSP::Command& command,
     }
     case CommandId::MemoryFill: {
         const GxScopeTimer timer{GxStats::fill_ns};
+#ifdef __PSVITA__
+        Common::vita_gpu_tag = Common::kGpuTagFill;
+#endif
         GxStats::fill_count.fetch_add(1, std::memory_order_relaxed);
         GxStats::frame_work.fetch_add(1, std::memory_order_relaxed);
         auto& params = command.memory_fill;
@@ -369,6 +375,9 @@ void GPU::ExecuteCommand(const Service::GSP::Command& command,
     }
     case CommandId::DisplayTransfer: {
         const GxScopeTimer timer{GxStats::transfer_ns};
+#ifdef __PSVITA__
+        Common::vita_gpu_tag = Common::kGpuTagTransfer;
+#endif
         GxStats::transfer_count.fetch_add(1, std::memory_order_relaxed);
         GxStats::frame_work.fetch_add(1, std::memory_order_relaxed);
         auto& params = command.display_transfer;
@@ -393,6 +402,9 @@ void GPU::ExecuteCommand(const Service::GSP::Command& command,
     }
     case CommandId::TextureCopy: {
         const GxScopeTimer timer{GxStats::transfer_ns};
+#ifdef __PSVITA__
+        Common::vita_gpu_tag = Common::kGpuTagTransfer;
+#endif
         GxStats::transfer_count.fetch_add(1, std::memory_order_relaxed);
         GxStats::frame_work.fetch_add(1, std::memory_order_relaxed);
         auto& params = command.texture_copy;
@@ -904,6 +916,7 @@ void GPU::AsyncLoop() {
             std::unique_lock lock{worker.mutex};
 #ifdef __PSVITA__
             Common::vita_gpu_stage.store("gpu: sin trabajo", std::memory_order_relaxed);
+            Common::vita_gpu_tag = Common::kGpuTagIdle;
 #endif
             worker.sleeping = true;
             worker.work_ready.wait(lock,
@@ -917,6 +930,9 @@ void GPU::AsyncLoop() {
             worker.executing = true;
         }
         const u64 begin = NowUs();
+#ifdef __PSVITA__
+        Common::vita_gpu_tag = Common::kGpuTagCommand;
+#endif
         // Muerto el hilo, se sigue vaciando la cola sin ejecutar para que nadie
         // se quede esperando; el de emulacion lo ve en DeliverInterrupts.
         if (!worker.failed) {
@@ -937,6 +953,7 @@ void GPU::AsyncLoop() {
                 case AsyncWorker::Type::Present:
 #ifdef __PSVITA__
                     Common::vita_gpu_stage.store("gpu: presentar", std::memory_order_relaxed);
+                    Common::vita_gpu_tag = Common::kGpuTagPresent;
 #endif
                     worker.present_time_us = item.time_us;
                     {
@@ -954,6 +971,9 @@ void GPU::AsyncLoop() {
             }
         }
         item.process.reset();
+#ifdef __PSVITA__
+        Common::vita_gpu_tag = Common::kGpuTagCommand;
+#endif
         GxStats::thread_busy_us.fetch_add(NowUs() - begin, std::memory_order_relaxed);
         {
             std::lock_guard lock{worker.mutex};

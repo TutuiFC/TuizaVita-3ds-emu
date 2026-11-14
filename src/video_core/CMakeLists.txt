@@ -140,6 +140,9 @@ if (ENABLE_SOFTWARE_RENDERER)
             renderer_gxm/gxm_texture_cache.h
             renderer_gxm/gxm_cg.cpp
             renderer_gxm/gxm_cg.h
+            # Traductor directo PICA -> USSE de los shaders de vertices (0.4.7.1).
+            renderer_gxm/usse_vs_gen.cpp
+            renderer_gxm/usse_vs_gen.h
             renderer_gxm/renderer_gxm.cpp
             renderer_gxm/renderer_gxm.h
             # Generador de shaders Cg del backend GXM: el tercer hermano de
@@ -328,6 +331,7 @@ set_source_files_properties(
     shader/generator/cg_vs_shader_gen.cpp
     shader/generator/cg_fs_shader_gen.cpp
     renderer_gxm/gxm_cg.cpp
+    renderer_gxm/usse_vs_gen.cpp
     PROPERTIES COMPILE_OPTIONS "-O2"
 )
 

@@ -20,12 +20,41 @@
 #include "citra_vita/vita_i18n.h"
 #include "citra_vita/vita_version.h"
 #include "common/string_util.h"
+#include "common/vita_diag.h"
 #include "core/frontend/image_interface.h"
 #include "core/loader/loader.h"
 #include "core/loader/smdh.h"
 
 namespace VitaFrontend {
+
+std::atomic<bool> g_menu_wait_atlas{true};
+std::atomic<bool> g_menu_hold_frames{false};
+std::atomic<bool> g_menu_notes{false};
+
 namespace {
+
+/**
+ * EL POOL DE VITA2D, TAMBIEN EN EL MENU (0.4.5.0). Este era el cuelgue de la GPU
+ * en la lista de juegos. vita2d_start_drawing() pone el pool a cero en cada
+ * fotograma aunque la GPU siga leyendo el anterior, y vita2d_draw_fill_circle
+ * guarda en el pool tambien sus INDICES: cada rectangulo redondeado son cuatro
+ * circulos. Mientras todo se dibuja igual no pasa nada, porque se reescriben los
+ * mismos valores. Pero al desplazarse la cuadricula cambia el numero de azulejos,
+ * se mueve en el pool todo lo que va detras, y la GPU lee como indices los
+ * vertices del fotograma nuevo: fuera de la memoria y GPUCRASH. Por eso el piloto
+ * con una sola pulsacion no lo repetia (la camara no se movia) y el tapon de
+ * 0.4.4.6 lo evitaba.
+ *
+ * La presentacion del juego lo resolvio en 0.2.2.0 vaciando el pool solo al pasar
+ * de la mitad (ver VitaWindow), pero aqui un fotograma gasta 481 KB de los 1024:
+ * caben dos, y uno mas grande (el selector de idioma dibuja encima) se quedaria
+ * sin pool y vita2d escribiria en NULL. Asi que se espera a la GPU en cada
+ * fotograma, con el pool entero para el siguiente.
+ */
+void StartMenuDrawing() {
+    vita2d_wait_rendering_done();
+    vita2d_start_drawing();
+}
 
 namespace I18n = VitaFrontend::I18n;
 
@@ -293,6 +322,16 @@ const std::string& HomeMenu::SelectedPath() const {
     return entries.empty() ? kEmpty : entries[selected].path;
 }
 
+bool HomeMenu::SelectPath(const std::string& path) {
+    for (int i = 0; i < Count(); i++) {
+        if (entries[i].path == path) {
+            MoveSelection(i - selected);
+            return true;
+        }
+    }
+    return false;
+}
+
 void HomeMenu::LoadInfo(Entry& entry) {
     entry.info_loaded = true;
     if (entry.product_id.empty()) {
@@ -383,6 +422,12 @@ bool HomeMenu::EnsureAtlas() {
     }
     atlas = vita2d_create_empty_texture_format(kAtlasSize, kAtlasSize,
                                                SCE_GXM_TEXTURE_FORMAT_U5U6U5_RGB);
+    if (g_menu_notes.load(std::memory_order_relaxed)) {
+        char note[128];
+        std::snprintf(note, sizeof(note), "atlas %p datos %p", static_cast<void*>(atlas),
+                      atlas != nullptr ? vita2d_texture_get_datap(atlas) : nullptr);
+        Common::VitaNote("menu", note);
+    }
     if (atlas == nullptr) {
         atlas_failed = true;
         return false;
@@ -487,6 +532,13 @@ bool HomeMenu::LoadScreenshot(int index) {
     sceIoClose(fd);
     entry.shot_state = ok ? 2 : 1;
     shot_for = ok ? index : -1;
+    if (g_menu_notes.load(std::memory_order_relaxed)) {
+        char note[160];
+        std::snprintf(note, sizeof(note), "captura %d %s: textura %p datos %p", index,
+                      ok ? "cargada" : "mal", static_cast<void*>(shot),
+                      shot != nullptr ? vita2d_texture_get_datap(shot) : nullptr);
+        Common::VitaNote("menu", note);
+    }
     return ok;
 }
 
@@ -553,6 +605,13 @@ bool HomeMenu::LoadCover(int index) {
     vita2d_texture_set_filters(cover, SCE_GXM_TEXTURE_FILTER_LINEAR, SCE_GXM_TEXTURE_FILTER_LINEAR);
     entry.cover_state = 2;
     cover_for = index;
+    if (g_menu_notes.load(std::memory_order_relaxed)) {
+        char note[192];
+        std::snprintf(note, sizeof(note), "caratula %d %s: %ux%u, textura %p datos %p", index,
+                      entry.product_id.c_str(), width, height, static_cast<void*>(cover),
+                      vita2d_texture_get_datap(cover));
+        Common::VitaNote("menu", note);
+    }
     return true;
 }
 
@@ -577,8 +636,26 @@ void HomeMenu::MoveSelection(int delta) {
     if (entries.empty()) {
         return;
     }
+    const int before = selected;
     selected = std::clamp(selected + delta, 0, Count() - 1);
     FollowSelection();
+    /**
+     * EL MENU ANOTA LO QUE HACE (0.4.4.6). Al usuario se le cuelga la GPU en la
+     * lista de juegos con una sola pulsacion de la cruceta, y el piloto no lo
+     * repite. Lo que se anota aqui sin hilo escritor va a la tarjeta linea a
+     * linea (abrir, escribir, cerrar) y sobrevive al reinicio de la consola.
+     */
+    if (g_menu_notes.load(std::memory_order_relaxed)) {
+        char note[160];
+        std::snprintf(note, sizeof(note), "seleccion %d -> %d de %d, camara %.0f -> %.0f", before,
+                      selected, Count(), static_cast<double>(camera),
+                      static_cast<double>(camera_target));
+        Common::VitaNote("menu", note);
+    }
+    if (g_menu_hold_frames.load(std::memory_order_relaxed)) {
+        // El tapon de 0.4.4.6: solo para volver atras desde ajustes.txt.
+        diag_frames = 120;
+    }
 }
 
 int HomeMenu::TileAt(int x, int y) const {
@@ -802,7 +879,7 @@ void HomeMenu::DrawMiniScreen(float x, float y, float w, float h) {
     shot_fade = std::min(1.0f, shot_fade + 0.12f);
     const unsigned int alpha = static_cast<unsigned int>(shot_fade * 255.0f);
 
-    if (LoadScreenshot(selected)) {
+    if (shot != nullptr && shot_for == selected) {
         vita2d_draw_texture_tint_part_scale(shot, x, y, 0.0f, 0.0f, kShotW, kShotH,
                                             w / static_cast<float>(kShotW),
                                             h / static_cast<float>(kShotH),
@@ -860,7 +937,7 @@ void HomeMenu::DrawPanel() {
     const float icon_y = kPanelY + 24.0f;
     int text_x = static_cast<int>(info_x + kIcon + 22.0f);
     float rule_x = info_x;
-    if (LoadCover(selected)) {
+    if (cover != nullptr && cover_for == selected) {
         // Con caratula: a la altura de la mini pantalla, y el texto a su lado.
         const float scale = kMiniH / static_cast<float>(vita2d_texture_get_height(cover));
         const float cover_w = static_cast<float>(vita2d_texture_get_width(cover)) * scale;
@@ -905,9 +982,6 @@ void HomeMenu::DrawTile(int index, float x, float y, float size, bool is_selecte
 
     const float inset = size * 0.09f;
     const float icon = size - 2.0f * inset;
-    if (!entry.icon.empty()) {
-        UploadIcon(index);
-    }
     if (entry.uploaded && atlas != nullptr) {
         const float scale = icon / static_cast<float>(kIconSize);
         vita2d_draw_texture_part_scale(atlas, x + inset, y + inset,
@@ -1049,11 +1123,38 @@ void HomeMenu::DrawBottomBar(float settings_hold, float language_hold) {
     hold_bar(language_start, x - 30.0f, language_hold);
 }
 
-void HomeMenu::DrawScene(float settings_hold, float language_hold) {
-    for (int i = 0; i < 2 && !entries.empty(); i++) {
-        // Que los iconos de la vista se suban antes de dibujar.
+void HomeMenu::PrepareFrame() {
+    if (entries.empty()) {
+        return;
+    }
+    /**
+     * LAS TEXTURAS, FUERA DE LA ESCENA (0.4.4.9). 0.4.4.8 esperaba a la GPU en
+     * UploadIcon, que corria dentro de la escena: sceGxmFinish con la escena
+     * abierta. La captura y la caratula tenian la misma espera en el mismo sitio
+     * desde mucho antes. Ahora todo lo que escribe o libera una textura va aqui,
+     * antes de abrir la escena, y dibujar solo usa lo que ya esta listo.
+     */
+    for (int i = 0; i < 2; i++) {
         LoadPendingInfo();
     }
+    LoadScreenshot(selected);
+    LoadCover(selected);
+    bool waited = !g_menu_wait_atlas.load(std::memory_order_relaxed);
+    for (int i = 0; i < Count() && i < kAtlasSlots && !atlas_failed; i++) {
+        const Entry& entry = entries[i];
+        if (entry.uploaded || entry.icon.empty()) {
+            continue;
+        }
+        // Una espera por fotograma como mucho, y solo si hay algun icono que subir.
+        if (!waited) {
+            vita2d_wait_rendering_done();
+            waited = true;
+        }
+        UploadIcon(i);
+    }
+}
+
+void HomeMenu::DrawScene(float settings_hold, float language_hold) {
     DrawBackground();
     DrawPanel();
     DrawGrid();
@@ -1063,10 +1164,33 @@ void HomeMenu::DrawScene(float settings_hold, float language_hold) {
 }
 
 void HomeMenu::Draw(float settings_hold, float language_hold) {
-    vita2d_start_drawing();
+    PrepareFrame();
+    StartMenuDrawing();
     vita2d_clear_screen();
     DrawScene(settings_hold, language_hold);
     vita2d_end_drawing();
+    if (g_menu_hold_frames.load(std::memory_order_relaxed) && diag_frames > 0) {
+        // El tapon de 0.4.4.6, solo para volver atras: espera a la GPU en cada
+        // fotograma para que la escritura del atlas no la pille leyendo.
+        if (g_menu_notes.load(std::memory_order_relaxed)) {
+            // Si la GPU muere en este fotograma, falta su "terminado".
+            char note[192];
+            std::snprintf(note, sizeof(note),
+                          "fotograma %u enviado: sel %d, captura %p (%d), caratula %p (%d), "
+                          "atlas %p, camara %.1f",
+                          frame, selected, static_cast<void*>(shot), shot_for,
+                          static_cast<void*>(cover), cover_for, static_cast<void*>(atlas),
+                          static_cast<double>(camera));
+            Common::VitaNote("menu", note);
+        }
+        vita2d_wait_rendering_done();
+        if (g_menu_notes.load(std::memory_order_relaxed)) {
+            char note[192];
+            std::snprintf(note, sizeof(note), "fotograma %u terminado", frame);
+            Common::VitaNote("menu", note);
+        }
+        diag_frames--;
+    }
     vita2d_swap_buffers();
 }
 
@@ -1126,7 +1250,8 @@ int RunLanguagePicker(HomeMenu& menu, vita2d_pgf* font) {
             }
         }
 
-        vita2d_start_drawing();
+        menu.PrepareFrame();
+        StartMenuDrawing();
         vita2d_clear_screen();
         menu.DrawScene(0.0f, 0.0f);
         vita2d_draw_rectangle(0.0f, 0.0f, kScreenW, kScreenH, Rgb(0x10141A, 0x99));
